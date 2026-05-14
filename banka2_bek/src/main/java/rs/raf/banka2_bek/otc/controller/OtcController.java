@@ -81,4 +81,10 @@ public class OtcController {
                                                            @RequestParam(required = false) Long buyerAccountId) {
         return ResponseEntity.ok(otcService.exerciseContract(contractId, buyerAccountId));
     }
+
+    /** Rucno odustajanje od ugovora — kupac ne dobija nazad placenu premiju. */
+    @PostMapping("/contracts/{contractId}/abandon")
+    public ResponseEntity<OtcContractDto> abandonContract(@PathVariable Long contractId) {
+        return ResponseEntity.ok(otcService.abandonContract(contractId));
+    }
 }

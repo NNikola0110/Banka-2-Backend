@@ -2960,3 +2960,30 @@ INSERT INTO branches (name, type, address, latitude, longitude, opening_hours, h
   ('ATM Lipov Lad', 'ATM', 'Mileseva 14', 44.800800, 20.510200, '07-22', 0, 0, NOW());
 
 SELECT setval('branches_id_seq', (SELECT COALESCE(MAX(id), 1) FROM branches));
+
+-- ============================================================
+-- 14.05.2026 vece-5: Game scores za Sobu za cekanje (leaderboard demo)
+-- ============================================================
+INSERT INTO game_scores (client_id, player_name, game_type, score, created_at) VALUES
+-- DINO highscore (distance)
+(1, 'Stefan Jovanović', 'DINO', 4250, NOW() - INTERVAL '3 days'),
+(2, 'Milica Nikolić', 'DINO', 3890, NOW() - INTERVAL '2 days'),
+(3, 'Lazar Ilić', 'DINO', 5120, NOW() - INTERVAL '1 days'),
+(4, 'Ana Stojanović', 'DINO', 2780, NOW() - INTERVAL '6 hours'),
+(1, 'Stefan Jovanović', 'DINO', 6810, NOW() - INTERVAL '1 hours'),
+-- SOLITAIRE wins (vise pobeda je bolje za leaderboard rank)
+(2, 'Milica Nikolić', 'SOLITAIRE', 12, NOW() - INTERVAL '5 days'),
+(1, 'Stefan Jovanović', 'SOLITAIRE', 8, NOW() - INTERVAL '4 days'),
+(3, 'Lazar Ilić', 'SOLITAIRE', 5, NOW() - INTERVAL '3 days'),
+(4, 'Ana Stojanović', 'SOLITAIRE', 3, NOW() - INTERVAL '2 days'),
+-- CHESS wins
+(3, 'Lazar Ilić', 'CHESS', 7, NOW() - INTERVAL '4 days'),
+(1, 'Stefan Jovanović', 'CHESS', 4, NOW() - INTERVAL '3 days'),
+(2, 'Milica Nikolić', 'CHESS', 2, NOW() - INTERVAL '2 days'),
+-- BANKA2_RUSH high score (distance + coins)
+(1, 'Stefan Jovanović', 'BANKA2_RUSH', 12450, NOW() - INTERVAL '2 days'),
+(4, 'Ana Stojanović', 'BANKA2_RUSH', 9870, NOW() - INTERVAL '1 days'),
+(2, 'Milica Nikolić', 'BANKA2_RUSH', 15630, NOW() - INTERVAL '12 hours'),
+(3, 'Lazar Ilić', 'BANKA2_RUSH', 8240, NOW() - INTERVAL '4 hours');
+
+SELECT setval('game_scores_id_seq', (SELECT COALESCE(MAX(id), 1) FROM game_scores));

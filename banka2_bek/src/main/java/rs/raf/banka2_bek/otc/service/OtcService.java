@@ -426,6 +426,37 @@ public class OtcService {
         return expired.size();
     }
 
+    /**
+     * Rucno odustajanje od ugovora od strane kupca. Spec Celina 4: opciono trgovinom
+     * kupac stice PRAVO (ne obavezu) da kupi. Premija je vec placena pri accept-u i
+     * NE VRACA SE — to je cena opcije. Ovaj endpoint zatvara ugovor pre settlement-a
+     * (status=EXPIRED) tako da seller-ovi public available shares budu slobodni odmah.
+     *
+     * - Samo kupac moze odustati (premiju je on platio)
+     * - Samo ACTIVE ugovori
+     * - Nikakvi novcani transferi — premija ostaje kod prodavca (vec je placena)
+     */
+    @Transactional
+    public OtcContractDto abandonContract(Long contractId) {
+        UserContext me = resolveCurrentUser();
+        ensureOtcAccess(me);
+        OtcContract contract = contractRepository.findById(contractId)
+                .orElseThrow(() -> new EntityNotFoundException("OTC ugovor ne postoji: " + contractId));
+        if (!contract.getBuyerId().equals(me.userId())
+                || !contract.getBuyerRole().equals(me.userRole())) {
+            throw new AccessDeniedException("Samo kupac moze odustati od ugovora.");
+        }
+        if (contract.getStatus() != OtcContractStatus.ACTIVE) {
+            throw new IllegalStateException("Ugovor nije aktivan (status=" + contract.getStatus() + ").");
+        }
+        contract.setStatus(OtcContractStatus.EXPIRED);
+        contractRepository.save(contract);
+        log.info("OTC contract #{} abandoned by buyer {} — premium {} {} NIJE vracena.",
+                contract.getId(), contract.getBuyerId(),
+                contract.getPremium(), resolveListingCurrency(contract.getListing()));
+        return toContractDto(contract);
+    }
+
     // ────────────────────────── Helpers ──────────────────────────
 
     /**
