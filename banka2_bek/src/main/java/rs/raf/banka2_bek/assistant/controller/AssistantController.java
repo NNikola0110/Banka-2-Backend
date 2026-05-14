@@ -130,7 +130,10 @@ public class AssistantController {
     @PostMapping(value = "/chat-multipart", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter chatMultipart(
             @RequestPart(value = "media", required = false) org.springframework.web.multipart.MultipartFile media,
-            @RequestPart("message") String message,
+            // message NIJE required — kad korisnik salje samo audio (bez ukucanog teksta),
+            // FE salje formData.append('message', '') sto Spring strict mode tretira kao
+            // "missing part" i baca 400. required=false + null-check ispod.
+            @RequestPart(value = "message", required = false) String message,
             @RequestPart(value = "conversationUuid", required = false) String conversationUuid,
             @RequestPart(value = "agenticMode", required = false) String agenticMode,
             @RequestPart(value = "useTools", required = false) String useTools,
