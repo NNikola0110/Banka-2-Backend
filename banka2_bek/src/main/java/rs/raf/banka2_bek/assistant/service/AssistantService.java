@@ -78,6 +78,9 @@ public class AssistantService {
     private final KokoroTtsClient kokoroTtsClient;
     private final ContextBuilder contextBuilder;
     private final ContextSanitizer sanitizer;
+    // Defensive scrubbing iz LLM odgovora — uklanja meta-reasoning preamble
+    // i Gemma <channel|> / <think> markere pre nego sto izlaz stigne FE-u.
+    private final ContentLeakFilter contentLeakFilter;
     private final RateLimiter rateLimiter;
     private final AuditLogger auditLogger;
     private final AgentActionGateway agentActionGateway;
@@ -191,6 +194,57 @@ public class AssistantService {
                     request.getMessage() != null && request.getMessage().length() > 60
                         ? request.getMessage().substring(0, 60) + "..." : request.getMessage());
 
+            // Phase 4 v3.5: deterministicki short-circuit FIRST — kad imamo
+            // forsiran tool I mozemo extract-ovati pun set parametara iz user
+            // poruke (npr. "uplati milici 100" → fromAccount, toAccount, amount,
+            // description, recipientName), KREIRAMO PREVIEW ODMAH bez wizard-a.
+            // Razlog: wizard postavi 5 pitanja koje smo vec znali da popunimo
+            // — to je los UX i izaziva bug "AI ipak pita stvari koje sam vec
+            // rekao". Wizard ostaje fallback kad extract-or vrati null.
+            Map<String, Object> shortCircuitExtracted = null;
+            if (forcedFirstTool != null) {
+                shortCircuitExtracted = extractParamsForTool(forcedFirstTool, request.getMessage(), user);
+            }
+            if (shortCircuitExtracted != null && !shortCircuitExtracted.isEmpty()) {
+                ToolHandler maybeHandler = toolRegistry.get(forcedFirstTool).orElse(null);
+                if (maybeHandler instanceof WriteToolHandler writeHandler) {
+                    log.info("ARBITRO direct-preview forced tool={} extracted={} — skipping wizard",
+                            forcedFirstTool, shortCircuitExtracted);
+                    try {
+                        AgentActionPreviewDto preview = agentActionGateway.createPending(
+                                conv.getConversationUuid().toString(),
+                                forcedFirstTool, shortCircuitExtracted, user, writeHandler);
+                        SseEvents.toolCall(emitter, forcedFirstTool, shortCircuitExtracted);
+                        toolsUsed.add(forcedFirstTool);
+                        SseEvents.actionPreview(emitter, preview);
+                        String shortHelpMsg = "Pripremio sam akciju '" + forcedFirstTool
+                                + "'. Pogledaj preview i klikni POTVRDI ili ODBACI.";
+                        persistMessage(conv, AssistantMessageRole.ASSISTANT, shortHelpMsg, null,
+                                null, request.getPageContext());
+                        long elapsed = System.currentTimeMillis() - startMs;
+                        SseEvents.done(emitter, null, conv.getConversationUuid().toString(),
+                                0, elapsed, 0);
+                        auditLogger.logAgentAction(user, preview.getActionUuid(), forcedFirstTool,
+                                "PENDING_DIRECT", null);
+                        emitter.complete();
+                        return;
+                    } catch (AgentActionGateway.AgenticDisabledException e) {
+                        log.info("ARBITRO direct-preview agentic disabled, falling back to wizard");
+                        // ne pucamo — wizard ce probati ispod
+                    } catch (AgentActionGateway.AgenticRateLimitedException e) {
+                        SseEvents.error(emitter, "rate_limited", e.getMessage());
+                        emitter.complete();
+                        return;
+                    } catch (Exception e) {
+                        log.warn("ARBITRO direct-preview failed for {}: {} — falling back to wizard",
+                                forcedFirstTool, e.getMessage());
+                        // Preview validacija pala (npr. fromAccount ne postoji u DB) —
+                        // padamo na wizard koji ce tracije korak-po-korak i pokazati
+                        // korisniku validne opcije.
+                    }
+                }
+            }
+
             // Phase 4.5: interactive wizard launcher.
             // Kada je agentic mode ON i intent detektovan, pokrecemo wizard koji
             // postavlja korisniku korak-po-korak pitanja sa biranjem opcija u
@@ -229,40 +283,37 @@ public class AssistantService {
                 }
             }
 
-            // Phase 4 v3.5: deterministicki short-circuit — kad je forsiran
-            // tool prepoznat I mozemo extract-ovati parametre iz user poruke
-            // pouzdanim regex-om, INJECT syntetski tool_call kao "fake LLM
-            // response" za prvu iteraciju. Razlog: Gemma 4 E2B emit-uje tool
-            // calls u 5+ razlicitih formata koje OpenAI-compat ne konvertuje.
-            // Synthetic injection → 100% pouzdano + brzo (0s LLM call).
+            // Phase 4 v3.5: stari INJECT synthetic tool_call put — ostaje
+            // fallback ako short-circuit gore nije proizveo preview (npr.
+            // wizard ne postoji za tool, ali extract-or je vratio params).
+            // Ako shortCircuitExtracted ima vrednosti ali je gore stao zbog
+            // izuzetka, jos uvek mozemo kroz LLM tool-use loop da ga ubacimo.
             OpenAiChatResponse syntheticFirstResp = null;
-            if (forcedFirstTool != null) {
-                Map<String, Object> extracted = extractParamsForTool(forcedFirstTool, request.getMessage(), user);
-                if (extracted != null && !extracted.isEmpty()) {
-                    log.info("ARBITRO short-circuit forced tool={} extracted={}",
-                            forcedFirstTool, extracted);
-                    String json;
-                    try {
-                        json = assistantObjectMapper.writeValueAsString(extracted);
-                    } catch (JsonProcessingException e) {
-                        json = "{}";
-                    }
-                    OpenAiToolCall synthetic = new OpenAiToolCall(
-                            "call_short_" + System.currentTimeMillis(),
-                            "function",
-                            new OpenAiToolCall.Function(forcedFirstTool, json)
-                    );
-                    OpenAiMessage synthMsg = OpenAiMessage.assistantWithTools(null, List.of(synthetic));
-                    OpenAiChatResponse.Choice synthChoice = new OpenAiChatResponse.Choice(
-                            0, synthMsg, "tool_calls"
-                    );
-                    syntheticFirstResp = new OpenAiChatResponse(
-                            "synthetic-" + System.currentTimeMillis(),
-                            properties.getModel(),
-                            List.of(synthChoice),
-                            null
-                    );
+            if (forcedFirstTool != null && shortCircuitExtracted != null
+                    && !shortCircuitExtracted.isEmpty()) {
+                log.info("ARBITRO synthetic-injection forced tool={} extracted={}",
+                        forcedFirstTool, shortCircuitExtracted);
+                String json;
+                try {
+                    json = assistantObjectMapper.writeValueAsString(shortCircuitExtracted);
+                } catch (JsonProcessingException e) {
+                    json = "{}";
                 }
+                OpenAiToolCall synthetic = new OpenAiToolCall(
+                        "call_short_" + System.currentTimeMillis(),
+                        "function",
+                        new OpenAiToolCall.Function(forcedFirstTool, json)
+                );
+                OpenAiMessage synthMsg = OpenAiMessage.assistantWithTools(null, List.of(synthetic));
+                OpenAiChatResponse.Choice synthChoice = new OpenAiChatResponse.Choice(
+                        0, synthMsg, "tool_calls"
+                );
+                syntheticFirstResp = new OpenAiChatResponse(
+                        "synthetic-" + System.currentTimeMillis(),
+                        properties.getModel(),
+                        List.of(synthChoice),
+                        null
+                );
             }
 
             // Tool-use loop
@@ -441,6 +492,12 @@ public class AssistantService {
                         : "(nije moguce dobiti odgovor — max iteracija dostignut)";
             }
 
+            // Defensive: filtriraj meta-reasoning preamble + Gemma channel marker
+            // leak iz finalContent-a. Filter je idempotentan pa moze i kasnije
+            // posle streamovanja da se primeni — ali ako vec sad imamo non-stream
+            // tekst (npr. od short-circuit-a), persist-ujemo cisto.
+            finalContent = contentLeakFilter.filter(finalContent);
+
             // Phase 5 optimizacija — pravi token-by-token streaming iz Ollame
             // umesto post-hoc word splitting-a. chatStream() vraca delta chunks
             // koje pakujemo u batch-ove od ~5 reci za smanjen SSE overhead.
@@ -452,23 +509,44 @@ public class AssistantService {
             boolean shouldStream = !finalContent.startsWith("(nije moguce")
                     && !finalContent.startsWith("Pripremio sam akciju");
             if (shouldStream) {
+                StringBuilder cumulative = new StringBuilder();
                 StringBuilder streamBatch = new StringBuilder();
                 int[] batchCount = {0};
+                // Plan v3.6 — SmartOutputFilter zamenjuje raniju ad-hoc preamble
+                // detekciju. Buffer-uje prve chunk-ove dok ne odluci da li je
+                // model u meta-mode-u ili emitujemo real content; posle prelaza
+                // u STREAMING fazu chunk-ovi prolaze bez filtera (sem direktnih
+                // leak tokena koje skida contentLeakFilter na batch granicama).
+                SmartOutputFilter smartFilter = new SmartOutputFilter();
                 try {
-                    // Re-pozovi LLM sa stream=true SAMO za final iteraciju (bez tools)
+                    // Re-pozovi LLM sa stream=true SAMO za final iteraciju (bez tools).
+                    // SmartOutputFilter drzi buffer dok ne pronadje "real content"
+                    // boundary (channel marker, preamble + \n\n, ili 500 chars bez
+                    // preamble markera) pa onda flush-uje ostatak.
                     llmHttpClient.chatStream(buildRequest(messages, null, true), chunk -> {
                         if (chunk.choices() == null || chunk.choices().isEmpty()) return;
                         OpenAiChatChunk.Choice c = chunk.choices().get(0);
                         if (c.delta() == null || c.delta().content() == null) return;
                         String delta = c.delta().content();
                         if (delta.isEmpty()) return;
-                        streamBatch.append(delta);
-                        // Flush kad batch dostigne ~5 reci ili 24 chars
-                        if (delta.contains(" ") || streamBatch.length() >= 24) {
+                        cumulative.append(delta);
+                        // Provuci kroz SmartOutputFilter — vrati prazno dok je
+                        // jos u BUFFERING fazi, ili tekst koji je bezbedan za emit.
+                        String safe = smartFilter.process(delta);
+                        if (safe.isEmpty()) return;
+                        // Defense in depth: contentLeakFilter skida bilo koji
+                        // ostatak direktnih markera (npr. <channel|> samo zatvarac
+                        // posle prelaska u STREAMING fazu).
+                        String cleaned = contentLeakFilter.filter(safe);
+                        if (cleaned.isEmpty()) return;
+                        streamBatch.append(cleaned);
+                        // Flush kad batch dostigne ~5 reci ili 24 chars (paritet
+                        // sa prethodnim ponasanjem).
+                        if (cleaned.contains(" ") || streamBatch.length() >= 24) {
                             SseEvents.token(emitter, streamBatch.toString());
                             totalTokens.incrementAndGet();
-                            streamBatch.setLength(0);
                             batchCount[0]++;
+                            streamBatch.setLength(0);
                         }
                     });
                 } catch (Exception streamErr) {
@@ -477,20 +555,37 @@ public class AssistantService {
                     streamBatch.setLength(0);
                     batchCount[0] = 0;
                 }
-                // Flush preostalo
+                // Stream je gotov — flush SmartOutputFilter buffer (eventualno
+                // sav preostali content ako prelazak u STREAMING fazu nije bio
+                // okinut) i lokalan streamBatch.
+                String tail = smartFilter.flush();
+                if (!tail.isEmpty()) {
+                    String tailClean = contentLeakFilter.filter(tail);
+                    if (!tailClean.isEmpty()) {
+                        streamBatch.append(tailClean);
+                    }
+                }
                 if (streamBatch.length() > 0) {
                     SseEvents.token(emitter, streamBatch.toString());
                     totalTokens.incrementAndGet();
+                    batchCount[0]++;
+                    streamBatch.setLength(0);
                 }
-                // Ako streaming nije ucitao ni jedan chunk (offline ili greska), fallback
+                // Ako streaming nije ucitao ni jedan clean chunk, fallback na finalContent.
                 if (batchCount[0] == 0 && streamBatch.length() == 0 && totalTokens.get() == 0) {
                     fallbackBatchEmit(finalContent, emitter, totalTokens);
+                } else if (cumulative.length() > 0) {
+                    // Override finalContent sa stream-ovanom filtriranom verzijom radi persist-a
+                    String streamedClean = contentLeakFilter.filter(cumulative.toString());
+                    if (!streamedClean.isEmpty()) {
+                        finalContent = streamedClean;
+                    }
                 }
             } else {
                 fallbackBatchEmit(finalContent, emitter, totalTokens);
             }
 
-            // Persist assistant message
+            // Persist assistant message — finalContent vec filtriran iznad
             AssistantMessage assistantPersisted = persistMessage(conv, AssistantMessageRole.ASSISTANT,
                     finalContent, null, null, request.getPageContext());
 
@@ -579,10 +674,13 @@ public class AssistantService {
     /**
      * Fallback emit kad streaming iz Ollame ne radi — koristi vec dobijen
      * finalContent iz non-stream tool dispatch petlje i emit-uje ga
-     * batch-ovan po 5 reci.
+     * batch-ovan po 5 reci. Filter primenjen i ovde za defense-in-depth
+     * slucaj kad fallback putanja stigne pre filter-a iznad.
      */
     private void fallbackBatchEmit(String content, SseEmitter emitter, AtomicInteger totalTokens) {
         if (content == null || content.isEmpty()) return;
+        content = contentLeakFilter.filter(content);
+        if (content.isEmpty()) return;
         String[] words = content.split("(?<=\\s)");
         StringBuilder batch = new StringBuilder();
         int batched = 0;
