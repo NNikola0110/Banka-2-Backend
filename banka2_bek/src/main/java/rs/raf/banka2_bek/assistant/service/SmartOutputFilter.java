@@ -35,14 +35,46 @@ public class SmartOutputFilter {
     private static final List<String> PREAMBLE_MARKERS = List.of(
             "Constraint Check:",
             "The prompt states:",
+            "The prompt instructs me:",
+            "The prompt instructs me",
+            "The instruction for ",
+            "The instructions state",
             "Final Output Generation",
             "Final Output:",
+            "Final Decision:",
+            "Final Decision *",
+            "*Final Decision*",
+            "*Revisiting",
+            "Revisiting the interaction",
+            "Revisiting the instructions",
             "I must now rely on internal knowledge",
             "I must now rely on my internal knowledge",
             "based on synthesized knowledge",
             "based on the fallback mechanism",
             "according to the system prompt",
-            "according to the instructions"
+            "according to the instructions",
+            "Since the tool failed",
+            "Since the tool found nothing",
+            "Given the instructions",
+            "Given the strict boundaries",
+            "I will state my limitation",
+            "I will address the question based on",
+            "I will stick to what I know",
+            "I will answer based on the instruction"
+    );
+
+    /**
+     * Markeri koji ukazuju na stvarni odgovor (Serbian/Croatian text) — kad neki
+     * od ovih trigger-a se nadje u buffer-u, sve od njegove pozicije nadalje
+     * smatramo "real content" i emit-ujemo. Detektuje takodje da prelaz u SRB
+     * jezik znaci kraj engleskog meta-reasoning bloka.
+     */
+    private static final List<String> FINAL_ANSWER_MARKERS = List.of(
+            "Nisam siguran",
+            "Mogu pomoci samo",
+            "Mogu pomoći samo",
+            "Belibor je",
+            "Belibor jeste"
     );
 
     private static final String CHANNEL_OPEN_PREFIX = "<|channel>";
@@ -108,6 +140,23 @@ public class SmartOutputFilter {
             }
         }
         if (hasPreamble) {
+            // 4a) Prvo trazimo final answer marker (Serbian text) u buffer-u —
+            //     model cesto skace iz engleskog meta-reasoning-a direktno u
+            //     odgovor bez \n\n separator-a.
+            int finalAnswerIdx = -1;
+            for (String marker : FINAL_ANSWER_MARKERS) {
+                int idx = text.indexOf(marker);
+                if (idx >= 0 && (finalAnswerIdx < 0 || idx < finalAnswerIdx)) {
+                    finalAnswerIdx = idx;
+                }
+            }
+            if (finalAnswerIdx >= 0) {
+                String after = text.substring(finalAnswerIdx);
+                buffer.setLength(0);
+                realContentStarted = true;
+                return after;
+            }
+            // 4b) Klasican \n\n separator
             int sep = text.indexOf("\n\n");
             if (sep >= 0 && sep < text.length() - 2) {
                 String after = text.substring(sep + 2);
@@ -115,7 +164,7 @@ public class SmartOutputFilter {
                 realContentStarted = true;
                 return after;
             }
-            // Drzi u buffer-u dok ne dodje \n\n
+            // Drzi u buffer-u dok ne dodje marker ili \n\n
             return "";
         }
 

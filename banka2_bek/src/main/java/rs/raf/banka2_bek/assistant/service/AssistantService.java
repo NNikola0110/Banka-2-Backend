@@ -177,16 +177,24 @@ public class AssistantService {
             // + master prompt-om i model ignorise tool_choice.
             String forcedFirstTool = null;
             if (agenticOn) {
-                forcedFirstTool = intentClassifier.classify(request.getMessage(), user)
-                        .orElse(null);
-                if (forcedFirstTool == null) {
-                    // Regex fallback — pokriva slucajeve kad je LLM klasifikator
-                    // pao (timeout, nepoznat tool, ...). 95% slucajeva LLM
-                    // bolje, ali regex je deterministican backup.
-                    forcedFirstTool = detectForcedTool(request.getMessage());
+                // REGEX FIRST (vece-6 runda): Gemma E2B (2B param model) confuses
+                // visually-similar intents like "kupi 5 AAPL akcija" (create_buy_order)
+                // vs "ulozi u fond" (invest_in_fund) — oba imaju "kupovinski" smisao.
+                // Regex je deterministican za jasne formulacije; LLM je fallback samo
+                // za dvosmislene poruke.
+                forcedFirstTool = detectForcedTool(request.getMessage());
+                if (forcedFirstTool != null) {
+                    log.info("ARBITRO regex matched: {} (msg='{}')",
+                            forcedFirstTool,
+                            request.getMessage().length() > 40
+                                    ? request.getMessage().substring(0, 40) + "..."
+                                    : request.getMessage());
+                } else {
+                    // Regex nije pogodio — pitamo LLM klasifikator (StructuredIntentClassifier)
+                    forcedFirstTool = intentClassifier.classify(request.getMessage(), user)
+                            .orElse(null);
                     if (forcedFirstTool != null) {
-                        log.info("ARBITRO IntentClassifier missed, regex fallback hit: {}",
-                                forcedFirstTool);
+                        log.info("ARBITRO LLM intent classifier hit: {}", forcedFirstTool);
                     }
                 }
             }
