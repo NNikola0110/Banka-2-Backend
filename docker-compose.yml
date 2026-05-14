@@ -133,6 +133,16 @@ services:
       PARTNER1_USER_PATH: ${PARTNER1_USER_PATH:-/interbank/user/{rn}/{id}}
       # Tim 1 routing broj
       PARTNER1_ROUTING: ${PARTNER1_ROUTING:-111}
+      # Arbitro Phase 6 — Whisper STT sidecar (faster-whisper tiny, port 8094 na hostu).
+      # Pokrece se kroz Banka-2-Tools/docker-compose.yml. Iz BE container-a
+      # se pristupa preko host.docker.internal (isti pattern kao Ollama+TTS).
+      # NOTE: host port 8094 (sidecar slusa 8093 unutar kontejnera) — 8093 zauzeo
+      # `banka2_alert_router` u prometheus stack-u.
+      # Ako Tools stack nije pokrenut, /assistant/chat-multipart graceful
+      # fallback na "(audio fajl)" placeholder + Gemma native ASR.
+      ARBITRO_WHISPER_URL: ${WHISPER_STT_URL:-http://host.docker.internal:8094}
+      ARBITRO_WHISPER_ENABLED: ${WHISPER_STT_ENABLED:-true}
+      ARBITRO_WHISPER_TIMEOUT_MS: ${WHISPER_STT_TIMEOUT_MS:-30000}
     # host.docker.internal alias za pristup host portovima (Linux native Docker
     # zahteva eksplicitan host-gateway alias; Docker Desktop ima nativno).
     # Koristi se SAMO za opcioni Arbitro stack u Banka-2-Tools/docker-compose.yml

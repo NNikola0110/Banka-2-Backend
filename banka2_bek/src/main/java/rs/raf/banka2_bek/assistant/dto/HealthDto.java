@@ -21,4 +21,6 @@ public class HealthDto {
     private boolean ragToolReachable;
     /** Phase 5 — Kokoro TTS sidecar reachability. */
     private boolean ttsReachable;
+    /** Whisper STT sidecar reachability (server-side speech recognition, port 8093). */
+    private boolean whisperReachable;
 }

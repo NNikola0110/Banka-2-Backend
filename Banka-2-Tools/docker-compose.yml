@@ -141,6 +141,34 @@ services:
       KOKORO_DEFAULT_VOICE: af_bella
     restart: unless-stopped
 
+  # Phase 6 — Whisper-tiny STT sidecar (faster-whisper, MIT). Lokalno hostovan,
+  # ~39MB model + ~70MB CTranslate2 runtime. CPU inference 2-5s na 10s audio
+  # (int8 quantization). Multilingual (32 jezika) — pokriva srpski + engleski
+  # mixed govor ("kupi 5 AAPL akcija").
+  #
+  # 3-tier anti-hallucination zastita:
+  #   1) Pre-flight RMS check — odbacuje audio gde je RMS < 0.005 (sustinski tisina)
+  #      pre nego sto pozove model. Stedi CPU + sprecava lazne pozitive.
+  #   2) Silero VAD (built-in u faster-whisper >= 0.10) — odseca tisinu/ambient
+  #      buku unutar segmenata sa `vad_filter=True`. Trening na milion+ sati audio
+  #      pa hendluje typing/AC/fan kao non-speech.
+  #   3) Hallucination pattern filter — Whisper-tiny zna da generise "Hvala vam"
+  #      / "Thanks for watching" iz tisine. Lista poznatih pattern-a se odbacuje
+  #      ako je audio duration < 3s.
+  #
+  # Model pre-baked u image-u tokom build-a — `docker compose up -d` daje odmah
+  # upotrebljiv sidecar bez first-call download cekanja.
+  # NOTE: host port 8094 (sidecar slusa na 8093 unutar kontejnera).
+  # 8093 je vec zauzeto sa `banka2_alert_router` u prometheus stack-u.
+  # BE kontejner mora da koristi 8094 u env var-u (`ARBITRO_WHISPER_URL`).
+  whisper-stt:
+    build: ./whisper-stt
+    image: ghcr.io/raf-si-2025/banka2-whisper-stt:latest
+    container_name: banka2_whisper_stt
+    ports:
+      - "8094:8093"
+    restart: unless-stopped
+
 volumes:
   # NAPOMENA: `ollama_models` volume je uklonjen — modeli su sada PRE-BAKED
   # u banka2-ollama image-u (vidi ./ollama/Dockerfile). Korisnik dobija

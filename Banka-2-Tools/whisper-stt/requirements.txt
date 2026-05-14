@@ -1,0 +1,15 @@
+# Whisper STT sidecar — Phase 5 voice input
+# Reference: github.com/SYSTRAN/faster-whisper (MIT license)
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.9
+pydantic>=2.9.0
+
+# faster-whisper 1.0.x+ koristi CTranslate2 backend — ~4x brzi od openai-whisper
+# uz polovinu VRAM-a. Built-in Silero VAD od verzije 0.10+ preko vad_filter=True.
+faster-whisper>=1.0.0
+
+# numpy 1.26.x je poslednja serija pre 2.0 ABI break-a; faster-whisper 1.0.x
+# i CTranslate2 jos uvek se kompajluju protiv numpy 1.x ABI-ja.
+numpy>=1.26.0,<2.0

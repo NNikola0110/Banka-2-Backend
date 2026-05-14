@@ -32,6 +32,7 @@ import rs.raf.banka2_bek.assistant.tool.WriteToolHandler;
 import rs.raf.banka2_bek.assistant.tool.client.KokoroTtsClient;
 import rs.raf.banka2_bek.assistant.tool.client.LlmHttpClient;
 import rs.raf.banka2_bek.assistant.tool.client.RagToolClient;
+import rs.raf.banka2_bek.assistant.tool.client.WhisperSttClient;
 import rs.raf.banka2_bek.assistant.tool.client.WikipediaToolClient;
 import rs.raf.banka2_bek.assistant.agentic.dto.AgentActionPreviewDto;
 import rs.raf.banka2_bek.assistant.agentic.service.AgentActionGateway;
@@ -76,6 +77,7 @@ public class AssistantService {
     private final WikipediaToolClient wikipediaToolClient;
     private final RagToolClient ragToolClient;
     private final KokoroTtsClient kokoroTtsClient;
+    private final WhisperSttClient whisperSttClient;
     private final ContextBuilder contextBuilder;
     private final ContextSanitizer sanitizer;
     // Defensive scrubbing iz LLM odgovora — uklanja meta-reasoning preamble
@@ -670,6 +672,7 @@ public class AssistantService {
         boolean rag = safelyPing(ragToolClient::ping, "rag");
         boolean tts = properties.getTools().getTts().isEnabled()
                 && safelyPing(kokoroTtsClient::ping, "tts");
+        boolean whisper = safelyPing(whisperSttClient::isReachable, "whisper");
         return HealthDto.builder()
                 .provider(properties.getProvider())
                 .model(properties.getModel())
@@ -677,6 +680,7 @@ public class AssistantService {
                 .wikipediaToolReachable(wiki)
                 .ragToolReachable(rag)
                 .ttsReachable(tts)
+                .whisperReachable(whisper)
                 .build();
     }
 
