@@ -1,5 +1,6 @@
 package rs.raf.banka2_bek.internalapi.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -278,8 +279,12 @@ public class InternalFundsService {
                         "Rezervacija ne postoji: " + reservationId));
 
         // 2. Idempotentnost: ako je status vec terminalan, vrati no-op
+        //    (sa stvarnim raspolozivim stanjem racuna, ne null — caller ga cita bez NPE)
         if (reservation.getStatus() != FundReservationStatus.RESERVED) {
-            return new ReleaseFundsResponse(reservationId, BigDecimal.ZERO, null);
+            BigDecimal currentAvailable = accountRepository.findById(reservation.getAccountId())
+                    .map(Account::getAvailableBalance)
+                    .orElse(BigDecimal.ZERO);
+            return new ReleaseFundsResponse(reservationId, BigDecimal.ZERO, currentAvailable);
         }
 
         // 3. Preostali iznos
@@ -360,8 +365,8 @@ public class InternalFundsService {
                 req.fromAccountId(),
                 req.toAccountId(),
                 req.amount(),
-                from.getAvailableBalance(),
-                to.getAvailableBalance());
+                from.getBalance(),
+                to.getBalance());
     }
 
     // ─── Pomocne metode ───────────────────────────────────────────────────────
@@ -397,11 +402,15 @@ public class InternalFundsService {
     }
 
     private void storeIdempotency(String key, String endpoint, Object result) {
+        String body;
         try {
-            String body = objectMapper.writeValueAsString(result);
-            idempotencyService.store(key, endpoint, 200, body);
-        } catch (Exception e) {
-            log.warn("Idempotency store failed for key {}: {}", key, e.getMessage());
+            body = objectMapper.writeValueAsString(result);
+        } catch (JsonProcessingException e) {
+            // Serijalizacija MORA uspeti: idempotency kes mora biti konzistentan sa
+            // izvrsenom operacijom. Propagiramo (unchecked) da se cela @Transactional
+            // operacija rollback-uje — bez divergencije commit-ovano stanje vs kes.
+            throw new RuntimeException("Idempotency serijalizacija nije uspela za kljuc " + key, e);
         }
+        idempotencyService.store(key, endpoint, 200, body);
     }
 }
