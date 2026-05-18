@@ -38,6 +38,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import org.mockito.ArgumentCaptor;
+
 @ExtendWith(MockitoExtension.class)
 class InternalFundsServiceTest {
 
@@ -98,7 +100,12 @@ class InternalFundsServiceTest {
         assertThat(account.getAvailableBalance()).isEqualByComparingTo("9500.00");
         assertThat(account.getReservedAmount()).isEqualByComparingTo("500.00");
 
-        verify(fundReservationRepository).save(any(FundReservation.class));
+        ArgumentCaptor<FundReservation> captor = ArgumentCaptor.forClass(FundReservation.class);
+        verify(fundReservationRepository).save(captor.capture());
+        FundReservation saved = captor.getValue();
+        assertThat(saved.getStatus()).isEqualTo(FundReservationStatus.RESERVED);
+        assertThat(saved.getAmount()).isEqualByComparingTo("500.00");
+        assertThat(saved.getReservationId()).isNotBlank();
         verify(accountRepository).save(account);
     }
 
@@ -140,6 +147,8 @@ class InternalFundsServiceTest {
 
     @Test
     void commit_happyPath_decreasesBalanceAndReserved() {
+        // reserve() would have set reservedAmount=1000 before commit is called
+        account.setReservedAmount(new BigDecimal("1000.00"));
         FundReservation reservation = buildReservation("res-001", 1L, "1000.00", "0.00", FundReservationStatus.RESERVED);
 
         when(fundReservationRepository.findByReservationIdForUpdate("res-001"))
@@ -156,11 +165,14 @@ class InternalFundsServiceTest {
         assertThat(response.reservationId()).isEqualTo("res-001");
         assertThat(response.committedTotal()).isEqualByComparingTo("800.00");
         assertThat(account.getBalance()).isEqualByComparingTo("9200.00");
-        assertThat(account.getReservedAmount()).isEqualByComparingTo("-800.00"); // was 0, now -800 because we subtract
+        // reservedAmount started at 1000, subtract settle(800) → 200
+        assertThat(account.getReservedAmount()).isEqualByComparingTo("200.00");
     }
 
     @Test
     void commit_withBeneficiary_creditsBeneficiaryAccount() {
+        // reserve() would have set reservedAmount=500 before commit is called
+        account.setReservedAmount(new BigDecimal("500.00"));
         FundReservation reservation = buildReservation("res-002", 1L, "500.00", "0.00", FundReservationStatus.RESERVED);
 
         Account beneficiary = Account.builder()
@@ -186,8 +198,12 @@ class InternalFundsServiceTest {
         when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         CommitFundsRequest req = new CommitFundsRequest(new BigDecimal("500.00"), BigDecimal.ZERO, 2L, "OTC premium");
-        service.commit("res-002", req);
+        CommitFundsResponse resp = service.commit("res-002", req);
 
+        // Response assertions: settle=500+0=500; account.balance=10000-500=9500
+        assertThat(resp.committedTotal()).isEqualByComparingTo("500.00");
+        assertThat(resp.balanceAfter()).isEqualByComparingTo("9500.00");
+        // Beneficiary credited with amount (not amount+commission)
         assertThat(beneficiary.getBalance()).isEqualByComparingTo("1500.00");
         assertThat(beneficiary.getAvailableBalance()).isEqualByComparingTo("1500.00");
     }
@@ -256,6 +272,11 @@ class InternalFundsServiceTest {
 
         // Should return zero released amount (no-op)
         assertThat(response.releasedAmount()).isEqualByComparingTo("0.00");
+        // reservationId echoed back correctly
+        assertThat(response.reservationId()).isEqualTo("res-006");
+        // availableBalanceAfter non-null and matches current account available balance (read-only lookup)
+        assertThat(response.availableBalanceAfter()).isNotNull();
+        assertThat(response.availableBalanceAfter()).isEqualByComparingTo(account.getAvailableBalance());
         // Account mutations NOT called
         verify(accountRepository, never()).findForUpdateById(any());
         verify(accountRepository, never()).save(any());

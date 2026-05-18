@@ -41,8 +41,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 @ActiveProfiles("test")
 class InternalFundsControllerIntegrationTest {
 
-    /** Default value from application.properties: ${INTERNAL_API_KEY:dev-internal-key-rotate-in-prod} */
-    private static final String INTERNAL_KEY = "dev-internal-key-rotate-in-prod";
+    @Value("${internal.api-key}")
+    private String internalKey;
 
     @Value("${local.server.port}")
     private int port;
@@ -129,7 +129,7 @@ class InternalFundsControllerIntegrationTest {
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
-        headers.set("X-Internal-Key", INTERNAL_KEY);
+        headers.set("X-Internal-Key", internalKey);
         // No X-Idempotency-Key
 
         ResponseEntity<String> resp = restTemplate.postForEntity(
@@ -186,7 +186,7 @@ class InternalFundsControllerIntegrationTest {
     private HttpHeaders internalHeaders(String idempotencyKey) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
-        headers.set("X-Internal-Key", INTERNAL_KEY);
+        headers.set("X-Internal-Key", internalKey);
         headers.set("X-Idempotency-Key", idempotencyKey);
         return headers;
     }
