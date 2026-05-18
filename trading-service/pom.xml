@@ -20,6 +20,7 @@
 
     <properties>
         <java.version>25</java.version>
+        <influxdb-client.version>7.3.0</influxdb-client.version>
     </properties>
 
     <dependencies>
@@ -87,6 +88,18 @@
             <groupId>org.springdoc</groupId>
             <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
             <version>3.0.3</version>
+        </dependency>
+        <!-- Lombok - kopirani trgovinski kod koristi @RequiredArgsConstructor/@Slf4j/@Builder -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <!-- InfluxDB klijent - time-series OHLCV (uspavan: banka2.influx.enabled=false) -->
+        <dependency>
+            <groupId>com.influxdb</groupId>
+            <artifactId>influxdb-client-java</artifactId>
+            <version>${influxdb-client.version}</version>
         </dependency>
     </dependencies>
 
