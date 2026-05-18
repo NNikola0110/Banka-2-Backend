@@ -104,6 +104,19 @@
             <artifactId>spring-boot-starter-mail</artifactId>
         </dependency>
 
+        <!-- Spring AMQP - monolit publish-uje notifikacione poruke na RabbitMQ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
+
+        <!-- Zajednicki kontrakti (NotificationMessage, NotificationRabbit) -->
+        <dependency>
+            <groupId>rs.raf</groupId>
+            <artifactId>banka2-contracts</artifactId>
+            <version>0.0.1-SNAPSHOT</version>
+        </dependency>
+
         <!-- Cache (Caffeine sa TTL) — koristi ActuaryProfitService -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
