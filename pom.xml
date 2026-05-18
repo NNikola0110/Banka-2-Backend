@@ -30,6 +30,7 @@
     <modules>
         <module>banka2-contracts</module>
         <module>banka2_bek</module>
+        <module>trading-service</module>
         <module>notification-service</module>
     </modules>
 
