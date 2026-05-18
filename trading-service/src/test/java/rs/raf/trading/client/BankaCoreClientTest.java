@@ -7,11 +7,13 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
+import rs.raf.banka2.contracts.internal.FxRateDto;
 import rs.raf.banka2.contracts.internal.InternalAccountDto;
 import rs.raf.banka2.contracts.internal.ReserveFundsRequest;
 import rs.raf.banka2.contracts.internal.ReserveFundsResponse;
 
 import java.math.BigDecimal;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -146,6 +148,27 @@ class BankaCoreClientTest {
         ReserveFundsRequest request = new ReserveFundsRequest(5L, new BigDecimal("200.00"), "EUR");
 
         bankaCoreClient.reserveFunds("unique-key-xyz-789", request);
+
+        mockServer.verify();
+    }
+
+    @Test
+    void getFxRates_happyPath_returnsDeserializedRates_andSendsInternalKeyHeader() throws Exception {
+        List<FxRateDto> stubRates = List.of(new FxRateDto("RSD", 1.0), new FxRateDto("EUR", 0.0085));
+        String responseJson = objectMapper.writeValueAsString(stubRates);
+
+        mockServer.expect(requestTo(BASE_URL + "/internal/fx/rates"))
+                .andExpect(method(HttpMethod.GET))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        List<FxRateDto> result = bankaCoreClient.getFxRates();
+
+        assertThat(result).hasSize(2);
+        assertThat(result.get(0).currency()).isEqualTo("RSD");
+        assertThat(result.get(0).rate()).isEqualTo(1.0);
+        assertThat(result.get(1).currency()).isEqualTo("EUR");
+        assertThat(result.get(1).rate()).isEqualTo(0.0085);
 
         mockServer.verify();
     }

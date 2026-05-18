@@ -12,6 +12,7 @@ import rs.raf.banka2.contracts.internal.ReserveFundsRequest;
 import rs.raf.banka2.contracts.internal.ReserveFundsResponse;
 import rs.raf.banka2.contracts.internal.TransferFundsRequest;
 import rs.raf.banka2.contracts.internal.TransferFundsResponse;
+import rs.raf.banka2.contracts.internal.FxRateDto;
 
 import java.util.List;
 
@@ -70,6 +71,22 @@ public class BankaCoreClient {
                 })
                 .body(String[].class);
         return perms == null ? List.of() : List.of(perms);
+    }
+
+    /**
+     * Vraca srednje devizne kurseve sa banka-core (GET /internal/fx/rates).
+     * Koristi ga stock.ListingServiceImpl za FOREX cross-rate racun.
+     */
+    public List<FxRateDto> getFxRates() {
+        FxRateDto[] rates = client.get()
+                .uri("/internal/fx/rates")
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, (request, response) -> {
+                    throw new BankaCoreClientException(response.getStatusCode().value(),
+                            "banka-core GET /internal/fx/rates → " + response.getStatusCode());
+                })
+                .body(FxRateDto[].class);
+        return rates == null ? List.of() : List.of(rates);
     }
 
     private <T> T post(String path, String idempotencyKey, Object body, Class<T> responseType) {
