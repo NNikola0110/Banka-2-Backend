@@ -20,7 +20,7 @@ import rs.raf.banka2_bek.loan.repository.LoanInstallmentRepository;
 import rs.raf.banka2_bek.loan.repository.LoanRepository;
 import rs.raf.banka2_bek.loan.repository.LoanRequestRepository;
 import rs.raf.banka2_bek.loan.service.implementation.LoanServiceImpl;
-import rs.raf.banka2_bek.notification.service.MailNotificationService;
+import rs.raf.banka2_bek.notification.NotificationPublisher;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -47,7 +47,7 @@ class LoanServiceImplCoverageTest {
     @Mock private AccountRepository accountRepository;
     @Mock private ClientRepository clientRepository;
     @Mock private CurrencyRepository currencyRepository;
-    @Mock private MailNotificationService mailNotificationService;
+    @Mock private NotificationPublisher notificationPublisher;
 
     private LoanServiceImpl loanService;
 
@@ -61,7 +61,7 @@ class LoanServiceImplCoverageTest {
         loanService = new LoanServiceImpl(
                 loanRequestRepository, loanRepository, installmentRepository,
                 accountRepository, clientRepository, currencyRepository,
-                mailNotificationService, "22200022");
+                notificationPublisher, "22200022");
 
         rsd = new Currency();
         rsd.setId(8L);

@@ -27,7 +27,7 @@ import rs.raf.banka2_bek.payment.model.PaymentStatus;
 import rs.raf.banka2_bek.payment.repository.PaymentAccountRepository;
 import rs.raf.banka2_bek.payment.repository.PaymentRepository;
 import rs.raf.banka2_bek.payment.service.implementation.PaymentServiceImpl;
-import rs.raf.banka2_bek.notification.service.MailNotificationService;
+import rs.raf.banka2_bek.notification.NotificationPublisher;
 import rs.raf.banka2_bek.interbank.service.BankRoutingService;
 import rs.raf.banka2_bek.interbank.service.TransactionExecutorService;
 import rs.raf.banka2_bek.interbank.service.InterbankPaymentAsyncService;
@@ -68,7 +68,7 @@ class PaymentServiceImplTest {
     @Mock
     private ExchangeService exchangeService;
     @Mock
-    private MailNotificationService mailNotificationService;
+    private NotificationPublisher notificationPublisher;
     @Mock
     private BankRoutingService bankRoutingService;
     @Mock
@@ -91,7 +91,7 @@ class PaymentServiceImplTest {
         paymentService = new PaymentServiceImpl(
                 paymentRepository, paymentAccountRepository, accountRepository,
                 clientRepository, transactionService, paymentReceiptPdfGenerator,
-                exchangeService, mailNotificationService,
+                exchangeService, notificationPublisher,
                 bankRoutingService, transactionExecutorService,
                 interbankPaymentAsyncService, interbankTransactionRepository,
                 "22200022");

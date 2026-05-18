@@ -25,7 +25,7 @@ import rs.raf.banka2_bek.card.repository.CardRepository;
 import rs.raf.banka2_bek.card.service.implementation.CardServiceImpl;
 import rs.raf.banka2_bek.client.model.Client;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
-import rs.raf.banka2_bek.notification.service.MailNotificationService;
+import rs.raf.banka2_bek.notification.NotificationPublisher;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -43,7 +43,7 @@ class CardServiceImplTest {
     @Mock private CardRepository cardRepository;
     @Mock private AccountRepository accountRepository;
     @Mock private ClientRepository clientRepository;
-    @Mock private MailNotificationService mailNotificationService;
+    @Mock private NotificationPublisher notificationPublisher;
 
     @InjectMocks
     private CardServiceImpl cardService;
@@ -540,7 +540,7 @@ class CardServiceImplTest {
 
             cardService.blockCard(1L);
 
-            verify(mailNotificationService).sendCardBlockedMail(
+            verify(notificationPublisher).sendCardBlockedMail(
                     eq("stefan@test.com"), eq("7890"), any(LocalDate.class));
         }
 
@@ -555,7 +555,7 @@ class CardServiceImplTest {
 
             when(cardRepository.findById(1L)).thenReturn(Optional.of(card));
             when(cardRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
-            doThrow(new RuntimeException("SMTP error")).when(mailNotificationService)
+            doThrow(new RuntimeException("SMTP error")).when(notificationPublisher)
                     .sendCardBlockedMail(anyString(), anyString(), any(LocalDate.class));
 
             CardResponseDto result = cardService.blockCard(1L);
@@ -597,7 +597,7 @@ class CardServiceImplTest {
 
             cardService.unblockCard(1L);
 
-            verify(mailNotificationService).sendCardUnblockedMail(
+            verify(notificationPublisher).sendCardUnblockedMail(
                     eq("stefan@test.com"), eq("7890"));
         }
 
@@ -612,7 +612,7 @@ class CardServiceImplTest {
 
             when(cardRepository.findById(1L)).thenReturn(Optional.of(card));
             when(cardRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
-            doThrow(new RuntimeException("SMTP error")).when(mailNotificationService)
+            doThrow(new RuntimeException("SMTP error")).when(notificationPublisher)
                     .sendCardUnblockedMail(anyString(), anyString());
 
             CardResponseDto result = cardService.unblockCard(1L);

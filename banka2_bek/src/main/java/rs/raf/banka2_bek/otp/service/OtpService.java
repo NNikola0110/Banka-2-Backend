@@ -3,7 +3,7 @@ package rs.raf.banka2_bek.otp.service;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import rs.raf.banka2_bek.notification.service.MailNotificationService;
+import rs.raf.banka2_bek.notification.NotificationPublisher;
 import rs.raf.banka2_bek.otp.model.OtpVerification;
 import rs.raf.banka2_bek.otp.repository.OtpVerificationRepository;
 
@@ -39,17 +39,17 @@ import java.util.Map;
 public class OtpService {
 
     private final OtpVerificationRepository otpRepository;
-    private final MailNotificationService mailNotificationService;
+    private final NotificationPublisher notificationPublisher;
     private final int expiryMinutes;
     private final int maxAttempts;
     private final SecureRandom secureRandom = new SecureRandom();
 
     public OtpService(OtpVerificationRepository otpRepository,
-                      MailNotificationService mailNotificationService,
+                      NotificationPublisher notificationPublisher,
                       @Value("${otp.expiry-minutes:5}") int expiryMinutes,
                       @Value("${otp.max-attempts:3}") int maxAttempts) {
         this.otpRepository = otpRepository;
-        this.mailNotificationService = mailNotificationService;
+        this.notificationPublisher = notificationPublisher;
         this.expiryMinutes = expiryMinutes;
         this.maxAttempts = maxAttempts;
     }
@@ -93,7 +93,7 @@ public class OtpService {
                 .build();
 
         otpRepository.save(otp);
-        mailNotificationService.sendOtpMail(email, code, expiryMinutes);
+        notificationPublisher.sendOtpMail(email, code, expiryMinutes);
     }
 
     @Transactional(readOnly = true)

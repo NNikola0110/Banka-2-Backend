@@ -8,7 +8,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import rs.raf.banka2_bek.notification.service.MailNotificationService;
+import rs.raf.banka2_bek.notification.NotificationPublisher;
 import rs.raf.banka2_bek.otp.model.OtpVerification;
 import rs.raf.banka2_bek.otp.repository.OtpVerificationRepository;
 
@@ -24,7 +24,7 @@ import static org.mockito.Mockito.*;
 class OtpServiceTest {
 
     @Mock private OtpVerificationRepository otpRepository;
-    @Mock private MailNotificationService mailNotificationService;
+    @Mock private NotificationPublisher notificationPublisher;
 
     private OtpService otpService;
 
@@ -33,7 +33,7 @@ class OtpServiceTest {
 
     @BeforeEach
     void setUp() {
-        otpService = new OtpService(otpRepository, mailNotificationService, EXPIRY_MINUTES, MAX_ATTEMPTS);
+        otpService = new OtpService(otpRepository, notificationPublisher, EXPIRY_MINUTES, MAX_ATTEMPTS);
     }
 
     // ===== generateAndSend =====
@@ -90,7 +90,7 @@ class OtpServiceTest {
 
             otpService.generateAndSend("user@test.com");
 
-            verifyNoInteractions(mailNotificationService);
+            verifyNoInteractions(notificationPublisher);
         }
     }
 
@@ -115,7 +115,7 @@ class OtpServiceTest {
             OtpVerification saved = captor.getValue();
             assertThat(saved.getCode()).matches("\\d{6}");
 
-            verify(mailNotificationService).sendOtpMail(
+            verify(notificationPublisher).sendOtpMail(
                     eq("user@test.com"), eq(saved.getCode()), eq(EXPIRY_MINUTES));
         }
 
@@ -134,7 +134,7 @@ class OtpServiceTest {
             otpService.generateAndSendViaEmail("user@test.com");
 
             assertThat(existing.getUsed()).isTrue();
-            verify(mailNotificationService).sendOtpMail(eq("user@test.com"), anyString(), eq(EXPIRY_MINUTES));
+            verify(notificationPublisher).sendOtpMail(eq("user@test.com"), anyString(), eq(EXPIRY_MINUTES));
         }
     }
 

@@ -28,7 +28,7 @@ import rs.raf.banka2_bek.loan.repository.LoanInstallmentRepository;
 import rs.raf.banka2_bek.loan.repository.LoanRepository;
 import rs.raf.banka2_bek.loan.repository.LoanRequestRepository;
 import rs.raf.banka2_bek.loan.service.implementation.LoanServiceImpl;
-import rs.raf.banka2_bek.notification.service.MailNotificationService;
+import rs.raf.banka2_bek.notification.NotificationPublisher;
 
 import java.math.BigDecimal;
 import java.math.MathContext;
@@ -53,7 +53,7 @@ class LoanServiceImplExtendedTest {
     @Mock private AccountRepository accountRepository;
     @Mock private ClientRepository clientRepository;
     @Mock private CurrencyRepository currencyRepository;
-    @Mock private MailNotificationService mailNotificationService;
+    @Mock private NotificationPublisher notificationPublisher;
 
     private LoanServiceImpl loanService;
 
@@ -67,7 +67,7 @@ class LoanServiceImplExtendedTest {
         loanService = new LoanServiceImpl(
                 loanRequestRepository, loanRepository, installmentRepository,
                 accountRepository, clientRepository, currencyRepository,
-                mailNotificationService, "22200022");
+                notificationPublisher, "22200022");
 
         rsd = new Currency();
         rsd.setId(8L);
@@ -207,7 +207,7 @@ class LoanServiceImplExtendedTest {
                 r.setId(1L);
                 return r;
             });
-            doThrow(new RuntimeException("SMTP error")).when(mailNotificationService)
+            doThrow(new RuntimeException("SMTP error")).when(notificationPublisher)
                     .sendLoanRequestSubmittedMail(anyString(), anyString(), any(), anyString());
 
             LoanRequestResponseDto result = loanService.createLoanRequest(dto, "stefan@test.com");
@@ -478,7 +478,7 @@ class LoanServiceImplExtendedTest {
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankAccount));
             when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
             when(installmentRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
-            doThrow(new RuntimeException("SMTP down")).when(mailNotificationService)
+            doThrow(new RuntimeException("SMTP down")).when(notificationPublisher)
                     .sendLoanApprovedMail(anyString(), anyString(), any(), anyString(), any(), any());
 
             LoanResponseDto result = loanService.approveLoanRequest(1L);
@@ -524,7 +524,7 @@ class LoanServiceImplExtendedTest {
 
             when(loanRequestRepository.findById(1L)).thenReturn(Optional.of(request));
             when(loanRequestRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
-            doThrow(new RuntimeException("SMTP")).when(mailNotificationService)
+            doThrow(new RuntimeException("SMTP")).when(notificationPublisher)
                     .sendLoanRejectedMail(anyString(), anyString(), any(), anyString());
 
             LoanRequestResponseDto result = loanService.rejectLoanRequest(1L);

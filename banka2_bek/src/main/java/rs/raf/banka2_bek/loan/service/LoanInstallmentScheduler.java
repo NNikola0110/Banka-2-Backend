@@ -12,7 +12,7 @@ import rs.raf.banka2_bek.loan.model.LoanInstallment;
 import rs.raf.banka2_bek.loan.model.LoanStatus;
 import rs.raf.banka2_bek.loan.repository.LoanInstallmentRepository;
 import rs.raf.banka2_bek.loan.repository.LoanRepository;
-import rs.raf.banka2_bek.notification.service.MailNotificationService;
+import rs.raf.banka2_bek.notification.NotificationPublisher;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -25,18 +25,18 @@ public class LoanInstallmentScheduler {
     private final LoanInstallmentRepository installmentRepository;
     private final LoanRepository loanRepository;
     private final AccountRepository accountRepository;
-    private final MailNotificationService mailNotificationService;
+    private final NotificationPublisher notificationPublisher;
     private final String bankRegistrationNumber;
 
     public LoanInstallmentScheduler(LoanInstallmentRepository installmentRepository,
                                      LoanRepository loanRepository,
                                      AccountRepository accountRepository,
-                                     MailNotificationService mailNotificationService,
+                                     NotificationPublisher notificationPublisher,
                                      @Value("${bank.registration-number}") String bankRegistrationNumber) {
         this.installmentRepository = installmentRepository;
         this.loanRepository = loanRepository;
         this.accountRepository = accountRepository;
-        this.mailNotificationService = mailNotificationService;
+        this.notificationPublisher = notificationPublisher;
         this.bankRegistrationNumber = bankRegistrationNumber;
     }
 
@@ -110,7 +110,7 @@ public class LoanInstallmentScheduler {
                     installment.getInterestAmount() != null ? installment.getInterestAmount() : "N/A");
 
             try {
-                mailNotificationService.sendInstallmentPaidMail(
+                notificationPublisher.sendInstallmentPaidMail(
                         loan.getClient().getEmail(),
                         loan.getLoanNumber(),
                         installment.getAmount(),
@@ -134,7 +134,7 @@ public class LoanInstallmentScheduler {
                     installment.getId(), loan.getLoanNumber(), nextRetryDate);
 
             try {
-                mailNotificationService.sendInstallmentFailedMail(
+                notificationPublisher.sendInstallmentFailedMail(
                         loan.getClient().getEmail(),
                         loan.getLoanNumber(),
                         installment.getAmount(),

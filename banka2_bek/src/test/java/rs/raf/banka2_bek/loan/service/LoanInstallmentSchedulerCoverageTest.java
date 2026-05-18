@@ -15,7 +15,7 @@ import rs.raf.banka2_bek.loan.model.LoanInstallment;
 import rs.raf.banka2_bek.loan.model.LoanStatus;
 import rs.raf.banka2_bek.loan.repository.LoanInstallmentRepository;
 import rs.raf.banka2_bek.loan.repository.LoanRepository;
-import rs.raf.banka2_bek.notification.service.MailNotificationService;
+import rs.raf.banka2_bek.notification.NotificationPublisher;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -42,7 +42,7 @@ class LoanInstallmentSchedulerCoverageTest {
     @Mock private LoanInstallmentRepository installmentRepository;
     @Mock private LoanRepository loanRepository;
     @Mock private AccountRepository accountRepository;
-    @Mock private MailNotificationService mailNotificationService;
+    @Mock private NotificationPublisher notificationPublisher;
 
     private LoanInstallmentScheduler scheduler;
 
@@ -50,7 +50,7 @@ class LoanInstallmentSchedulerCoverageTest {
     void setUp() {
         scheduler = new LoanInstallmentScheduler(
                 installmentRepository, loanRepository, accountRepository,
-                mailNotificationService, BANK_REG_NUMBER);
+                notificationPublisher, BANK_REG_NUMBER);
     }
 
     @Test

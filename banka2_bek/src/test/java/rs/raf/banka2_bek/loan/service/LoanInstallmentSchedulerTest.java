@@ -16,7 +16,7 @@ import rs.raf.banka2_bek.loan.model.LoanInstallment;
 import rs.raf.banka2_bek.loan.model.LoanStatus;
 import rs.raf.banka2_bek.loan.repository.LoanInstallmentRepository;
 import rs.raf.banka2_bek.loan.repository.LoanRepository;
-import rs.raf.banka2_bek.notification.service.MailNotificationService;
+import rs.raf.banka2_bek.notification.NotificationPublisher;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -45,7 +45,7 @@ class LoanInstallmentSchedulerTest {
     private AccountRepository accountRepository;
 
     @Mock
-    private MailNotificationService mailNotificationService;
+    private NotificationPublisher notificationPublisher;
 
     private LoanInstallmentScheduler scheduler;
 
@@ -53,7 +53,7 @@ class LoanInstallmentSchedulerTest {
     void setUp() {
         scheduler = new LoanInstallmentScheduler(
                 installmentRepository, loanRepository, accountRepository,
-                mailNotificationService, BANK_REG_NUMBER);
+                notificationPublisher, BANK_REG_NUMBER);
     }
 
     private Currency buildCurrency() {
@@ -284,7 +284,7 @@ class LoanInstallmentSchedulerTest {
             when(accountRepository.findBankAccountForUpdateByCurrency(any(), eq("RSD")))
                     .thenReturn(Optional.empty());
             doThrow(new RuntimeException("SMTP error"))
-                    .when(mailNotificationService).sendInstallmentPaidMail(
+                    .when(notificationPublisher).sendInstallmentPaidMail(
                             anyString(), anyString(), any(), anyString(), any());
 
             scheduler.processInstallments();
@@ -308,7 +308,7 @@ class LoanInstallmentSchedulerTest {
                     .thenReturn(List.of(installment));
             when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
             doThrow(new RuntimeException("SMTP error"))
-                    .when(mailNotificationService).sendInstallmentFailedMail(
+                    .when(notificationPublisher).sendInstallmentFailedMail(
                             anyString(), anyString(), any(), anyString(), any());
 
             scheduler.processInstallments();
