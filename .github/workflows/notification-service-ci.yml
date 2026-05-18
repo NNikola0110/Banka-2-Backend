@@ -1,0 +1,35 @@
+name: notification-service-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'notification-service/**'
+      - 'banka2-contracts/**'
+      - 'pom.xml'
+      - '.github/workflows/notification-service-ci.yml'
+  pull_request:
+    paths:
+      - 'notification-service/**'
+      - 'banka2-contracts/**'
+      - 'pom.xml'
+      - '.github/workflows/notification-service-ci.yml'
+
+jobs:
+  build-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: temurin
+          cache: maven
+          cache-dependency-path: notification-service/pom.xml
+
+      - name: Build & test notification-service
+        # -am gradi upstream reactor module (banka2-contracts) pre notification-service
+        run: mvn -B -pl notification-service -am verify
