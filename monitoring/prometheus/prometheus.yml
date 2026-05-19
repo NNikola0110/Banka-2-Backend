@@ -24,9 +24,9 @@ scrape_configs:
       - targets:
           - localhost:9090
 
-  # Banka2 backend — Spring Boot Actuator + Micrometer Prometheus registry
-  # automatski publikuju standardne (JVM, HTTP, DB, cache) i custom poslovne
-  # metrike na /actuator/prometheus endpoint-u.
+  # Banka2 backend (banka-core monolit) — Spring Boot Actuator + Micrometer
+  # Prometheus registry automatski publikuju standardne (JVM, HTTP, DB, cache)
+  # i custom poslovne metrike na /actuator/prometheus endpoint-u.
   - job_name: banka2_backend
     metrics_path: /actuator/prometheus
     scrape_interval: 15s
@@ -36,6 +36,34 @@ scrape_configs:
         labels:
           service: backend
           tier: api
+
+  # trading-service — pod-faza 2f cutover izdvojio trgovinski domen u zasebnu
+  # uslugu (orderi, portfolio, listings, OTC, fondovi, porez, opcije, margin).
+  # /actuator/prometheus dodat u Fazi 3-2. Docker-compose service hostname je
+  # `trading-service`, container port 8082 (server.port=8082).
+  - job_name: trading_service
+    metrics_path: /actuator/prometheus
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - trading-service:8082
+        labels:
+          service: trading-service
+          tier: api
+
+  # notification-service — Faza 1 izdvojila email notifikacioni sloj
+  # (RabbitMQ consumer). /actuator/prometheus dodat u Fazi 3-2.
+  # Docker-compose service hostname je `notification-service`, container
+  # port 8083 (server.port=8083).
+  - job_name: notification_service
+    metrics_path: /actuator/prometheus
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - notification-service:8083
+        labels:
+          service: notification-service
+          tier: worker
 
   # AlertManager self-metrike.
   - job_name: alertmanager
