@@ -22,6 +22,8 @@ import rs.raf.banka2_bek.interbank.protocol.OtcOffer;
 import rs.raf.banka2_bek.interbank.protocol.PublicStock;
 import rs.raf.banka2_bek.interbank.protocol.StockDescription;
 import rs.raf.banka2_bek.interbank.protocol.UserInformation;
+import rs.raf.banka2.contracts.internal.InternalListingDto;
+import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcContractRepository;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcNegotiationRepository;
 import rs.raf.banka2_bek.interbank.service.OtcNegotiationService;
@@ -30,8 +32,6 @@ import rs.raf.banka2_bek.interbank.wrapper.InterbankOtcWrapperDtos.CreateOtcInte
 import rs.raf.banka2_bek.interbank.wrapper.InterbankOtcWrapperDtos.OtcInterbankContract;
 import rs.raf.banka2_bek.interbank.wrapper.InterbankOtcWrapperDtos.OtcInterbankListing;
 import rs.raf.banka2_bek.interbank.wrapper.InterbankOtcWrapperDtos.OtcInterbankOffer;
-import rs.raf.banka2_bek.stock.model.Listing;
-import rs.raf.banka2_bek.stock.repository.ListingRepository;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -72,7 +72,7 @@ public class InterbankOtcWrapperService {
     private final InterbankOtcContractRepository contractRepository;
     private final ClientRepository clientRepository;
     private final EmployeeRepository employeeRepository;
-    private final ListingRepository listingRepository;
+    private final TradingServiceInternalClient tradingServiceClient;
 
     /** Cache imena partner banaka po routing number-u (resolveUserName izlaz). */
     private final Map<String, UserInformation> userInfoCache = new ConcurrentHashMap<>();
@@ -95,13 +95,17 @@ public class InterbankOtcWrapperService {
             try {
                 List<PublicStock> stocks = negotiationService.fetchRemotePublicStocks(rn);
                 for (PublicStock ps : stocks) {
-                    Optional<Listing> localListing = listingRepository.findByTicker(ps.stock().ticker());
-                    String listingName = localListing.map(Listing::getName).orElse(ps.stock().ticker());
-                    String currency = localListing.map(l -> l.getQuoteCurrency() != null
-                            ? l.getQuoteCurrency()
-                            : (l.getBaseCurrency() != null ? l.getBaseCurrency() : "USD"))
+                    Optional<InternalListingDto> localListing =
+                            tradingServiceClient.findListingByTicker(ps.stock().ticker());
+                    String listingName = localListing.map(InternalListingDto::name)
+                            .orElse(ps.stock().ticker());
+                    String currency = localListing.map(l -> l.quoteCurrency() != null
+                            ? l.quoteCurrency()
+                            : (l.baseCurrency() != null ? l.baseCurrency() : "USD"))
                             .orElse("USD");
-                    BigDecimal currentPrice = localListing.map(Listing::getPrice).orElse(BigDecimal.ZERO);
+                    BigDecimal currentPrice = localListing.map(InternalListingDto::price)
+                            .map(price -> price != null ? price : BigDecimal.ZERO)
+                            .orElse(BigDecimal.ZERO);
 
                     for (PublicStock.Seller seller : ps.sellers()) {
                         String role = inferRole(seller.seller().id());
@@ -136,12 +140,12 @@ public class InterbankOtcWrapperService {
             throw new IllegalArgumentException("sellerBankCode mora biti partner banka, ne nasa");
         }
 
-        Listing listing = listingRepository.findByTicker(request.listingTicker())
+        InternalListingDto listing = tradingServiceClient.findListingByTicker(request.listingTicker())
                 .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
                         "Ticker " + request.listingTicker() + " ne postoji u nasem listings-u"));
-        String currency = listing.getQuoteCurrency() != null
-                ? listing.getQuoteCurrency()
-                : (listing.getBaseCurrency() != null ? listing.getBaseCurrency() : "USD");
+        String currency = listing.quoteCurrency() != null
+                ? listing.quoteCurrency()
+                : (listing.baseCurrency() != null ? listing.baseCurrency() : "USD");
 
         ForeignBankId buyerId = new ForeignBankId(myRouting, prefixedId(buyerUserId, buyerUserRole));
         ForeignBankId sellerId = new ForeignBankId(sellerRouting, request.sellerUserId());
@@ -451,9 +455,11 @@ public class InterbankOtcWrapperService {
                 ? prefixedId(n.getLocalPartyId(), n.getLocalPartyRole())
                 : n.getForeignPartyIdString();
 
-        Optional<Listing> listing = listingRepository.findByTicker(n.getTicker());
-        String listingName = listing.map(Listing::getName).orElse(n.getTicker());
-        BigDecimal currentPrice = listing.map(Listing::getPrice).orElse(BigDecimal.ZERO);
+        Optional<InternalListingDto> listing = tradingServiceClient.findListingByTicker(n.getTicker());
+        String listingName = listing.map(InternalListingDto::name).orElse(n.getTicker());
+        BigDecimal currentPrice = listing.map(InternalListingDto::price)
+                .map(price -> price != null ? price : BigDecimal.ZERO)
+                .orElse(BigDecimal.ZERO);
 
         return new OtcInterbankOffer(
                 n.getForeignNegotiationRoutingNumber() + ":" + n.getForeignNegotiationIdString(),
@@ -495,20 +501,22 @@ public class InterbankOtcWrapperService {
             buyerUserId = c.getForeignPartyIdString();
         }
 
-        Optional<Listing> listing = listingRepository.findByTicker(c.getTicker());
+        Optional<InternalListingDto> listing = tradingServiceClient.findListingByTicker(c.getTicker());
 
         return new OtcInterbankContract(
                 String.valueOf(c.getId()),
-                listing.map(Listing::getId).orElse(0L),
+                listing.map(InternalListingDto::id).orElse(0L),
                 c.getTicker(),
-                listing.map(Listing::getName).orElse(c.getTicker()),
+                listing.map(InternalListingDto::name).orElse(c.getTicker()),
                 c.getStrikeCurrency(),
                 buyerUserId, buyerBankCode, resolveLocalOrForeignName(buyerBankCode, buyerUserId),
                 sellerUserId, sellerBankCode, resolveLocalOrForeignName(sellerBankCode, sellerUserId),
                 c.getQuantity(),
                 c.getStrikePrice(),
                 c.getPremium(),
-                listing.map(Listing::getPrice).orElse(BigDecimal.ZERO),
+                listing.map(InternalListingDto::price)
+                        .map(price -> price != null ? price : BigDecimal.ZERO)
+                        .orElse(BigDecimal.ZERO),
                 c.getSettlementDate(),
                 c.getStatus().name(),
                 c.getCreatedAt(),

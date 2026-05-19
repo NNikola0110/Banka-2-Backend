@@ -31,7 +31,16 @@ public class InterbankConfig {
                 .enable(SerializationFeature.WRITE_BIGDECIMAL_AS_PLAIN);
     }
 
+    /**
+     * {@code @Primary} — od faze 2f postoje 2 {@code RestClient} bean-a
+     * ({@code interbankRestClient} + {@code tradingServiceRestClient} iz
+     * {@code TradingServiceClientConfig}). {@code InterbankClient} injektuje
+     * {@code RestClient} po tipu (Lombok {@code @RequiredArgsConstructor}); ovaj
+     * je default. {@code TradingServiceInternalClient} koristi eksplicitan
+     * {@code @Qualifier("tradingServiceRestClient")}.
+     */
     @Bean
+    @Primary
     public RestClient interbankRestClient(){
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         // §2.9 retry semantika — read timeout veci od 10s da nam ne timeout-uje

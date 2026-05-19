@@ -9,9 +9,9 @@ import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.interbank.config.InterbankProperties;
 import rs.raf.banka2_bek.interbank.protocol.CurrencyCode;
+import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcContractRepository;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcNegotiationRepository;
-import rs.raf.banka2_bek.portfolio.repository.PortfolioRepository;
 import rs.raf.banka2_bek.interbank.protocol.ForeignBankId;
 import rs.raf.banka2_bek.interbank.protocol.MonetaryValue;
 import rs.raf.banka2_bek.interbank.protocol.OtcNegotiation;
@@ -41,7 +41,7 @@ class OtcNegotiationServiceIntegrationTest {
     @Mock
     private InterbankOtcContractRepository contractRepository;
     @Mock
-    private PortfolioRepository portfolioRepository;
+    private TradingServiceInternalClient tradingServiceClient;
     @Mock
     private ClientRepository clientRepository;
     @Mock
@@ -56,7 +56,7 @@ class OtcNegotiationServiceIntegrationTest {
         properties.setMyRoutingNumber(OUR_RN);
         properties.setMyBankDisplayName("Banka 2");
         OtcNegotiationService service = new OtcNegotiationService(client, properties,
-                negotiationRepository, contractRepository, portfolioRepository,
+                negotiationRepository, contractRepository, tradingServiceClient,
                 clientRepository, employeeRepository, transactionExecutor);
 
         ForeignBankId buyer = new ForeignBankId(OUR_RN, "buyer-1");
@@ -123,7 +123,7 @@ class OtcNegotiationServiceIntegrationTest {
         InterbankProperties properties = new InterbankProperties();
         properties.setMyRoutingNumber(OUR_RN);
         OtcNegotiationService service = new OtcNegotiationService(client, properties,
-                negotiationRepository, contractRepository, portfolioRepository,
+                negotiationRepository, contractRepository, tradingServiceClient,
                 clientRepository, employeeRepository, transactionExecutor);
 
         ForeignBankId negotiationId = new ForeignBankId(SELLER_RN, "neg-77");

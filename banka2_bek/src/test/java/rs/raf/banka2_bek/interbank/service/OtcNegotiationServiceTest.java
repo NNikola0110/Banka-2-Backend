@@ -10,9 +10,9 @@ import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.interbank.config.InterbankProperties;
 import rs.raf.banka2_bek.interbank.protocol.CurrencyCode;
+import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcContractRepository;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcNegotiationRepository;
-import rs.raf.banka2_bek.portfolio.repository.PortfolioRepository;
 import rs.raf.banka2_bek.interbank.protocol.ForeignBankId;
 import rs.raf.banka2_bek.interbank.protocol.MonetaryValue;
 import rs.raf.banka2_bek.interbank.protocol.OtcNegotiation;
@@ -49,7 +49,7 @@ class OtcNegotiationServiceTest {
     @Mock
     private InterbankOtcContractRepository contractRepository;
     @Mock
-    private PortfolioRepository portfolioRepository;
+    private TradingServiceInternalClient tradingServiceClient;
     @Mock
     private ClientRepository clientRepository;
     @Mock
@@ -67,7 +67,7 @@ class OtcNegotiationServiceTest {
         properties.setMyBankDisplayName("Banka 2");
         service = new OtcNegotiationService(client, properties,
                 negotiationRepository, contractRepository,
-                portfolioRepository, clientRepository, employeeRepository,
+                tradingServiceClient, clientRepository, employeeRepository,
                 transactionExecutor);
     }
 

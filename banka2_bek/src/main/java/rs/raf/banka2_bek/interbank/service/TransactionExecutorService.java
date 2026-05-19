@@ -7,9 +7,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import rs.raf.banka2.contracts.internal.InternalListingDto;
+import rs.raf.banka2.contracts.internal.InternalPortfolioHoldingDto;
 import rs.raf.banka2_bek.account.model.Account;
 import rs.raf.banka2_bek.account.model.AccountStatus;
 import rs.raf.banka2_bek.account.repository.AccountRepository;
+import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
 import rs.raf.banka2_bek.interbank.exception.InterbankExceptions;
 import rs.raf.banka2_bek.interbank.model.InterbankOtcContract;
 import rs.raf.banka2_bek.interbank.model.InterbankOtcContractStatus;
@@ -20,10 +23,6 @@ import rs.raf.banka2_bek.interbank.protocol.*;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcContractRepository;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcNegotiationRepository;
 import rs.raf.banka2_bek.interbank.repository.InterbankTransactionRepository;
-import rs.raf.banka2_bek.portfolio.model.Portfolio;
-import rs.raf.banka2_bek.portfolio.repository.PortfolioRepository;
-import rs.raf.banka2_bek.stock.model.Listing;
-import rs.raf.banka2_bek.stock.repository.ListingRepository;
 
 import java.math.BigDecimal;
 import java.security.SecureRandom;
@@ -41,9 +40,8 @@ public class TransactionExecutorService {
     private final InterbankTransactionRepository txRepo;
     private final ObjectMapper objectMapper;
     private final AccountRepository accountRepository;
-    private final PortfolioRepository portfolioRepository;
     private final InterbankReservationApplier reservationApplier;
-    private final ListingRepository listingRepository;
+    private final TradingServiceInternalClient tradingServiceClient;
     private final InterbankOtcNegotiationRepository otcNegotiationRepository;
     private final InterbankOtcContractRepository otcContractRepository;
 
@@ -243,12 +241,16 @@ public class TransactionExecutorService {
                 reservationApplier.commitMonas(a.num(), abs, isDebit);
 
             } else if (p.asset() instanceof Asset.Stock s && p.account() instanceof TxAccount.Person pe) {
-                Listing listing = listingRepository.findByTicker(s.asset().ticker())
-                        .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
-                                "Listing not found: " + s.asset().ticker()));
+                String ticker = s.asset().ticker();
+                // Provera postojanja hartije — trading-service vlasnik listings tabele.
+                if (tradingServiceClient.findListingByTicker(ticker).isEmpty()) {
+                    throw new InterbankExceptions.InterbankProtocolException(
+                            "Listing not found: " + ticker);
+                }
                 Long userId = Long.parseLong(pe.id().id());
-                reservationApplier.commitStock(userId, "CLIENT", listing,
-                        abs.intValueExact(), isDebit);
+                reservationApplier.commitStock(
+                        stockIdempotencyKey(transactionId, "commit", userId, "CLIENT", ticker),
+                        userId, "CLIENT", ticker, abs.intValueExact(), isDebit);
 
             } else if (p.asset() instanceof Asset.OptionAsset oa && p.account() instanceof TxAccount.Option) {
                 ForeignBankId negId = oa.asset().negotiationId();
@@ -299,11 +301,16 @@ public class TransactionExecutorService {
                 reservationApplier.releaseMonas(a.num(), abs);
 
             } else if (p.asset() instanceof Asset.Stock s && p.account() instanceof TxAccount.Person pe) {
-                Listing listing = listingRepository.findByTicker(s.asset().ticker())
-                        .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
-                                "Listing not found: " + s.asset().ticker()));
+                String ticker = s.asset().ticker();
+                // Provera postojanja hartije — trading-service vlasnik listings tabele.
+                if (tradingServiceClient.findListingByTicker(ticker).isEmpty()) {
+                    throw new InterbankExceptions.InterbankProtocolException(
+                            "Listing not found: " + ticker);
+                }
                 Long userId = Long.parseLong(pe.id().id());
-                reservationApplier.releaseStock(userId, "CLIENT", listing.getId(), abs.intValueExact());
+                reservationApplier.releaseStock(
+                        stockIdempotencyKey(transactionId, "release", userId, "CLIENT", ticker),
+                        userId, "CLIENT", ticker, abs.intValueExact());
 
             } else if (p.asset() instanceof Asset.OptionAsset) {
                 // Option rollback is a no-op: stocks remain reserved under the contract;
@@ -592,20 +599,20 @@ public class TransactionExecutorService {
                     violations.add(new NoVoteReason(NoVoteReason.Reason.NO_SUCH_ACCOUNT, p));
                     continue;
                 }
-                Optional<Listing> listingOpt = listingRepository.findByTicker(s.asset().ticker());
+                Optional<InternalListingDto> listingOpt =
+                        tradingServiceClient.findListingByTicker(s.asset().ticker());
                 if (listingOpt.isEmpty()) {
                     violations.add(new NoVoteReason(NoVoteReason.Reason.NO_SUCH_ASSET, p));
                     continue;
                 }
                 if (isCredit) {
-                    Listing listing = listingOpt.get();
-                    Optional<Portfolio> portfolioOpt = portfolioRepository
-                            .findByUserIdAndUserRoleAndListingId(userId, "CLIENT", listing.getId());
-                    if (portfolioOpt.isEmpty()) {
+                    InternalPortfolioHoldingDto holding = tradingServiceClient.findHolding(
+                            userId, "CLIENT", s.asset().ticker());
+                    if (!holding.exists()) {
                         violations.add(new NoVoteReason(NoVoteReason.Reason.NO_SUCH_ASSET, p));
                         continue;
                     }
-                    if (portfolioOpt.get().getAvailableQuantity() < abs.intValueExact()) {
+                    if (holding.availableQuantity() < abs.intValueExact()) {
                         violations.add(new NoVoteReason(NoVoteReason.Reason.INSUFFICIENT_ASSET, p));
                     }
                 }
@@ -676,11 +683,25 @@ public class TransactionExecutorService {
 
             } else if (asset instanceof Asset.Stock s && account instanceof TxAccount.Person pe) {
                 Long userId = Long.parseLong(pe.id().id());
-                Listing listing = listingRepository.findByTicker(s.asset().ticker()).orElseThrow();
-                reservationApplier.reserveStock(userId, "CLIENT", listing.getId(), abs.intValueExact());
+                String ticker = s.asset().ticker();
+                reservationApplier.reserveStock(
+                        stockIdempotencyKey(tx.transactionId(), "reserve", userId, "CLIENT", ticker),
+                        userId, "CLIENT", ticker, abs.intValueExact());
             }
         }
 
         return violations;
+    }
+
+    /**
+     * Determinisitcki idempotency kljuc za hartijsku nogu inter-bank transakcije.
+     * Kombinuje {@code transactionId}, fazu ({@code reserve}/{@code commit}/{@code release})
+     * i posting identitet ({@code userId}, {@code role}, {@code ticker}) — retry
+     * iste transakcije gadja isti kljuc, pa trading-service vraca kesiran odgovor.
+     */
+    private static String stockIdempotencyKey(ForeignBankId txId, String phase,
+                                              Long userId, String role, String ticker) {
+        return "ib-" + txId.routingNumber() + "-" + txId.id() + ":stock-" + phase
+                + ":" + userId + ":" + role + ":" + ticker;
     }
 }

@@ -29,10 +29,10 @@ import rs.raf.banka2_bek.interbank.protocol.StockDescription;
 import rs.raf.banka2_bek.interbank.protocol.Transaction;
 import rs.raf.banka2_bek.interbank.protocol.TxAccount;
 import rs.raf.banka2_bek.interbank.protocol.UserInformation;
+import rs.raf.banka2.contracts.internal.InternalPublicStockSellerDto;
+import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcContractRepository;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcNegotiationRepository;
-import rs.raf.banka2_bek.portfolio.model.Portfolio;
-import rs.raf.banka2_bek.portfolio.repository.PortfolioRepository;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -85,7 +85,7 @@ public class OtcNegotiationService {
     private final InterbankProperties properties;
     private final InterbankOtcNegotiationRepository negotiationRepository;
     private final InterbankOtcContractRepository contractRepository;
-    private final PortfolioRepository portfolioRepository;
+    private final TradingServiceInternalClient tradingServiceClient;
     private final ClientRepository clientRepository;
     private final EmployeeRepository employeeRepository;
     private final TransactionExecutorService transactionExecutor;
@@ -182,30 +182,31 @@ public class OtcNegotiationService {
     public List<PublicStock> serveLocalPublicStocks() {
         int myRouting = requireMyRoutingNumber();
 
-        // Iteriramo kroz sve portfolios sa publicQuantity > 0 i grupisemo po ticker-u.
+        // Citamo sve javno-vidljive pozicije (publicQuantity > 0) preko trading-service
+        // seam-a (faza 2f — portfolios tabela zivi u trading_db) i grupisemo po ticker-u.
         // Quantity koja se nudi je publicQuantity umanjen za one sto su vec rezervisani
-        // u ACTIVE pregovorima (gde smo MI seller).
+        // u ACTIVE pregovorima (gde smo MI seller) — negotiation tabela ostaje u banka-core.
         Map<String, List<PublicStock.Seller>> byTicker = new HashMap<>();
         Map<String, StockDescription> stockByTicker = new HashMap<>();
 
-        for (Portfolio p : portfolioRepository.findAll()) {
-            int publicQty = p.getPublicQuantity() == null ? 0 : p.getPublicQuantity();
+        for (InternalPublicStockSellerDto p : tradingServiceClient.findAllPublicStock()) {
+            int publicQty = p.publicQuantity();
             if (publicQty <= 0) continue;
 
             BigDecimal reservedInActiveNegotiations = nullToZero(
                     negotiationRepository.sumActiveAmountForSellerAndTicker(
-                            p.getUserId(), p.getUserRole(), p.getListingTicker()));
+                            p.userId(), p.userRole(), p.ticker()));
             BigDecimal available = BigDecimal.valueOf(publicQty).subtract(reservedInActiveNegotiations);
             if (available.signum() <= 0) continue;
 
-            String prefixed = ("CLIENT".equalsIgnoreCase(p.getUserRole())
-                    ? CLIENT_ID_PREFIX : EMPLOYEE_ID_PREFIX) + p.getUserId();
+            String prefixed = ("CLIENT".equalsIgnoreCase(p.userRole())
+                    ? CLIENT_ID_PREFIX : EMPLOYEE_ID_PREFIX) + p.userId();
             ForeignBankId sellerId = new ForeignBankId(myRouting, prefixed);
 
             byTicker
-                    .computeIfAbsent(p.getListingTicker(), k -> new ArrayList<>())
+                    .computeIfAbsent(p.ticker(), k -> new ArrayList<>())
                     .add(new PublicStock.Seller(sellerId, available));
-            stockByTicker.putIfAbsent(p.getListingTicker(), new StockDescription(p.getListingTicker()));
+            stockByTicker.putIfAbsent(p.ticker(), new StockDescription(p.ticker()));
         }
 
         List<PublicStock> result = new ArrayList<>(byTicker.size());
@@ -260,12 +261,12 @@ public class OtcNegotiationService {
         LocalParty seller = parseLocalPartyId(offer.sellerId().id());
 
         // Kvota provera: seller mora imati dovoljno publicQuantity-a
-        // (umanjeno za ACTIVE pregovore + ACTIVE ugovore).
-        int sellerPublic = portfolioRepository
-                .findByUserIdAndUserRole(seller.userId(), seller.role())
+        // (umanjeno za ACTIVE pregovore + ACTIVE ugovore). Public-stock pozicije
+        // citamo preko trading-service seam-a (faza 2f — portfolios tabela u trading_db).
+        int sellerPublic = tradingServiceClient
+                .findPublicStockForSeller(seller.userId(), seller.role(), offer.stock().ticker())
                 .stream()
-                .filter(p -> p.getListingTicker().equals(offer.stock().ticker()))
-                .mapToInt(p -> p.getPublicQuantity() == null ? 0 : p.getPublicQuantity())
+                .mapToInt(InternalPublicStockSellerDto::publicQuantity)
                 .sum();
         BigDecimal alreadyReserved = nullToZero(
                 negotiationRepository.sumActiveAmountForSellerAndTicker(

@@ -3,23 +3,39 @@ package rs.raf.banka2_bek.interbank.service;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import rs.raf.banka2.contracts.internal.CommitStockRequest;
+import rs.raf.banka2.contracts.internal.ReleaseStockRequest;
+import rs.raf.banka2.contracts.internal.ReserveStockRequest;
 import rs.raf.banka2_bek.account.model.Account;
 import rs.raf.banka2_bek.account.repository.AccountRepository;
+import rs.raf.banka2_bek.interbank.client.TradingServiceClientException;
+import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
 import rs.raf.banka2_bek.interbank.exception.InterbankExceptions;
-import rs.raf.banka2_bek.portfolio.model.Portfolio;
-import rs.raf.banka2_bek.portfolio.repository.PortfolioRepository;
-import rs.raf.banka2_bek.stock.model.Listing;
 
 import java.math.BigDecimal;
-import java.util.Optional;
 
+/**
+ * Primenjuje rezervacije/oslobadjanja/commit-e na novcane i hartijske noge
+ * inter-bank 2PC transakcija.
+ *
+ * <p><b>Novcane noge</b> ({@code reserveMonas}/{@code releaseMonas}/{@code commitMonas})
+ * rade in-process JPA pristup {@code accounts} tabeli — racuni pripadaju banka-core-u
+ * i posle 2f cutover-a, pa tu nema seam-a.
+ *
+ * <p><b>Hartijske noge</b> ({@code reserveStock}/{@code releaseStock}/{@code commitStock})
+ * su u fazi 2f prevezane sa in-process {@code Portfolio}/{@code Listing} JPA na HTTP
+ * seam — {@code portfolios}/{@code listings} tabele posle cutover-a zive samo u
+ * trading_db. Pozivi idu kroz {@link TradingServiceInternalClient}; idempotency
+ * kljuc je determinisitcki po inter-bank transakciji + postingu tako da retry
+ * (banka-core {@code InterbankRetryScheduler}) ne primeni kretanje hartija dvaput.
+ */
 @Service
 @RequiredArgsConstructor
 @Transactional
 public class InterbankReservationApplier {
 
     private final AccountRepository accountRepository;
-    private final PortfolioRepository portfolioRepository;
+    private final TradingServiceInternalClient tradingServiceClient;
 
     public void reserveMonas(String accountNumber, BigDecimal amount){
         Account acct = accountRepository.findForUpdateByAccountNumber(accountNumber)
@@ -66,61 +82,45 @@ public class InterbankReservationApplier {
         accountRepository.save(acct);
     }
 
-    public void reserveStock(Long userId, String role, Long listingId, int quantity){
-        Portfolio portfolio = portfolioRepository
-                .findByUserIdAndUserRoleAndListingIdForUpdate(userId, role, listingId)
-                .orElseThrow(
-                        () -> new InterbankExceptions.InterbankProtocolException("NO_SUCH_ASSET: no portfolio exists for listing " + listingId)
-                );
-        if (portfolio.getAvailableQuantity() < quantity)
-            throw new InterbankExceptions.InterbankProtocolException("INSUFFICIENT_QUANTITY on listing" + listingId + ". Only " + portfolio.getAvailableQuantity() + " quantity available.");
-
-        portfolio.setReservedQuantity(portfolio.getReservedQuantity() + quantity);
-        portfolioRepository.save(portfolio);
-    }
-
-    public void releaseStock(Long userId, String role, Long listingId, int quantity){
-        Portfolio portfolio = portfolioRepository
-                .findByUserIdAndUserRoleAndListingIdForUpdate(userId, role, listingId)
-                .orElseThrow(
-                        () -> new InterbankExceptions.InterbankProtocolException("NO_SUCH_ASSET: no portfolio exists for listing " + listingId)
-                );
-        portfolio.setReservedQuantity(Math.max(0, portfolio.getReservedQuantity() - quantity));
-        portfolioRepository.save(portfolio);
-    }
-
-    public void commitStock(Long userId, String role, Listing listing, int quantity, boolean isDebit){
-        if (isDebit) {
-            Optional<Portfolio> current = portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(userId, role, listing.getId());
-            if (current.isPresent()) {
-                Portfolio portfolio = current.get();
-                portfolio.setQuantity(portfolio.getQuantity() + quantity);
-                portfolioRepository.save(portfolio);
-            } else {
-                Portfolio portfolio = Portfolio.builder()
-                        .userId(userId)
-                        .userRole(role)
-                        .listingId(listing.getId())
-                        .listingTicker(listing.getTicker())
-                        .listingName(listing.getName())
-                        .listingType(listing.getListingType().name())
-                        .averageBuyPrice(listing.getPrice() != null ? listing.getPrice() : BigDecimal.ZERO)
-                        .quantity(quantity)
-                        .reservedQuantity(0)
-                        .publicQuantity(0)
-                        .build();
-                portfolioRepository.save(portfolio);
-            }
+    /**
+     * Rezervise hartije preko trading-service seam-a (faza 2f). {@code idempotencyKey}
+     * je determinisitcki po inter-bank transakciji + postingu — retry je bezbedan.
+     */
+    public void reserveStock(String idempotencyKey, Long userId, String role,
+                             String ticker, int quantity){
+        try {
+            tradingServiceClient.reserveStock(idempotencyKey,
+                    new ReserveStockRequest(userId, role, ticker, quantity));
+        } catch (TradingServiceClientException e) {
+            throw new InterbankExceptions.InterbankProtocolException(e.getMessage());
         }
-        else {
-            Portfolio portfolio = portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(userId, role, listing.getId())
-                  .orElseThrow(
-                          () -> new InterbankExceptions.InterbankProtocolException("NO_SUCH_ASSET: no portfolio exists for listing " + listing.getId())
-                  );
-            portfolio.setQuantity(portfolio.getQuantity() - quantity);
-            portfolio.setReservedQuantity(Math.max(0, portfolio.getReservedQuantity() - quantity));
-            portfolioRepository.save(portfolio);
+    }
 
+    /**
+     * Oslobadja rezervisane hartije preko trading-service seam-a (faza 2f).
+     */
+    public void releaseStock(String idempotencyKey, Long userId, String role,
+                             String ticker, int quantity){
+        try {
+            tradingServiceClient.releaseStock(idempotencyKey,
+                    new ReleaseStockRequest(userId, role, ticker, quantity));
+        } catch (TradingServiceClientException e) {
+            throw new InterbankExceptions.InterbankProtocolException(e.getMessage());
+        }
+    }
+
+    /**
+     * Commit kretanja hartija preko trading-service seam-a (faza 2f). trading-service
+     * razresava listing po ticker-u; za {@code isDebit=true} kreira portfolio ako ne
+     * postoji (sa {@code averageBuyPrice} = trenutna cena listinga).
+     */
+    public void commitStock(String idempotencyKey, Long userId, String role,
+                            String ticker, int quantity, boolean isDebit){
+        try {
+            tradingServiceClient.commitStock(idempotencyKey,
+                    new CommitStockRequest(userId, role, ticker, quantity, isDebit));
+        } catch (TradingServiceClientException e) {
+            throw new InterbankExceptions.InterbankProtocolException(e.getMessage());
         }
     }
 }

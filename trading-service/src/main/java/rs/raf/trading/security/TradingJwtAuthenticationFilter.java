@@ -30,6 +30,16 @@ public class TradingJwtAuthenticationFilter extends OncePerRequestFilter {
         this.jwtValidator = jwtValidator;
     }
 
+    /**
+     * {@code /internal/**} rute autentifikuje {@code InternalAuthFilter} preko
+     * X-Internal-Key — JWT filter ih ne dira (interni pozivalac, banka-core
+     * {@code interbank} seam, ne nosi Bearer token).
+     */
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        return request.getRequestURI().startsWith("/internal/");
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                     FilterChain chain) throws ServletException, IOException {

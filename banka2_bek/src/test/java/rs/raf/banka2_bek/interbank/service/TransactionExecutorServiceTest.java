@@ -12,10 +12,13 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
+import rs.raf.banka2.contracts.internal.InternalListingDto;
+import rs.raf.banka2.contracts.internal.InternalPortfolioHoldingDto;
 import rs.raf.banka2_bek.account.model.Account;
 import rs.raf.banka2_bek.account.model.AccountStatus;
 import rs.raf.banka2_bek.account.repository.AccountRepository;
 import rs.raf.banka2_bek.currency.model.Currency;
+import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
 import rs.raf.banka2_bek.interbank.exception.InterbankExceptions;
 import rs.raf.banka2_bek.interbank.model.InterbankOtcContract;
 import rs.raf.banka2_bek.interbank.model.InterbankOtcContractStatus;
@@ -26,10 +29,6 @@ import rs.raf.banka2_bek.interbank.protocol.*;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcContractRepository;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcNegotiationRepository;
 import rs.raf.banka2_bek.interbank.repository.InterbankTransactionRepository;
-import rs.raf.banka2_bek.portfolio.model.Portfolio;
-import rs.raf.banka2_bek.portfolio.repository.PortfolioRepository;
-import rs.raf.banka2_bek.stock.model.Listing;
-import rs.raf.banka2_bek.stock.repository.ListingRepository;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -57,9 +56,8 @@ class TransactionExecutorServiceTest {
     @Mock private BankRoutingService routing;
     @Mock private InterbankTransactionRepository txRepo;
     @Mock private AccountRepository accountRepository;
-    @Mock private PortfolioRepository portfolioRepository;
     @Mock private InterbankReservationApplier reservationApplier;
-    @Mock private ListingRepository listingRepository;
+    @Mock private TradingServiceInternalClient tradingServiceClient;
     @Mock private InterbankOtcNegotiationRepository otcNegotiationRepository;
     @Mock private InterbankOtcContractRepository otcContractRepository;
 
@@ -85,8 +83,8 @@ class TransactionExecutorServiceTest {
 
         service = new TransactionExecutorService(
                 messageService, client, routing, txRepo, objectMapper,
-                accountRepository, portfolioRepository, reservationApplier,
-                listingRepository, otcNegotiationRepository, otcContractRepository);
+                accountRepository, reservationApplier, tradingServiceClient,
+                otcNegotiationRepository, otcContractRepository);
 
         ReflectionTestUtils.setField(service, "self", self);
 
@@ -474,7 +472,7 @@ class TransactionExecutorServiceTest {
     @Test
     @DisplayName("prepareLocal: ticker not found → NO + NO_SUCH_ASSET")
     void prepareLocal_tickerNotFound_noVote() {
-        when(listingRepository.findByTicker(any())).thenReturn(Optional.empty());
+        when(tradingServiceClient.findListingByTicker(any())).thenReturn(Optional.empty());
 
         TransactionVote vote = service.prepareLocal(localStockTx());
 
@@ -486,9 +484,10 @@ class TransactionExecutorServiceTest {
     @Test
     @DisplayName("prepareLocal: STOCK credit — portfolio not found → NO + NO_SUCH_ASSET")
     void prepareLocal_portfolioMissing_noVote() {
-        when(listingRepository.findByTicker("AAPL")).thenReturn(Optional.of(buildListing(1L, "AAPL")));
-        when(portfolioRepository.findByUserIdAndUserRoleAndListingId(anyLong(), any(), anyLong()))
-                .thenReturn(Optional.empty());
+        when(tradingServiceClient.findListingByTicker("AAPL"))
+                .thenReturn(Optional.of(listingDto(1L, "AAPL")));
+        when(tradingServiceClient.findHolding(anyLong(), any(), eq("AAPL")))
+                .thenReturn(holdingMissing("AAPL"));
 
         TransactionVote vote = service.prepareLocal(localStockTx());
 
@@ -500,9 +499,10 @@ class TransactionExecutorServiceTest {
     @Test
     @DisplayName("prepareLocal: STOCK credit — insufficient quantity → NO + INSUFFICIENT_ASSET")
     void prepareLocal_insufficientStock_noVote() {
-        when(listingRepository.findByTicker("AAPL")).thenReturn(Optional.of(buildListing(1L, "AAPL")));
-        when(portfolioRepository.findByUserIdAndUserRoleAndListingId(anyLong(), any(), anyLong()))
-                .thenReturn(Optional.of(buildPortfolio(3))); // needs 10, has 3
+        when(tradingServiceClient.findListingByTicker("AAPL"))
+                .thenReturn(Optional.of(listingDto(1L, "AAPL")));
+        when(tradingServiceClient.findHolding(anyLong(), any(), eq("AAPL")))
+                .thenReturn(holding(1L, "AAPL", 3)); // needs 10, has 3
 
         TransactionVote vote = service.prepareLocal(localStockTx());
 
@@ -512,17 +512,18 @@ class TransactionExecutorServiceTest {
     }
 
     @Test
-    @DisplayName("prepareLocal: STOCK YES → reserveStock called with correct userId and listingId")
+    @DisplayName("prepareLocal: STOCK YES → reserveStock called via trading-service seam with correct args")
     void prepareLocal_stockYes_reservesStock() {
-        when(listingRepository.findByTicker("AAPL")).thenReturn(Optional.of(buildListing(7L, "AAPL")));
-        when(portfolioRepository.findByUserIdAndUserRoleAndListingId(anyLong(), any(), anyLong()))
-                .thenReturn(Optional.of(buildPortfolio(20))); // has 20, needs 10
+        when(tradingServiceClient.findListingByTicker("AAPL"))
+                .thenReturn(Optional.of(listingDto(7L, "AAPL")));
+        when(tradingServiceClient.findHolding(anyLong(), any(), eq("AAPL")))
+                .thenReturn(holding(7L, "AAPL", 20)); // has 20, needs 10
 
         TransactionVote vote = service.prepareLocal(localStockTx());
 
         assertThat(vote.vote()).isEqualTo(TransactionVote.Vote.YES);
-        // credit posting: person 42 gives 10 AAPL (listingId=7)
-        verify(reservationApplier).reserveStock(eq(42L), eq("CLIENT"), eq(7L), eq(10));
+        // credit posting: person 42 gives 10 AAPL — reserveStock via seam (idempotency key + ticker)
+        verify(reservationApplier).reserveStock(anyString(), eq(42L), eq("CLIENT"), eq("AAPL"), eq(10));
     }
 
     @Test
@@ -617,13 +618,15 @@ class TransactionExecutorServiceTest {
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
         when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
-        when(listingRepository.findByTicker("AAPL")).thenReturn(Optional.of(buildListing(7L, "AAPL")));
+        when(tradingServiceClient.findListingByTicker("AAPL"))
+                .thenReturn(Optional.of(listingDto(7L, "AAPL")));
         stubTxSave();
 
         service.commitLocal(tx.transactionId());
 
-        verify(reservationApplier).commitStock(eq(99L), eq("CLIENT"), any(Listing.class), eq(10), eq(true));
-        verify(reservationApplier).commitStock(eq(42L), eq("CLIENT"), any(Listing.class), eq(10), eq(false));
+        // commitStock via trading-service seam: idempotency key + ticker (ne vise Listing objekat)
+        verify(reservationApplier).commitStock(anyString(), eq(99L), eq("CLIENT"), eq("AAPL"), eq(10), eq(true));
+        verify(reservationApplier).commitStock(anyString(), eq(42L), eq("CLIENT"), eq("AAPL"), eq(10), eq(false));
     }
 
     @Test
@@ -633,7 +636,7 @@ class TransactionExecutorServiceTest {
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
         when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
-        when(listingRepository.findByTicker(any())).thenReturn(Optional.empty());
+        when(tradingServiceClient.findListingByTicker(any())).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.commitLocal(tx.transactionId()))
                 .isInstanceOf(InterbankExceptions.InterbankProtocolException.class);
@@ -709,13 +712,15 @@ class TransactionExecutorServiceTest {
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
         when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
-        when(listingRepository.findByTicker("AAPL")).thenReturn(Optional.of(buildListing(7L, "AAPL")));
+        when(tradingServiceClient.findListingByTicker("AAPL"))
+                .thenReturn(Optional.of(listingDto(7L, "AAPL")));
         stubTxSave();
 
         service.rollbackLocal(tx.transactionId());
 
-        verify(reservationApplier).releaseStock(eq(42L), eq("CLIENT"), eq(7L), eq(10));
-        verify(reservationApplier, never()).releaseStock(eq(99L), any(), anyLong(), anyInt());
+        // releaseStock via trading-service seam: idempotency key + ticker
+        verify(reservationApplier).releaseStock(anyString(), eq(42L), eq("CLIENT"), eq("AAPL"), eq(10));
+        verify(reservationApplier, never()).releaseStock(anyString(), eq(99L), any(), any(), anyInt());
     }
 
     @Test
@@ -730,13 +735,14 @@ class TransactionExecutorServiceTest {
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
         when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
-        when(listingRepository.findByTicker("AAPL")).thenReturn(Optional.of(buildListing(7L, "AAPL")));
+        when(tradingServiceClient.findListingByTicker("AAPL"))
+                .thenReturn(Optional.of(listingDto(7L, "AAPL")));
         stubTxSave();
 
         service.rollbackLocal(tx.transactionId());
 
-        verify(reservationApplier, never()).releaseStock(eq(77L), any(), anyLong(), anyInt());
-        verify(reservationApplier).releaseStock(eq(88L), eq("CLIENT"), eq(7L), eq(5));
+        verify(reservationApplier, never()).releaseStock(anyString(), eq(77L), any(), any(), anyInt());
+        verify(reservationApplier).releaseStock(anyString(), eq(88L), eq("CLIENT"), eq("AAPL"), eq(5));
     }
 
     @Test
@@ -746,7 +752,7 @@ class TransactionExecutorServiceTest {
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
         when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
-        when(listingRepository.findByTicker(any())).thenReturn(Optional.empty());
+        when(tradingServiceClient.findListingByTicker(any())).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.rollbackLocal(tx.transactionId()))
                 .isInstanceOf(InterbankExceptions.InterbankProtocolException.class);
@@ -1230,19 +1236,20 @@ class TransactionExecutorServiceTest {
         return a;
     }
 
-    private Listing buildListing(Long id, String ticker) {
-        Listing l = new Listing();
-        l.setId(id);
-        l.setTicker(ticker);
-        return l;
+    /** InternalListingDto stub — listing-by-ticker odgovor trading-service seam-a. */
+    private InternalListingDto listingDto(Long id, String ticker) {
+        return new InternalListingDto(id, ticker, ticker + " Inc.", "STOCK",
+                BigDecimal.valueOf(180), null, null);
     }
 
-    /** availableQuantity = quantity (reservedQuantity defaults to 0). */
-    private Portfolio buildPortfolio(int quantity) {
-        Portfolio p = new Portfolio();
-        p.setQuantity(quantity);
-        p.setReservedQuantity(0);
-        return p;
+    /** InternalPortfolioHoldingDto stub — holding postoji, availableQuantity = quantity. */
+    private InternalPortfolioHoldingDto holding(Long listingId, String ticker, int quantity) {
+        return new InternalPortfolioHoldingDto(true, 1L, listingId, ticker, quantity, 0, quantity);
+    }
+
+    /** InternalPortfolioHoldingDto stub — vlasnik nema portfolio za hartiju. */
+    private InternalPortfolioHoldingDto holdingMissing(String ticker) {
+        return new InternalPortfolioHoldingDto(false, null, null, ticker, 0, 0, 0);
     }
 
     private InterbankTransaction savedIbt(Transaction tx, InterbankTransactionStatus status)

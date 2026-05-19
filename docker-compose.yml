@@ -167,6 +167,9 @@ services:
       SPRING_RABBITMQ_PORT: "5672"
       SPRING_RABBITMQ_USERNAME: guest
       SPRING_RABBITMQ_PASSWORD: guest
+      # Faza 2f — interbank paket zove trading-service /internal/portfolio/**
+      # (portfolios/listings tabele zive u trading_db posle cutover-a).
+      TRADINGSERVICE_BASE_URL: http://trading-service:8082
     # host.docker.internal alias za pristup host portovima (Linux native Docker
     # zahteva eksplicitan host-gateway alias; Docker Desktop ima nativno).
     # Koristi se SAMO za opcioni Arbitro stack u Banka-2-Tools/docker-compose.yml
