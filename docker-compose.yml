@@ -127,12 +127,10 @@ services:
       BANKA2_DATASOURCE_REPLICA_USERNAME: banka2user
       BANKA2_DATASOURCE_REPLICA_PASSWORD: banka2pass
       BANKA2_DATASOURCE_REPLICA_ENABLED: "true"
-      # InfluxDB konfiguracija — write-ovi OHLCV tickove iz ListingPriceRecorder-a.
-      BANKA2_INFLUX_URL: http://influxdb:8086
-      BANKA2_INFLUX_TOKEN: ${INFLUX_TOKEN:-dev-token-change-me-32-bytes-minimum}
-      BANKA2_INFLUX_ORG: ${INFLUX_ORG:-banka2}
-      BANKA2_INFLUX_BUCKET: ${INFLUX_BUCKET:-tick-listings}
-      BANKA2_INFLUX_ENABLED: "true"
+      # Pod-faza 2f cutover: InfluxDB (OHLCV time-series) je presao u
+      # trading-service zajedno sa `timeseries` paketom — monolit (banka-core)
+      # vise ne pristupa InfluxDB-u, pa nema ni BANKA2_INFLUX_* env-a ni
+      # influxdb depends_on-a ovde.
       SPRING_JPA_HIBERNATE_DDL_AUTO: update
       SPRING_JPA_SHOW_SQL: "false"
       SPRING_JPA_PROPERTIES_HIBERNATE_DIALECT: org.hibernate.dialect.PostgreSQLDialect
@@ -183,8 +181,6 @@ services:
         condition: service_healthy
       db_replica:
         condition: service_healthy
-      influxdb:
-        condition: service_healthy
       rabbitmq:
         condition: service_healthy
     # Healthcheck — `wget` je u eclipse-temurin:25-jre image-u (busybox).
@@ -200,8 +196,11 @@ services:
       start_period: 60s
 
   # InfluxDB 2.x — time-series baza za berzanske OHLCV podatke (Open/High/Low/Close/Volume).
-  # Backend zapisuje tickove kao Point-ove u `tick-listings` bucket; FE chart cita
-  # OHLCV agregat preko Flux query-ja umesto iz PG `listing_daily_price_info` tabele.
+  # Pod-faza 2f cutover: `timeseries` paket je presao u trading-service, pa je
+  # InfluxDB sada konceptualno trading-service-ova baza (trading-service je
+  # zapisuje OHLCV tickove). `banka2.influx.enabled=false` u trading-service-u
+  # drzi InfluxConfig/Recorder bean-ove inertnim — InfluxDB kontejner je gore
+  # i spreman, ali write-ovi se ukljucuju u Fazi 3.
   influxdb:
     image: influxdb:2.7-alpine
     container_name: banka2_influxdb
@@ -247,6 +246,32 @@ services:
         # potvrdi da je load-ovan.
         condition: service_healthy
 
+  # Trading seed — pod-faza 2f cutover. Ubacuje trgovinski seed u trading_db
+  # posle sto trading-service kreira tabele (ddl-auto=update). Mirror `seed`
+  # servisa: ceka trading-service healthy pa pokrene psql sa ON_ERROR_STOP.
+  # `exchanges`/`exchange_holidays` se NE seed-uju ovde — radi ih ExchangeSeedData
+  # (ApplicationRunner) unutar trading-service-a; trading-seed.sql ima samo
+  # ostale trgovinske tabele (listings/orders/portfolios/funds/...).
+  seed-trading:
+    image: postgres:16-alpine
+    container_name: banka2_seed_trading
+    volumes:
+      - ./trading-seed.sql:/trading-seed.sql:ro
+    environment:
+      PGPASSWORD: tradingpass
+    entrypoint:
+      - sh
+      - -c
+      - |
+        echo 'Trading-service je healthy (kreirao tabele) — ubacujem trading seed...'
+        psql -h trading_db -U tradinguser -d trading -v ON_ERROR_STOP=1 -f /trading-seed.sql
+        echo 'Trading seed uspesno ubasen!'
+    depends_on:
+      trading-service:
+        # service_healthy ceka trading-service healthcheck — Spring Boot port
+        # otvoren -> Hibernate ddl-auto kreirao sve trgovinske tabele.
+        condition: service_healthy
+
   # RabbitMQ - async broker. Faza 0: prisutan ali jos neiskoriscen.
   # Management UI na 15672 (guest/guest).
   rabbitmq:
@@ -264,6 +289,8 @@ services:
 
   # nginx api-gateway - jedini spolja izlozen ulaz. Zauzima host 8080
   # (stari port monolita) pa se FE/Mobile konfiguracija ne menja.
+  # Pod-faza 2f cutover: gateway path-routing-uje trgovinske prefikse na
+  # trading-service:8082, ostalo na backend:8080 (vidi api-gateway/nginx.conf).
   api-gateway:
     build: ./api-gateway
     container_name: banka2_gateway
@@ -271,6 +298,8 @@ services:
       - "${GATEWAY_HOST_PORT:-8080}:80"
     depends_on:
       backend:
+        condition: service_healthy
+      trading-service:
         condition: service_healthy
     healthcheck:
       # 127.0.0.1 (ne localhost): busybox wget bi za `localhost` probao IPv6 ::1,
@@ -281,7 +310,9 @@ services:
       retries: 6
       start_period: 20s
 
-  # trading-service - Faza 2a: sopstvena baza, JWT, BankaCoreClient.
+  # trading-service - pod-faza 2f cutover: live vlasnik trgovinskog domena
+  # (orderi, portfolio, listings, OTC, fondovi, porez, aktuari, opcije, margin)
+  # iza api-gateway-a. Sopstvena baza trading_db, JWT, BankaCoreClient.
   trading-service:
     build:
       context: .
@@ -296,8 +327,27 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-only-jwt-secret-do-not-use-in-prod-rotate-via-env-var-on-each-deploy}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-key-rotate-in-prod}
       BANKACORE_BASE_URL: http://backend:8080
+      # RabbitMQ — pod-faza 2f-5a: trading-service publish-uje
+      # MARGIN_ACCOUNT_BLOCKED poruku ka notification-service (cross-JVM).
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: "5672"
+      SPRING_RABBITMQ_USERNAME: guest
+      SPRING_RABBITMQ_PASSWORD: guest
+      # InfluxDB — `timeseries` paket je presao u trading-service (pod-faza 2f).
+      # `banka2.influx.enabled=false` drzi InfluxConfig/Recorder bean-ove
+      # inertnim (ConditionalOnProperty) — kontejner je gore, write-ovi
+      # OHLCV tickova se ukljucuju u Fazi 3.
+      BANKA2_INFLUX_URL: http://influxdb:8086
+      BANKA2_INFLUX_TOKEN: ${INFLUX_TOKEN:-dev-token-change-me-32-bytes-minimum}
+      BANKA2_INFLUX_ORG: ${INFLUX_ORG:-banka2}
+      BANKA2_INFLUX_BUCKET: ${INFLUX_BUCKET:-tick-listings}
+      BANKA2_INFLUX_ENABLED: "false"
     depends_on:
       trading_db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      influxdb:
         condition: service_healthy
     healthcheck:
       # eclipse-temurin:25-jre runtime nema curl/wget; bash /dev/tcp proverava
