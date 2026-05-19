@@ -837,32 +837,24 @@ public class OtcService {
     }
 
     /**
-     * Podrazumevani racun korisnika u datoj valuti.
-     *
-     * <p>NAPOMENA (faza 2d-B money-seam — DELIMICAN PARITET): za zaposlene
-     * monolitni {@code findDefaultAccount} koristi bankin trading racun, sto je
-     * verno preneto preko {@code getBankTradingAccount(currency)}. Za KLIJENTE
-     * monolit bira klijentov racun u preferiranoj valuti
-     * ({@code findByClientIdAndStatusOrderByAvailableBalanceDesc}) — banka-core
-     * jos NEMA interni endpoint za "podrazumevani racun klijenta po valuti", pa
-     * se i za klijente koristi {@code getBankTradingAccount}. Posledica: kad je
-     * seller klijent, premija/strike se kreditiraju na bankin BANK_TRADING racun
-     * umesto na licni racun klijenta-prodavca. Za kupca je ovaj put bezopasan
-     * jer kontroler uvek prosledi {@code buyerAccountId} (tada se ovde i ne
-     * ulazi). Resava se dodavanjem internog endpoint-a u 2d-F / cutover-u.
+     * Podrazumevani racun korisnika u datoj valuti — verno monolitovom
+     * {@code OtcService.findDefaultAccount}: za KLIJENTA klijentov preferiran
+     * aktivan racun (racun u {@code preferredCurrency}, inace prvi aktivan sa
+     * najvecim raspolozivim balansom), za ZAPOSLENOG bankin trading racun. Sva
+     * logika izbora racuna zivi u banka-core domenu — razresava je interni
+     * {@code GET /internal/accounts/preferred/{userRole}/{userId}} endpoint.
      */
     private InternalAccountDto findDefaultAccount(Long userId, String role, String preferredCurrency) {
-        // EMPLOYEE — bankin trading racun (supervizor trguje sa bankinih racuna): verno.
-        // CLIENT — privremeni fallback na bankin trading racun (vidi NAPOMENU iznad).
         try {
-            return bankaCoreClient.getBankTradingAccount(preferredCurrency);
+            return bankaCoreClient.getPreferredAccount(role, userId, preferredCurrency);
         } catch (BankaCoreClientException ex) {
-            try {
-                return bankaCoreClient.getBankTradingAccount("USD");
-            } catch (BankaCoreClientException ex2) {
+            if (ex.getHttpStatus() == 404) {
                 throw new EntityNotFoundException(
-                        "Bankin racun u " + preferredCurrency + " ne postoji.");
+                        UserRole.isClient(role)
+                                ? "Korisnik #" + userId + " nema aktivan racun."
+                                : "Bankin racun u " + preferredCurrency + " ne postoji.");
             }
+            throw ex;
         }
     }
 

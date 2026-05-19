@@ -21,6 +21,8 @@ import rs.raf.banka2_bek.account.model.AccountCategory;
 import rs.raf.banka2_bek.account.model.AccountStatus;
 import rs.raf.banka2_bek.account.model.AccountType;
 import rs.raf.banka2_bek.account.repository.AccountRepository;
+import rs.raf.banka2_bek.client.model.Client;
+import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.company.model.Company;
 import rs.raf.banka2_bek.company.repository.CompanyRepository;
 import rs.raf.banka2_bek.currency.model.Currency;
@@ -57,6 +59,7 @@ class InternalAccountsEmployeesControllerIntegrationTest {
 
     @Autowired private AccountRepository accountRepository;
     @Autowired private EmployeeRepository employeeRepository;
+    @Autowired private ClientRepository clientRepository;
     @Autowired private CurrencyRepository currencyRepository;
     @Autowired private CompanyRepository companyRepository;
     @Autowired private DataSource dataSource;
@@ -166,6 +169,95 @@ class InternalAccountsEmployeesControllerIntegrationTest {
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
     }
 
+    // ─── getPreferredAccount: CLIENT → racun u trazenoj valuti ───────────────
+
+    @Test
+    void getPreferredAccount_client_returnsAccountInRequestedCurrency() throws Exception {
+        Currency rsd = persistCurrency("RSD");
+        Currency eur = persistCurrency("EUR");
+        Client client = persistClient("pref-client@test.com");
+        // Klijent ima RSD i EUR racun; trazimo EUR.
+        persistClientAccount(client, rsd, "222000000000000201", new BigDecimal("9000.00"));
+        Account eurAccount = persistClientAccount(
+                client, eur, "222000000000000202", new BigDecimal("500.00"));
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                url("/internal/accounts/preferred/CLIENT/" + client.getId() + "?currency=EUR"),
+                HttpMethod.GET, new HttpEntity<>(internalHeaders()), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode json = objectMapper.readTree(resp.getBody());
+        assertThat(json.path("id").asLong()).isEqualTo(eurAccount.getId());
+        assertThat(json.path("currencyCode").asText()).isEqualTo("EUR");
+        assertThat(json.path("ownerClientId").asLong()).isEqualTo(client.getId());
+    }
+
+    // ─── getPreferredAccount: CLIENT bez racuna u valuti → fallback najveci ──
+
+    @Test
+    void getPreferredAccount_client_noCurrencyMatch_fallsBackToHighestBalance() throws Exception {
+        Currency rsd = persistCurrency("RSD");
+        Client client = persistClient("pref-client-fb@test.com");
+        // Klijent nema USD racun; trazimo USD → fallback na racun sa najvecim balansom.
+        persistClientAccount(client, rsd, "222000000000000211", new BigDecimal("100.00"));
+        Account richest = persistClientAccount(
+                client, rsd, "222000000000000212", new BigDecimal("8000.00"));
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                url("/internal/accounts/preferred/CLIENT/" + client.getId() + "?currency=USD"),
+                HttpMethod.GET, new HttpEntity<>(internalHeaders()), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode json = objectMapper.readTree(resp.getBody());
+        // findByClientIdAndStatusOrderByAvailableBalanceDesc → prvi je racun sa
+        // najvecim raspolozivim balansom.
+        assertThat(json.path("id").asLong()).isEqualTo(richest.getId());
+    }
+
+    // ─── getPreferredAccount: EMPLOYEE → bankin trading racun ────────────────
+
+    @Test
+    void getPreferredAccount_employee_returnsBankTradingAccount() throws Exception {
+        Currency rsd = persistCurrency("RSD");
+        Company bank = persistBankCompany();
+        Employee officer = persistEmployee("pref-bt-officer@test.com", "QA");
+        Account bankAccount = accountRepository.save(Account.builder()
+                .accountNumber("222000000000000220")
+                .accountType(AccountType.BUSINESS)
+                .currency(rsd)
+                .company(bank)
+                .employee(officer)
+                .balance(new BigDecimal("1000000.00"))
+                .availableBalance(new BigDecimal("1000000.00"))
+                .reservedAmount(BigDecimal.ZERO)
+                .accountCategory(AccountCategory.BANK_TRADING)
+                .status(AccountStatus.ACTIVE)
+                .build());
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                url("/internal/accounts/preferred/EMPLOYEE/42?currency=RSD"),
+                HttpMethod.GET, new HttpEntity<>(internalHeaders()), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode json = objectMapper.readTree(resp.getBody());
+        assertThat(json.path("id").asLong()).isEqualTo(bankAccount.getId());
+        assertThat(json.path("currencyCode").asText()).isEqualTo("RSD");
+    }
+
+    // ─── getPreferredAccount: not found → 404 ────────────────────────────────
+
+    @Test
+    void getPreferredAccount_clientWithoutAccount_returns404() {
+        Client client = persistClient("pref-client-empty@test.com");
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                url("/internal/accounts/preferred/CLIENT/" + client.getId() + "?currency=RSD"),
+                HttpMethod.GET, new HttpEntity<>(internalHeaders()), String.class);
+
+        // IllegalArgumentException → 404 (InternalApiExceptionHandler)
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
     // ─── getEmployees: no filter → all ───────────────────────────────────────
 
     @Test
@@ -265,6 +357,44 @@ class InternalAccountsEmployeesControllerIntegrationTest {
                 .taxNumber("100000001")
                 .address("Bulevar Kralja Aleksandra 1, Beograd")
                 .isBank(true)
+                .build());
+    }
+
+    private Client persistClient(String email) {
+        Client c = new Client();
+        c.setFirstName("Pref");
+        c.setLastName("Client");
+        c.setDateOfBirth(LocalDate.of(1995, 1, 1));
+        c.setGender("M");
+        c.setEmail(email);
+        c.setPhone("+381600000002");
+        c.setAddress("Test Address");
+        c.setPassword("x");
+        c.setSaltPassword("salt");
+        c.setActive(true);
+        return clientRepository.save(c);
+    }
+
+    private Account persistClientAccount(Client client, Currency currency,
+                                         String accountNumber, BigDecimal balance) {
+        // Account zahteva non-null employee_id (kao u monolitu) — zaposleni je
+        // sluzbenik koji vodi racun.
+        Employee officer = persistEmployee("officer-" + accountNumber + "@test.com", "QA");
+        return accountRepository.save(Account.builder()
+                .accountNumber(accountNumber)
+                .accountType(AccountType.CHECKING)
+                .accountCategory(AccountCategory.CLIENT)
+                .currency(currency)
+                .client(client)
+                .employee(officer)
+                .status(AccountStatus.ACTIVE)
+                .balance(balance)
+                .availableBalance(balance)
+                .reservedAmount(BigDecimal.ZERO)
+                .dailyLimit(new BigDecimal("50000.00"))
+                .monthlyLimit(new BigDecimal("200000.00"))
+                .dailySpending(BigDecimal.ZERO)
+                .monthlySpending(BigDecimal.ZERO)
                 .build());
     }
 

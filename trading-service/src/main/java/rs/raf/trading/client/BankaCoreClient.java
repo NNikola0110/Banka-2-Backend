@@ -184,6 +184,27 @@ public class BankaCoreClient {
     }
 
     /**
+     * Vraca podrazumevani racun OTC ucesnika u datoj valuti — za CLIENT klijentov
+     * preferiran aktivan racun, za EMPLOYEE/ADMIN bankin trading racun (verno
+     * monolitovom {@code OtcService.findDefaultAccount}). Na HTTP gresku
+     * (ukljucujuci 404 — racun ne postoji) baca {@link BankaCoreClientException}.
+     */
+    public InternalAccountDto getPreferredAccount(String userRole, Long userId, String currencyCode) {
+        return client.get()
+                .uri(uriBuilder -> uriBuilder
+                        .path("/internal/accounts/preferred/{userRole}/{userId}")
+                        .queryParam("currency", currencyCode)
+                        .build(userRole, userId))
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, (request, response) -> {
+                    throw new BankaCoreClientException(response.getStatusCode().value(),
+                            "banka-core GET /internal/accounts/preferred/" + userRole + "/" + userId
+                                    + " → " + response.getStatusCode());
+                })
+                .body(InternalAccountDto.class);
+    }
+
+    /**
      * Vraca zaposlene filtrirane po opcionim atributima (firstName / lastName /
      * email / position). Null/prazni filteri se izostavljaju iz query string-a.
      */

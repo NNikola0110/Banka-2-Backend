@@ -336,6 +336,43 @@ class BankaCoreClientTest {
     }
 
     @Test
+    void getPreferredAccount_client_sendsRoleIdAndCurrencyQuery_andReturnsAccount() throws Exception {
+        InternalAccountDto stub = new InternalAccountDto(
+                55L, "222000112345678955", "Stefan Jovanovic",
+                new BigDecimal("4000.00"), new BigDecimal("4000.00"),
+                BigDecimal.ZERO, "USD", "ACTIVE",
+                7L, null, "CLIENT");
+        String responseJson = objectMapper.writeValueAsString(stub);
+
+        mockServer.expect(requestTo(BASE_URL + "/internal/accounts/preferred/CLIENT/7?currency=USD"))
+                .andExpect(method(HttpMethod.GET))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        InternalAccountDto result = bankaCoreClient.getPreferredAccount("CLIENT", 7L, "USD");
+
+        assertThat(result.id()).isEqualTo(55L);
+        assertThat(result.currencyCode()).isEqualTo("USD");
+        assertThat(result.ownerClientId()).isEqualTo(7L);
+
+        mockServer.verify();
+    }
+
+    @Test
+    void getPreferredAccount_notFound_throwsBankaCoreClientExceptionWith404() {
+        mockServer.expect(requestTo(BASE_URL + "/internal/accounts/preferred/CLIENT/999?currency=RSD"))
+                .andExpect(method(HttpMethod.GET))
+                .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        assertThatThrownBy(() -> bankaCoreClient.getPreferredAccount("CLIENT", 999L, "RSD"))
+                .isInstanceOf(BankaCoreClientException.class)
+                .satisfies(ex -> assertThat(((BankaCoreClientException) ex).getHttpStatus())
+                        .isEqualTo(404));
+
+        mockServer.verify();
+    }
+
+    @Test
     void findEmployees_withQueryParams_sendsFiltersAndReturnsList() throws Exception {
         List<InternalUserDto> stub = List.of(
                 new InternalUserDto(3L, "EMPLOYEE", "tamara.pavlovic@banka.rs",

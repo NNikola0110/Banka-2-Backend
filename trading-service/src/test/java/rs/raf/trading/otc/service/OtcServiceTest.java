@@ -507,14 +507,16 @@ class OtcServiceTest {
             when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(0);
             when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
 
-            // buyer account passed in (id=10, USD), seller account = bank trading USD (id=99)
+            // buyer account passed in (id=10, USD); seller (klijent #2) → njegov
+            // licni preferiran racun (id=88, USD) preko getPreferredAccount.
             InternalAccountDto buyerAcc = account(10L, "111", "Buyer", "USD", 1L);
-            InternalAccountDto bankAcc = account(99L, "BANK", "Banka", "USD", null);
+            InternalAccountDto sellerAcc = account(88L, "222", "Seller", "USD", 2L);
             when(bankaCoreClient.getAccount(10L)).thenReturn(buyerAcc);
-            when(bankaCoreClient.getBankTradingAccount("USD")).thenReturn(bankAcc);
+            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
+                    .thenReturn(sellerAcc);
 
             when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
-                    .thenReturn(new TransferFundsResponse(10L, 99L, new BigDecimal("50.00"),
+                    .thenReturn(new TransferFundsResponse(10L, 88L, new BigDecimal("50.00"),
                             BigDecimal.ZERO, BigDecimal.ZERO));
             when(bankaCoreClient.reserveFunds(anyString(), any(ReserveFundsRequest.class)))
                     .thenReturn(new ReserveFundsResponse("RES-77", 10L,
@@ -524,14 +526,14 @@ class OtcServiceTest {
 
             service.acceptOffer(1L, 10L);
 
-            // premija premium → transferFunds buyer(10) → bank(99), iznos 50
+            // premija premium → transferFunds buyer(10) → seller(88), iznos 50
             ArgumentCaptor<String> transferKey = ArgumentCaptor.forClass(String.class);
             ArgumentCaptor<TransferFundsRequest> transferReq =
                     ArgumentCaptor.forClass(TransferFundsRequest.class);
             verify(bankaCoreClient).transferFunds(transferKey.capture(), transferReq.capture());
             assertThat(transferKey.getValue()).isEqualTo("otc-accept-1-premium");
             assertThat(transferReq.getValue().fromAccountId()).isEqualTo(10L);
-            assertThat(transferReq.getValue().toAccountId()).isEqualTo(99L);
+            assertThat(transferReq.getValue().toAccountId()).isEqualTo(88L);
             assertThat(transferReq.getValue().debitAmount()).isEqualByComparingTo("50.00");
             assertThat(transferReq.getValue().creditAmount()).isEqualByComparingTo("50.00");
 
@@ -563,6 +565,51 @@ class OtcServiceTest {
         }
 
         @Test
+        @DisplayName("acceptOffer — seller je ZAPOSLENI → seller racun je bankin "
+                + "(getPreferredAccount EMPLOYEE)")
+        void acceptOffer_employeeSeller_resolvesBankAccount() {
+            authSupervisor();
+            // seller (id=2) je ZAPOSLENI; obe strane su zaposleni (ensureSameRoleParticipants).
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(2L, UserRole.EMPLOYEE));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 5, "160.00", "50.00", 2L);
+            offer.setBuyerRole(UserRole.EMPLOYEE);
+            offer.setSellerRole(UserRole.EMPLOYEE);
+            when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
+            Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.EMPLOYEE, 100L, 20, 10, 0);
+            when(portfolioRepository.findByUserIdAndUserRole(2L, UserRole.EMPLOYEE))
+                    .thenReturn(List.of(sellerPf));
+            when(contractRepository.sumActiveReservedByListing(2L, UserRole.EMPLOYEE, 100L))
+                    .thenReturn(0);
+            when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
+
+            // buyer racun (id=10) prosledjen — i kupac je zaposleni (bankin racun).
+            InternalAccountDto buyerAcc = account(10L, "111", "Banka", "USD", null);
+            // EMPLOYEE seller → bankin trading racun (id=99, vlasnik nije klijent).
+            InternalAccountDto bankAcc = account(99L, "BANK", "Banka", "USD", null);
+            when(bankaCoreClient.getAccount(10L)).thenReturn(buyerAcc);
+            when(bankaCoreClient.getPreferredAccount(UserRole.EMPLOYEE, 2L, "USD"))
+                    .thenReturn(bankAcc);
+            when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
+                    .thenReturn(new TransferFundsResponse(10L, 99L, new BigDecimal("50.00"),
+                            BigDecimal.ZERO, BigDecimal.ZERO));
+            when(bankaCoreClient.reserveFunds(anyString(), any(ReserveFundsRequest.class)))
+                    .thenReturn(new ReserveFundsResponse("RES-77", 10L,
+                            new BigDecimal("800.00"), BigDecimal.ZERO));
+            when(offerRepository.save(any(OtcOffer.class))).thenAnswer(inv -> inv.getArgument(0));
+            when(contractRepository.save(any(OtcContract.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            service.acceptOffer(1L, 10L);
+
+            // premija ide na bankin racun (99) — verno monolitu (EMPLOYEE → bankin racun)
+            ArgumentCaptor<TransferFundsRequest> transferReq =
+                    ArgumentCaptor.forClass(TransferFundsRequest.class);
+            verify(bankaCoreClient).transferFunds(anyString(), transferReq.capture());
+            assertThat(transferReq.getValue().toAccountId()).isEqualTo(99L);
+            verify(bankaCoreClient).getPreferredAccount(UserRole.EMPLOYEE, 2L, "USD");
+        }
+
+        @Test
         @DisplayName("acceptOffer — banka-core 409 na rezervaciji → InsufficientFundsException")
         void acceptOffer_reserveConflictMapsToInsufficientFunds() {
             authClient();
@@ -576,10 +623,10 @@ class OtcServiceTest {
             when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(0);
             when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
             when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            when(bankaCoreClient.getBankTradingAccount("USD"))
-                    .thenReturn(account(99L, "BANK", "Banka", "USD", null));
+            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
+                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
             when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
-                    .thenReturn(new TransferFundsResponse(10L, 99L, new BigDecimal("50.00"),
+                    .thenReturn(new TransferFundsResponse(10L, 88L, new BigDecimal("50.00"),
                             BigDecimal.ZERO, BigDecimal.ZERO));
             when(bankaCoreClient.reserveFunds(anyString(), any(ReserveFundsRequest.class)))
                     .thenThrow(new BankaCoreClientException(409, "nedovoljno"));
@@ -641,13 +688,14 @@ class OtcServiceTest {
             OtcContract contract = activeContract(7L, 1L, 2L, listing, 5, "160.00", "RES-77");
             when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
             when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            when(bankaCoreClient.getBankTradingAccount("USD"))
-                    .thenReturn(account(99L, "BANK", "Banka", "USD", null));
+            // seller (klijent #2) → njegov licni preferiran racun (id=88, USD)
+            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
+                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
             when(bankaCoreClient.commitFunds(anyString(), anyString(), any(CommitFundsRequest.class)))
                     .thenReturn(new CommitFundsResponse("RES-77", new BigDecimal("800.00"),
                             BigDecimal.ZERO, BigDecimal.ZERO));
             when(bankaCoreClient.creditFunds(anyString(), any(CreditFundsRequest.class)))
-                    .thenReturn(new CreditFundsResponse(99L, new BigDecimal("800.00"),
+                    .thenReturn(new CreditFundsResponse(88L, new BigDecimal("800.00"),
                             new BigDecimal("100800.00")));
             Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 5);
             when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
@@ -671,13 +719,13 @@ class OtcServiceTest {
             assertThat(commitReq.getValue().amount()).isEqualByComparingTo("800.00");
             assertThat(commitReq.getValue().beneficiaryAccountId()).isNull();
 
-            // 2. creditFunds seller (bank account 99, 800)
+            // 2. creditFunds seller (njegov licni racun 88, 800)
             ArgumentCaptor<String> creditKey = ArgumentCaptor.forClass(String.class);
             ArgumentCaptor<CreditFundsRequest> creditReq =
                     ArgumentCaptor.forClass(CreditFundsRequest.class);
             verify(bankaCoreClient).creditFunds(creditKey.capture(), creditReq.capture());
             assertThat(creditKey.getValue()).isEqualTo("otc-exercise-7-credit");
-            assertThat(creditReq.getValue().accountId()).isEqualTo(99L);
+            assertThat(creditReq.getValue().accountId()).isEqualTo(88L);
             assertThat(creditReq.getValue().amount()).isEqualByComparingTo("800.00");
 
             // contract postaje EXERCISED
@@ -697,10 +745,11 @@ class OtcServiceTest {
             contract.setBuyerReservedAmount(null); // legacy — bez rezervacije
             when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
             when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            when(bankaCoreClient.getBankTradingAccount("USD"))
-                    .thenReturn(account(99L, "BANK", "Banka", "USD", null));
+            // seller (klijent #2) → njegov licni preferiran racun (id=88, USD)
+            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
+                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
             when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
-                    .thenReturn(new TransferFundsResponse(10L, 99L, new BigDecimal("800.00"),
+                    .thenReturn(new TransferFundsResponse(10L, 88L, new BigDecimal("800.00"),
                             BigDecimal.ZERO, BigDecimal.ZERO));
             Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 5);
             when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(

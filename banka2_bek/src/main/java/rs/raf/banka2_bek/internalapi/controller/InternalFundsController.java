@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import rs.raf.banka2.contracts.internal.CommitFundsRequest;
 import rs.raf.banka2.contracts.internal.CreditFundsRequest;
@@ -188,6 +189,20 @@ public class InternalFundsController {
     @GetMapping("/accounts/bank-trading/{currencyCode}")
     public ResponseEntity<?> getBankTradingAccount(@PathVariable String currencyCode) {
         return ResponseEntity.ok(lookupService.getBankTradingAccount(currencyCode));
+    }
+
+    /**
+     * Vraca podrazumevani racun OTC ucesnika u datoj valuti — za CLIENT klijentov
+     * preferiran aktivan racun, za EMPLOYEE/ADMIN bankin trading racun (verno
+     * monolitovom {@code OtcService.findDefaultAccount}). 4-segmentna putanja
+     * ({@code /accounts/preferred/{userRole}/{userId}}) ne kolidira sa
+     * {@code /accounts/{id}}, {@code /accounts/fund} ni {@code /accounts/bank-trading/{ccy}}.
+     */
+    @GetMapping("/accounts/preferred/{userRole}/{userId}")
+    public ResponseEntity<?> getPreferredAccount(@PathVariable String userRole,
+                                                 @PathVariable Long userId,
+                                                 @RequestParam("currency") String currency) {
+        return ResponseEntity.ok(lookupService.getPreferredAccount(userRole, userId, currency));
     }
 
     /**
