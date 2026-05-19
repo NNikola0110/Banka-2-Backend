@@ -15,6 +15,7 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.*;
@@ -22,6 +23,8 @@ import static org.mockito.Mockito.*;
 /**
  * Testovi za TradingJwtAuthenticationFilter.
  * Koristi Spring MockHttpServletRequest/Response i Mockito za FilterChain.
+ * {@code TradingPermissionResolver} je mockovan — po difoltu vraca praznu listu
+ * permisija (testovi koji proveravaju permisije ga stub-uju eksplicitno).
  */
 class TradingJwtAuthenticationFilterTest {
 
@@ -29,13 +32,16 @@ class TradingJwtAuthenticationFilterTest {
             "test-jwt-secret-do-not-use-in-prod-32-bytes-minimum-required-for-hs256";
 
     private TradingJwtAuthenticationFilter filter;
+    private TradingPermissionResolver permissionResolver;
     private SecretKey secretKey;
 
     @BeforeEach
     void setUp() {
         secretKey = Keys.hmacShaKeyFor(TEST_SECRET.getBytes(StandardCharsets.UTF_8));
         JwtValidator validator = new JwtValidator(TEST_SECRET);
-        filter = new TradingJwtAuthenticationFilter(validator);
+        permissionResolver = mock(TradingPermissionResolver.class);
+        when(permissionResolver.resolvePermissions(anyString())).thenReturn(List.of());
+        filter = new TradingJwtAuthenticationFilter(validator, permissionResolver);
     }
 
     @AfterEach
@@ -160,5 +166,46 @@ class TradingJwtAuthenticationFilterTest {
         assertThat(auth.getAuthorities())
                 .extracting("authority")
                 .containsExactly("ROLE_ADMIN");
+    }
+
+    @Test
+    void employeeToken_addsResolvedPermissionAuthorities() throws Exception {
+        // Supervizor: JWT role je EMPLOYEE, permisije se razresavaju preko banka-core.
+        when(permissionResolver.resolvePermissions("nikola.milenkovic@banka.rs"))
+                .thenReturn(List.of("SUPERVISOR", "TRADE_STOCKS"));
+        String token = buildValidToken("nikola.milenkovic@banka.rs", "EMPLOYEE");
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer " + token);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        verify(chain, times(1)).doFilter(request, response);
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        assertThat(auth).isNotNull();
+        assertThat(auth.getAuthorities())
+                .extracting("authority")
+                .containsExactlyInAnyOrder("ROLE_EMPLOYEE", "SUPERVISOR", "TRADE_STOCKS");
+    }
+
+    @Test
+    void clientToken_skipsPermissionResolver() throws Exception {
+        String token = buildValidToken("stefan.jovanovic@gmail.com", "CLIENT");
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer " + token);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        // Klijent nema employee permisije — lookup se preskace.
+        verify(permissionResolver, never()).resolvePermissions(anyString());
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        assertThat(auth.getAuthorities())
+                .extracting("authority")
+                .containsExactly("ROLE_CLIENT");
     }
 }

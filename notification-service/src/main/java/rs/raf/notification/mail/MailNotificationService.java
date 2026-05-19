@@ -6,6 +6,7 @@ import org.springframework.stereotype.Service;
 import rs.raf.notification.mail.template.AccountCreatedConfirmationEmailTemplate;
 import rs.raf.notification.mail.template.ActivationConfirmedEmailTemplate;
 import rs.raf.notification.mail.template.ActivationEmailTemplate;
+import rs.raf.notification.mail.template.MarginAccountBlockedEmailTemplate;
 import rs.raf.notification.mail.template.OtpEmailTemplate;
 import rs.raf.notification.mail.template.PasswordResetEmailTemplate;
 import rs.raf.notification.mail.template.TransactionEmailTemplate;
@@ -52,6 +53,7 @@ public class MailNotificationService {
     private final AccountCreatedConfirmationEmailTemplate accountCreatedConfirmationEmailTemplate;
     private final OtpEmailTemplate otpEmailTemplate;
     private final TransactionEmailTemplate transactionEmailTemplate;
+    private final MarginAccountBlockedEmailTemplate marginAccountBlockedEmailTemplate;
 
     public MailNotificationService(JavaMailSender mailSender,
                                    PasswordResetEmailTemplate passwordResetEmailTemplate,
@@ -60,6 +62,7 @@ public class MailNotificationService {
                                    AccountCreatedConfirmationEmailTemplate accountCreatedConfirmationEmailTemplate,
                                    OtpEmailTemplate otpEmailTemplate,
                                    TransactionEmailTemplate transactionEmailTemplate,
+                                   MarginAccountBlockedEmailTemplate marginAccountBlockedEmailTemplate,
                                    @Value("${spring.mail.username}") String fromAddress,
                                    @Value("${notification.password-reset-url-base}") String passwordResetUrlBase,
                                    @Value("${notification.password-reset-page-path:/reset-password}") String passwordResetPagePath,
@@ -77,6 +80,7 @@ public class MailNotificationService {
         this.accountCreatedConfirmationEmailTemplate = accountCreatedConfirmationEmailTemplate;
         this.otpEmailTemplate = otpEmailTemplate;
         this.transactionEmailTemplate = transactionEmailTemplate;
+        this.marginAccountBlockedEmailTemplate = marginAccountBlockedEmailTemplate;
     }
 
     public void sendPasswordResetMail(String toEmail, String token) {
@@ -170,6 +174,13 @@ public class MailNotificationService {
                                           LocalDate nextRetryDate) {
         String subject = transactionEmailTemplate.buildInstallmentFailedSubject();
         String html = transactionEmailTemplate.buildInstallmentFailedBody(loanNumber, amountDue, currency, nextRetryDate);
+        HtmlMailSender.sendHtmlMail(mailSender, fromAddress, toEmail, subject, html);
+    }
+
+    public void sendMarginAccountBlockedMail(String toEmail, String maintenanceMargin,
+                                             String initialMargin, String deficit) {
+        String subject = marginAccountBlockedEmailTemplate.buildSubject();
+        String html = marginAccountBlockedEmailTemplate.buildBody(maintenanceMargin, initialMargin, deficit);
         HtmlMailSender.sendHtmlMail(mailSender, fromAddress, toEmail, subject, html);
     }
 }

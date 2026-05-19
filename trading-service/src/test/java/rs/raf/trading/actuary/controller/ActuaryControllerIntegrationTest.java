@@ -28,6 +28,7 @@ import javax.crypto.SecretKey;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -107,6 +108,14 @@ class ActuaryControllerIntegrationTest {
         // JWT za HTTP autentifikaciju (filter chain ga validira lokalno).
         supervisorToken = buildToken("nina.nikolic@banka.rs", "EMPLOYEE");
         agentToken = buildToken("marko.markovic@banka.rs", "EMPLOYEE");
+
+        // /actuaries/** route guard trazi SUPERVISOR/ADMIN authority — JWT filter
+        // razresava permisije preko BankaCoreClient.getUserPermissions. Supervizor
+        // dobija SUPERVISOR, agent samo AGENT (pa pada na reset-limit @PreAuthorize).
+        lenient().when(bankaCoreClient.getUserPermissions("nina.nikolic@banka.rs"))
+                .thenReturn(List.of("SUPERVISOR"));
+        lenient().when(bankaCoreClient.getUserPermissions("marko.markovic@banka.rs"))
+                .thenReturn(List.of("AGENT"));
 
         // TradingUserResolver mock: email -> employeeId. Supervizor je default
         // za testove updateAgentLimit; pojedinacni testovi prekrivaju po potrebi.

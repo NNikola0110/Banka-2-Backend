@@ -42,6 +42,14 @@ class NotificationConsumerTest {
     }
 
     @Test
+    void marginAccountBlocked_delegatesToMail() {
+        consumer.handle(new NotificationMessage(NotificationKind.MARGIN_ACCOUNT_BLOCKED,
+                Map.of("email", "a@b.rs", "maintenanceMargin", "5000.00",
+                        "initialMargin", "4800.00", "deficit", "200.00")));
+        verify(mail).sendMarginAccountBlockedMail("a@b.rs", "5000.00", "4800.00", "200.00");
+    }
+
+    @Test
     void mailFailure_doesNotPropagate() {
         Mockito.doThrow(new RuntimeException("smtp down"))
                 .when(mail).sendCardUnblockedMail(Mockito.anyString(), Mockito.anyString());

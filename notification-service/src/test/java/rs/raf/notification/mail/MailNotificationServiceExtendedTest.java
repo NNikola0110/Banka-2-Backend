@@ -26,6 +26,7 @@ class MailNotificationServiceExtendedTest {
     @Mock private AccountCreatedConfirmationEmailTemplate accountCreatedConfirmationEmailTemplate;
     @Mock private OtpEmailTemplate otpEmailTemplate;
     @Mock private TransactionEmailTemplate transactionEmailTemplate;
+    @Mock private MarginAccountBlockedEmailTemplate marginAccountBlockedEmailTemplate;
     @Mock private MimeMessage mimeMessage;
 
     private MailNotificationService service;
@@ -35,8 +36,8 @@ class MailNotificationServiceExtendedTest {
         when(mailSender.createMimeMessage()).thenReturn(mimeMessage);
         service = new MailNotificationService(mailSender, passwordResetEmailTemplate, activationEmailTemplate,
                 activationConfirmedEmailTemplate, accountCreatedConfirmationEmailTemplate, otpEmailTemplate,
-                transactionEmailTemplate, "noreply@banka.rs", "http://localhost:3000", "/reset-password",
-                "http://localhost:3000", "/activate-account");
+                transactionEmailTemplate, marginAccountBlockedEmailTemplate, "noreply@banka.rs",
+                "http://localhost:3000", "/reset-password", "http://localhost:3000", "/activate-account");
     }
 
     @Test void sendPasswordResetMail_sends() {
@@ -127,6 +128,13 @@ class MailNotificationServiceExtendedTest {
         when(transactionEmailTemplate.buildInstallmentFailedSubject()).thenReturn("Failed");
         when(transactionEmailTemplate.buildInstallmentFailedBody(any(), any(), any(), any())).thenReturn("<html></html>");
         service.sendInstallmentFailedMail("u@b.rs", "LN1", BigDecimal.TEN, "RSD", LocalDate.now());
+        verify(mailSender).send(mimeMessage);
+    }
+
+    @Test void sendMarginAccountBlockedMail_sends() {
+        when(marginAccountBlockedEmailTemplate.buildSubject()).thenReturn("Margin blocked");
+        when(marginAccountBlockedEmailTemplate.buildBody(any(), any(), any())).thenReturn("<html></html>");
+        service.sendMarginAccountBlockedMail("u@b.rs", "5000.00", "4800.00", "200.00");
         verify(mailSender).send(mimeMessage);
     }
 }

@@ -112,6 +112,13 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-cache</artifactId>
         </dependency>
+        <!-- RabbitMQ - margin-call notifikacija ka notification-service (faza 2f-5a).
+             Publisher-only: samo MessageConverter bean, bez Exchange/Queue topologije
+             (notification-service je vlasnik), pa @SpringBootTest ne trazi broker. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
     </dependencies>
 
     <build>
