@@ -8,6 +8,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.mail.javamail.JavaMailSender;
 import rs.raf.notification.mail.template.*;
+import rs.raf.notification.mail.template.InAppGenericEmailTemplate;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -27,6 +28,7 @@ class MailNotificationServiceExtendedTest {
     @Mock private OtpEmailTemplate otpEmailTemplate;
     @Mock private TransactionEmailTemplate transactionEmailTemplate;
     @Mock private MarginAccountBlockedEmailTemplate marginAccountBlockedEmailTemplate;
+    @Mock private InAppGenericEmailTemplate inAppGenericEmailTemplate;
     @Mock private MimeMessage mimeMessage;
 
     private MailNotificationService service;
@@ -36,7 +38,8 @@ class MailNotificationServiceExtendedTest {
         when(mailSender.createMimeMessage()).thenReturn(mimeMessage);
         service = new MailNotificationService(mailSender, passwordResetEmailTemplate, activationEmailTemplate,
                 activationConfirmedEmailTemplate, accountCreatedConfirmationEmailTemplate, otpEmailTemplate,
-                transactionEmailTemplate, marginAccountBlockedEmailTemplate, "noreply@banka.rs",
+                transactionEmailTemplate, marginAccountBlockedEmailTemplate, inAppGenericEmailTemplate,
+                "noreply@banka.rs",
                 "http://localhost:3000", "/reset-password", "http://localhost:3000", "/activate-account");
     }
 
@@ -136,5 +139,17 @@ class MailNotificationServiceExtendedTest {
         when(marginAccountBlockedEmailTemplate.buildBody(any(), any(), any())).thenReturn("<html></html>");
         service.sendMarginAccountBlockedMail("u@b.rs", "5000.00", "4800.00", "200.00");
         verify(mailSender).send(mimeMessage);
+    }
+
+    @Test void sendInAppNotificationMail_sends() {
+        when(inAppGenericEmailTemplate.buildBody(any(), any(), any())).thenReturn("<html></html>");
+        service.sendInAppNotificationMail("u@b.rs", "Ana", "Obaveštenje", "Vaš nalog je ažuriran.");
+        verify(mailSender).send(mimeMessage);
+    }
+
+    @Test void sendInAppNotificationMail_usesTitleAsSubject() {
+        when(inAppGenericEmailTemplate.buildBody(any(), any(), any())).thenReturn("<html></html>");
+        service.sendInAppNotificationMail("u@b.rs", "Ana", "Moj naslov", "Sadrzaj.");
+        verify(inAppGenericEmailTemplate).buildBody("Ana", "Moj naslov", "Sadrzaj.");
     }
 }

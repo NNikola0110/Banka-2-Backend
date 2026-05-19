@@ -11,6 +11,7 @@ import org.springframework.mail.javamail.JavaMailSender;
 import rs.raf.notification.mail.template.AccountCreatedConfirmationEmailTemplate;
 import rs.raf.notification.mail.template.ActivationConfirmedEmailTemplate;
 import rs.raf.notification.mail.template.ActivationEmailTemplate;
+import rs.raf.notification.mail.template.InAppGenericEmailTemplate;
 import rs.raf.notification.mail.template.MarginAccountBlockedEmailTemplate;
 import rs.raf.notification.mail.template.OtpEmailTemplate;
 import rs.raf.notification.mail.template.PasswordResetEmailTemplate;
@@ -42,6 +43,8 @@ class MailNotificationServiceTest {
     private TransactionEmailTemplate transactionEmailTemplate;
     @Mock
     private MarginAccountBlockedEmailTemplate marginAccountBlockedEmailTemplate;
+    @Mock
+    private InAppGenericEmailTemplate inAppGenericEmailTemplate;
 
     private MailNotificationService service;
 
@@ -60,6 +63,7 @@ class MailNotificationServiceTest {
                 otpEmailTemplate,
                 transactionEmailTemplate,
                 marginAccountBlockedEmailTemplate,
+                inAppGenericEmailTemplate,
                 "from@test.com",
                 "http://localhost:3000",
                 "/reset-password",

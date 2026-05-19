@@ -72,6 +72,14 @@ public class NotificationConsumer {
                 case MARGIN_ACCOUNT_BLOCKED ->
                         mail.sendMarginAccountBlockedMail(d.get("email"), d.get("maintenanceMargin"),
                                 d.get("initialMargin"), d.get("deficit"));
+                case IN_APP_GENERIC -> {
+                    String email = d.get("email");
+                    if (email == null || email.isBlank()) {
+                        log.warn("IN_APP_GENERIC poruka nema 'email' kljuc — preskacemo slanje");
+                        return;
+                    }
+                    mail.sendInAppNotificationMail(email, d.get("firstName"), d.get("title"), d.get("body"));
+                }
             }
         } catch (RuntimeException ex) {
             // Best-effort: neuspeh slanja se loguje sa stack trace-om (ex kao zadnji

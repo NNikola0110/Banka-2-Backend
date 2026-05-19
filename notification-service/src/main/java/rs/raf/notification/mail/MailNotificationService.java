@@ -6,6 +6,7 @@ import org.springframework.stereotype.Service;
 import rs.raf.notification.mail.template.AccountCreatedConfirmationEmailTemplate;
 import rs.raf.notification.mail.template.ActivationConfirmedEmailTemplate;
 import rs.raf.notification.mail.template.ActivationEmailTemplate;
+import rs.raf.notification.mail.template.InAppGenericEmailTemplate;
 import rs.raf.notification.mail.template.MarginAccountBlockedEmailTemplate;
 import rs.raf.notification.mail.template.OtpEmailTemplate;
 import rs.raf.notification.mail.template.PasswordResetEmailTemplate;
@@ -54,6 +55,7 @@ public class MailNotificationService {
     private final OtpEmailTemplate otpEmailTemplate;
     private final TransactionEmailTemplate transactionEmailTemplate;
     private final MarginAccountBlockedEmailTemplate marginAccountBlockedEmailTemplate;
+    private final InAppGenericEmailTemplate inAppGenericEmailTemplate;
 
     public MailNotificationService(JavaMailSender mailSender,
                                    PasswordResetEmailTemplate passwordResetEmailTemplate,
@@ -63,6 +65,7 @@ public class MailNotificationService {
                                    OtpEmailTemplate otpEmailTemplate,
                                    TransactionEmailTemplate transactionEmailTemplate,
                                    MarginAccountBlockedEmailTemplate marginAccountBlockedEmailTemplate,
+                                   InAppGenericEmailTemplate inAppGenericEmailTemplate,
                                    @Value("${spring.mail.username}") String fromAddress,
                                    @Value("${notification.password-reset-url-base}") String passwordResetUrlBase,
                                    @Value("${notification.password-reset-page-path:/reset-password}") String passwordResetPagePath,
@@ -81,6 +84,7 @@ public class MailNotificationService {
         this.otpEmailTemplate = otpEmailTemplate;
         this.transactionEmailTemplate = transactionEmailTemplate;
         this.marginAccountBlockedEmailTemplate = marginAccountBlockedEmailTemplate;
+        this.inAppGenericEmailTemplate = inAppGenericEmailTemplate;
     }
 
     public void sendPasswordResetMail(String toEmail, String token) {
@@ -182,6 +186,24 @@ public class MailNotificationService {
         String subject = marginAccountBlockedEmailTemplate.buildSubject();
         String html = marginAccountBlockedEmailTemplate.buildBody(maintenanceMargin, initialMargin, deficit);
         HtmlMailSender.sendHtmlMail(mailSender, fromAddress, toEmail, subject, html);
+    }
+
+    /**
+     * [B1] Salje genericki branded email za in-app notifikaciju.
+     *
+     * <p>Poziva se iz {@code NotificationConsumer} kada stigne
+     * {@code IN_APP_GENERIC} poruka sa RabbitMQ-a. Koristi naslov notifikacije
+     * kao subjekat email-a i personalizuje pozdrav imenom korisnika kada je
+     * dostupno; u suprotnom koristi neutralni pozdrav.
+     *
+     * @param toEmail   adresa primaoca; ne sme biti {@code null}
+     * @param firstName ime primaoca za pozdrav (opciono — moze biti {@code null})
+     * @param title     naslov notifikacije; postaje subjekat email-a
+     * @param body      sadrzaj notifikacije; prikazuje se u telu email-a
+     */
+    public void sendInAppNotificationMail(String toEmail, String firstName, String title, String body) {
+        String html = inAppGenericEmailTemplate.buildBody(firstName, title, body);
+        HtmlMailSender.sendHtmlMail(mailSender, fromAddress, toEmail, title, html);
     }
 }
 

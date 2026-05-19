@@ -57,4 +57,19 @@ class NotificationConsumerTest {
         consumer.handle(new NotificationMessage(NotificationKind.CARD_UNBLOCKED,
                 Map.of("email", "a@b.rs", "last4Digits", "1234")));
     }
+
+    @Test
+    void inAppGeneric_delegatesToMail() {
+        consumer.handle(new NotificationMessage(NotificationKind.IN_APP_GENERIC,
+                Map.of("email", "a@b.rs", "firstName", "Ana",
+                        "title", "Obaveštenje", "body", "Vaš nalog je ažuriran.")));
+        verify(mail).sendInAppNotificationMail("a@b.rs", "Ana", "Obaveštenje", "Vaš nalog je ažuriran.");
+    }
+
+    @Test
+    void inAppGeneric_missingEmail_doesNotDelegate() {
+        consumer.handle(new NotificationMessage(NotificationKind.IN_APP_GENERIC,
+                Map.of("title", "Naslov", "body", "Sadrzaj")));
+        Mockito.verifyNoInteractions(mail);
+    }
 }
