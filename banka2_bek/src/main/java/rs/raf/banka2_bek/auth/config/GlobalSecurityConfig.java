@@ -74,14 +74,15 @@ public class GlobalSecurityConfig  {
                         // (pratiti postojeci obrazac u ovom fajlu — npr. /actuaries/** za role-based,
                         // /otc/** za authenticated):
                         //   - /notifications/**            -> authenticated()                 [B1 - Notifikacioni sistem]
-                        //   - /price-alerts/**             -> authenticated()                 [B5 - Cenovni alarmi]
-                        //   - /watchlists/**               -> authenticated()                 [B6 - Watchlist]
                         //   - /audit/**                    -> ADMIN + SUPERVISOR samo         [B7 - Audit log]
-                        //   - /recurring-orders/**         -> authenticated()                 [B8 - Trajni nalozi]
-                        //   - /dividends/**                -> authenticated()                 [B9 - Dividende]
                         //   - /otc/negotiation-history/**  -> authenticated()                 [B10 - Istorija OTC pregovora]
                         // Specificne rute moraju doci PRE generickih matcher-a.
                         // Spec: Zadaci_Backend.pdf.
+                        //
+                        // Napomena: zadaci B5 (Price Alert), B6 (Watchlist), B8 (Trajni nalozi)
+                        // i B9 (Dividende) su trgovinski — njihovi skeleton paketi su premesteni
+                        // u `trading-service` (Faza 2e); rute /price-alerts, /watchlists,
+                        // /recurring-orders, /dividends konfigurisu se u TradingSecurityConfig.
                         // ============================================================
                         .requestMatchers(
                                 "/error",

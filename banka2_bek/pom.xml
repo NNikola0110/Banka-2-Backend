@@ -289,11 +289,11 @@
                             coverage merenja dok se ne implementiraju. KAD zadatak bude gotov +
                             ispraceni testovima, nosilac UKLANJA svoj exclude red odavde.
                         -->
-                        <exclude>rs/raf/banka2_bek/pricealert/**</exclude>
-                        <exclude>rs/raf/banka2_bek/watchlist/**</exclude>
+                        <!-- B5/B6/B8/B9 skeleton paketi (pricealert/watchlist/
+                             recurringorder/dividend) su trgovinski — premesteni u
+                             trading-service (Faza 2e), pa vise nisu u monolitovom
+                             coverage scope-u. -->
                         <exclude>rs/raf/banka2_bek/audit/**</exclude>
-                        <exclude>rs/raf/banka2_bek/recurringorder/**</exclude>
-                        <exclude>rs/raf/banka2_bek/dividend/**</exclude>
                         <exclude>rs/raf/banka2_bek/notification/model/**</exclude>
                         <exclude>rs/raf/banka2_bek/notification/repository/**</exclude>
                         <exclude>rs/raf/banka2_bek/notification/controller/**</exclude>

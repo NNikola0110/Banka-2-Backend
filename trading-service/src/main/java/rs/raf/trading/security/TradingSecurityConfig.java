@@ -20,7 +20,10 @@ import rs.raf.trading.internalapi.config.InternalAuthFilter;
  * Rute su preslikane iz monolitovog {@code GlobalSecurityConfig}-a (trgovinski
  * deo): {@code /orders}, {@code /listings}, {@code /actuaries}, {@code /portfolio},
  * {@code /tax}, {@code /exchanges}, {@code /options}, {@code /margin-accounts},
- * {@code /otc}, {@code /funds}, {@code /profit-bank}. Per-permisija autoritete
+ * {@code /otc}, {@code /funds}, {@code /profit-bank}. Faza 2e je dodala skeleton
+ * trgovinske pakete (B5/B6/B8/B9): {@code /price-alerts}, {@code /watchlists},
+ * {@code /recurring-orders}, {@code /dividends}, {@code /admin/dividends}.
+ * Per-permisija autoritete
  * ({@code SUPERVISOR}, {@code ADMIN} ...) postavlja {@link TradingJwtAuthenticationFilter}
  * razresavanjem preko banka-core internog API-ja.
  *
@@ -89,6 +92,17 @@ public class TradingSecurityConfig {
                 // ── Profit Banke: samo supervizori ───────────────────────────
                 .requestMatchers("/profit-bank/**").hasAnyAuthority(
                         "ROLE_ADMIN", "ADMIN", "SUPERVISOR")
+                // ── Skeleton trgovinski paketi (Faza 2e) — B5/B6/B8/B9 ───────
+                //    Stubovi jos nisu implementirani; authenticated() je
+                //    bezbedan default. /admin/dividends je supervizorski
+                //    pregled (B9) — strozija autorizacija PRE generickog
+                //    /dividends/** pravila.
+                .requestMatchers("/price-alerts/**").authenticated()       // B5
+                .requestMatchers("/watchlists/**").authenticated()         // B6
+                .requestMatchers("/recurring-orders/**").authenticated()   // B8
+                .requestMatchers("/admin/dividends/**").hasAnyAuthority(    // B9
+                        "ROLE_ADMIN", "ADMIN", "SUPERVISOR")
+                .requestMatchers("/dividends/**").authenticated()          // B9
                 .anyRequest().authenticated())
             .addFilterBefore(internalAuthFilter, UsernamePasswordAuthenticationFilter.class)
             .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
