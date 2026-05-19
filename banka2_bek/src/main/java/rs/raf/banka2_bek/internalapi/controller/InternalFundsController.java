@@ -9,10 +9,12 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import rs.raf.banka2.contracts.internal.CommitFundsRequest;
+import rs.raf.banka2.contracts.internal.CreditFundsRequest;
 import rs.raf.banka2.contracts.internal.InternalErrorDto;
 import rs.raf.banka2.contracts.internal.ProvisionFundAccountRequest;
 import rs.raf.banka2.contracts.internal.ReleaseFundsRequest;
 import rs.raf.banka2.contracts.internal.ReserveFundsRequest;
+import rs.raf.banka2.contracts.internal.TaxCollectRequest;
 import rs.raf.banka2.contracts.internal.TransferFundsRequest;
 import rs.raf.banka2_bek.internalapi.service.InternalAccountProvisioningService;
 import rs.raf.banka2_bek.internalapi.service.InternalFundsService;
@@ -106,6 +108,39 @@ public class InternalFundsController {
                     .body(new InternalErrorDto("MISSING_IDEMPOTENCY_KEY", "X-Idempotency-Key je obavezan"));
         }
         return ResponseEntity.ok(fundsService.transferIdempotent(idempotencyKey, body));
+    }
+
+    /**
+     * Jednostrani kredit racuna bez debit kontra-strane — SELL prihod, dividende.
+     * Trziste je apstraktan izvor novca (verno modelu monolita).
+     */
+    @PostMapping("/funds/credit")
+    public ResponseEntity<?> credit(
+            @RequestBody CreditFundsRequest body,
+            @RequestHeader(value = "X-Idempotency-Key", required = false) String idempotencyKey) {
+
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return ResponseEntity.badRequest()
+                    .body(new InternalErrorDto("MISSING_IDEMPOTENCY_KEY", "X-Idempotency-Key je obavezan"));
+        }
+        return ResponseEntity.ok(fundsService.creditIdempotent(idempotencyKey, body));
+    }
+
+    /**
+     * Naplata poreza na kapitalnu dobit — debit RSD racuna klijenta, credit
+     * drzavnog RSD racuna. Ako klijent nema sredstava, naplata se preskace
+     * ({@code collected=false}).
+     */
+    @PostMapping("/funds/tax-collect")
+    public ResponseEntity<?> taxCollect(
+            @RequestBody TaxCollectRequest body,
+            @RequestHeader(value = "X-Idempotency-Key", required = false) String idempotencyKey) {
+
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return ResponseEntity.badRequest()
+                    .body(new InternalErrorDto("MISSING_IDEMPOTENCY_KEY", "X-Idempotency-Key je obavezan"));
+        }
+        return ResponseEntity.ok(fundsService.collectTaxIdempotent(idempotencyKey, body));
     }
 
     // ── Lookup ───────────────────────────────────────────────────────────────

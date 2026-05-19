@@ -9,13 +9,19 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import rs.raf.banka2.contracts.internal.CommitFundsRequest;
 import rs.raf.banka2.contracts.internal.CommitFundsResponse;
+import rs.raf.banka2.contracts.internal.CreditFundsRequest;
+import rs.raf.banka2.contracts.internal.CreditFundsResponse;
 import rs.raf.banka2.contracts.internal.ReleaseFundsRequest;
 import rs.raf.banka2.contracts.internal.ReleaseFundsResponse;
 import rs.raf.banka2.contracts.internal.ReserveFundsRequest;
 import rs.raf.banka2.contracts.internal.ReserveFundsResponse;
+import rs.raf.banka2.contracts.internal.TaxCollectRequest;
+import rs.raf.banka2.contracts.internal.TaxCollectResponse;
 import rs.raf.banka2.contracts.internal.TransferFundsRequest;
 import rs.raf.banka2.contracts.internal.TransferFundsResponse;
 import rs.raf.banka2_bek.account.model.Account;
+import rs.raf.banka2_bek.account.model.AccountCategory;
+import rs.raf.banka2_bek.account.model.AccountStatus;
 import rs.raf.banka2_bek.account.model.AccountType;
 import rs.raf.banka2_bek.account.repository.AccountRepository;
 import rs.raf.banka2_bek.currency.model.Currency;
@@ -28,6 +34,7 @@ import rs.raf.banka2_bek.internalapi.service.InternalIdempotencyService;
 import rs.raf.banka2_bek.transaction.repository.TransactionRepository;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -53,9 +60,15 @@ class InternalFundsServiceTest {
 
     private Currency rsd;
     private Account account;
+    /** Bankin BANK_TRADING racun u RSD — prima provizije. */
+    private Account bankTradingAccount;
 
     @BeforeEach
     void setUp() {
+        // state.registration-number — InternalFundsService ga cita @Value-om
+        org.springframework.test.util.ReflectionTestUtils.setField(
+                service, "stateRegistrationNumber", "17858459");
+
         rsd = new Currency();
         rsd.setId(1L);
         rsd.setCode("RSD");
@@ -78,6 +91,21 @@ class InternalFundsServiceTest {
 
         // Set id via reflection since @Builder doesn't include id
         org.springframework.test.util.ReflectionTestUtils.setField(account, "id", 1L);
+
+        bankTradingAccount = Account.builder()
+                .accountNumber("222000900000000099")
+                .accountType(AccountType.CHECKING)
+                .accountCategory(AccountCategory.BANK_TRADING)
+                .currency(rsd)
+                .balance(new BigDecimal("100000.00"))
+                .availableBalance(new BigDecimal("100000.00"))
+                .reservedAmount(BigDecimal.ZERO)
+                .dailyLimit(BigDecimal.ZERO)
+                .monthlyLimit(BigDecimal.ZERO)
+                .dailySpending(BigDecimal.ZERO)
+                .monthlySpending(BigDecimal.ZERO)
+                .build();
+        org.springframework.test.util.ReflectionTestUtils.setField(bankTradingAccount, "id", 99L);
     }
 
     // ─── reserve tests ────────────────────────────────────────────────────────
@@ -146,7 +174,7 @@ class InternalFundsServiceTest {
     // ─── commit tests ─────────────────────────────────────────────────────────
 
     @Test
-    void commit_happyPath_decreasesBalanceAndReserved() {
+    void commit_happyPath_noCommission_decreasesBalanceAndReserved() {
         // reserve() would have set reservedAmount=1000 before commit is called
         account.setReservedAmount(new BigDecimal("1000.00"));
         FundReservation reservation = buildReservation("res-001", 1L, "1000.00", "0.00", FundReservationStatus.RESERVED);
@@ -167,6 +195,38 @@ class InternalFundsServiceTest {
         assertThat(account.getBalance()).isEqualByComparingTo("9200.00");
         // reservedAmount started at 1000, subtract settle(800) → 200
         assertThat(account.getReservedAmount()).isEqualByComparingTo("200.00");
+        // commission == 0 → bankin racun se NE dira
+        verify(accountRepository, never())
+                .findFirstByAccountCategoryAndCurrency_Code(any(), anyString());
+    }
+
+    @Test
+    void commit_withCommission_creditsCommissionToBankTradingAccount() {
+        // reserve() set reservedAmount=1000; fill kosta 800 + 50 provizije
+        account.setReservedAmount(new BigDecimal("1000.00"));
+        FundReservation reservation = buildReservation("res-001c", 1L, "1000.00", "0.00", FundReservationStatus.RESERVED);
+
+        when(fundReservationRepository.findByReservationIdForUpdate("res-001c"))
+                .thenReturn(Optional.of(reservation));
+        when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
+        when(accountRepository.findFirstByAccountCategoryAndCurrency_Code(
+                AccountCategory.BANK_TRADING, "RSD")).thenReturn(Optional.of(bankTradingAccount));
+        when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(fundReservationRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        CommitFundsRequest req = new CommitFundsRequest(
+                new BigDecimal("800.00"), new BigDecimal("50.00"), null, "BUY fill");
+        CommitFundsResponse response = service.commit("res-001c", req);
+
+        // settle = 800 + 50 = 850 → balance 10000-850 = 9150, reserved 1000-850 = 150
+        assertThat(response.committedTotal()).isEqualByComparingTo("850.00");
+        assertThat(account.getBalance()).isEqualByComparingTo("9150.00");
+        assertThat(account.getReservedAmount()).isEqualByComparingTo("150.00");
+        // Provizija (50) je kreditovana bankinom BANK_TRADING racunu
+        assertThat(bankTradingAccount.getBalance()).isEqualByComparingTo("100050.00");
+        assertThat(bankTradingAccount.getAvailableBalance()).isEqualByComparingTo("100050.00");
+        verify(accountRepository).save(bankTradingAccount);
     }
 
     @Test
@@ -286,20 +346,8 @@ class InternalFundsServiceTest {
     // ─── transfer tests ───────────────────────────────────────────────────────
 
     @Test
-    void transfer_happyPath_debitsFromCreditTo() {
-        Account toAccount = Account.builder()
-                .accountNumber("222000200000000003")
-                .accountType(AccountType.CHECKING)
-                .currency(rsd)
-                .balance(new BigDecimal("500.00"))
-                .availableBalance(new BigDecimal("500.00"))
-                .reservedAmount(BigDecimal.ZERO)
-                .dailyLimit(BigDecimal.ZERO)
-                .monthlyLimit(BigDecimal.ZERO)
-                .dailySpending(BigDecimal.ZERO)
-                .monthlySpending(BigDecimal.ZERO)
-                .build();
-        org.springframework.test.util.ReflectionTestUtils.setField(toAccount, "id", 2L);
+    void transfer_happyPath_noCommission_debitsFromCreditTo() {
+        Account toAccount = buildPlainAccount("222000200000000003", "500.00", 2L);
 
         // transfer locks in min-id order: 1 then 2
         when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
@@ -317,23 +365,42 @@ class InternalFundsServiceTest {
         assertThat(account.getAvailableBalance()).isEqualByComparingTo("9800.00");
         assertThat(toAccount.getBalance()).isEqualByComparingTo("700.00");
         assertThat(toAccount.getAvailableBalance()).isEqualByComparingTo("700.00");
+        // commission == null → bankin racun se NE dira
+        verify(accountRepository, never())
+                .findFirstByAccountCategoryAndCurrency_Code(any(), anyString());
+    }
+
+    @Test
+    void transfer_withCommission_debitsAmountPlusCommissionAndCreditsBank() {
+        Account toAccount = buildPlainAccount("222000200000000003", "500.00", 2L);
+
+        when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
+        when(accountRepository.findForUpdateById(2L)).thenReturn(Optional.of(toAccount));
+        when(accountRepository.findFirstByAccountCategoryAndCurrency_Code(
+                AccountCategory.BANK_TRADING, "RSD")).thenReturn(Optional.of(bankTradingAccount));
+        when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        // amount 200 + provizija 15
+        TransferFundsRequest req = new TransferFundsRequest(
+                1L, 2L, new BigDecimal("200.00"), "RSD", new BigDecimal("15.00"), "fond uplata");
+        TransferFundsResponse response = service.transfer(req);
+
+        assertThat(response.amount()).isEqualByComparingTo("200.00");
+        // from skida amount + provizija = 215 → 10000-215 = 9785
+        assertThat(account.getBalance()).isEqualByComparingTo("9785.00");
+        assertThat(account.getAvailableBalance()).isEqualByComparingTo("9785.00");
+        // to dobija samo amount (200)
+        assertThat(toAccount.getBalance()).isEqualByComparingTo("700.00");
+        // banka dobija proviziju (15)
+        assertThat(bankTradingAccount.getBalance()).isEqualByComparingTo("100015.00");
+        assertThat(bankTradingAccount.getAvailableBalance()).isEqualByComparingTo("100015.00");
+        verify(accountRepository).save(bankTradingAccount);
     }
 
     @Test
     void transfer_insufficientFunds_throwsIllegalStateException() {
-        Account toAccount = Account.builder()
-                .accountNumber("222000200000000004")
-                .accountType(AccountType.CHECKING)
-                .currency(rsd)
-                .balance(new BigDecimal("0.00"))
-                .availableBalance(new BigDecimal("0.00"))
-                .reservedAmount(BigDecimal.ZERO)
-                .dailyLimit(BigDecimal.ZERO)
-                .monthlyLimit(BigDecimal.ZERO)
-                .dailySpending(BigDecimal.ZERO)
-                .monthlySpending(BigDecimal.ZERO)
-                .build();
-        org.springframework.test.util.ReflectionTestUtils.setField(toAccount, "id", 2L);
+        Account toAccount = buildPlainAccount("222000200000000004", "0.00", 2L);
 
         when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
         when(accountRepository.findForUpdateById(2L)).thenReturn(Optional.of(toAccount));
@@ -375,6 +442,202 @@ class InternalFundsServiceTest {
         verify(accountRepository, never()).save(any());
     }
 
+    // ─── credit tests ─────────────────────────────────────────────────────────
+
+    @Test
+    void credit_noCommission_creditsAccountOneSided() {
+        when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
+        when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        CreditFundsRequest req = new CreditFundsRequest(
+                1L, new BigDecimal("750.00"), BigDecimal.ZERO, "RSD", "SELL prihod");
+        CreditFundsResponse response = service.credit(req);
+
+        assertThat(response.accountId()).isEqualTo(1L);
+        assertThat(response.creditedAmount()).isEqualByComparingTo("750.00");
+        // balance 10000 + 750 = 10750 — bez ijednog debit-a (trziste je apstraktan izvor)
+        assertThat(response.balanceAfter()).isEqualByComparingTo("10750.00");
+        assertThat(account.getBalance()).isEqualByComparingTo("10750.00");
+        assertThat(account.getAvailableBalance()).isEqualByComparingTo("10750.00");
+        verify(accountRepository, never())
+                .findFirstByAccountCategoryAndCurrency_Code(any(), anyString());
+    }
+
+    @Test
+    void credit_withCommission_creditsAccountAndBank() {
+        when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
+        when(accountRepository.findFirstByAccountCategoryAndCurrency_Code(
+                AccountCategory.BANK_TRADING, "RSD")).thenReturn(Optional.of(bankTradingAccount));
+        when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        CreditFundsRequest req = new CreditFundsRequest(
+                1L, new BigDecimal("1000.00"), new BigDecimal("25.00"), "RSD", "SELL prihod");
+        CreditFundsResponse response = service.credit(req);
+
+        assertThat(response.creditedAmount()).isEqualByComparingTo("1000.00");
+        assertThat(account.getBalance()).isEqualByComparingTo("11000.00");
+        // banka dobija proviziju (25)
+        assertThat(bankTradingAccount.getBalance()).isEqualByComparingTo("100025.00");
+        verify(accountRepository).save(bankTradingAccount);
+    }
+
+    @Test
+    void credit_wrongCurrency_throwsIllegalArgumentException() {
+        when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
+
+        CreditFundsRequest req = new CreditFundsRequest(
+                1L, new BigDecimal("100.00"), BigDecimal.ZERO, "EUR", "test");
+        assertThatThrownBy(() -> service.credit(req))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Valuta");
+    }
+
+    @Test
+    void credit_nonPositiveAmount_throwsIllegalArgumentException() {
+        CreditFundsRequest req = new CreditFundsRequest(
+                1L, BigDecimal.ZERO, BigDecimal.ZERO, "RSD", "test");
+        assertThatThrownBy(() -> service.credit(req))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("pozitivan");
+    }
+
+    @Test
+    void creditIdempotent_cachedKey_returnsCachedResponseWithoutReExecuting() throws Exception {
+        String cachedJson = "{\"accountId\":1,\"creditedAmount\":500.00,\"balanceAfter\":10500.00}";
+        InternalRequest cachedRequest = new InternalRequest();
+        cachedRequest.setIdempotencyKey("idem-credit-1");
+        cachedRequest.setEndpoint("/internal/funds/credit");
+        cachedRequest.setHttpStatus(200);
+        cachedRequest.setResponseBody(cachedJson);
+
+        when(idempotencyService.findCached("idem-credit-1")).thenReturn(Optional.of(cachedRequest));
+        CreditFundsResponse expected = new CreditFundsResponse(
+                1L, new BigDecimal("500.00"), new BigDecimal("10500.00"));
+        when(objectMapper.readValue(cachedJson, CreditFundsResponse.class)).thenReturn(expected);
+
+        CreditFundsRequest req = new CreditFundsRequest(
+                1L, new BigDecimal("500.00"), BigDecimal.ZERO, "RSD", "SELL prihod");
+        CreditFundsResponse response = service.creditIdempotent("idem-credit-1", req);
+
+        assertThat(response.creditedAmount()).isEqualByComparingTo("500.00");
+        // Cached path — nijedna mutirajuca operacija
+        verify(accountRepository, never()).findForUpdateById(any());
+        verify(accountRepository, never()).save(any());
+    }
+
+    // ─── tax-collect tests ────────────────────────────────────────────────────
+
+    @Test
+    void collectTax_happyPath_debitsClientAndCreditsState() {
+        Account stateAccount = buildPlainAccount("178000000000000001", "0.00", 50L);
+        Account clientRsd = buildPlainAccount("222000300000000001", "5000.00", 10L);
+
+        when(accountRepository.findBankAccountForUpdateByCurrency("17858459", "RSD"))
+                .thenReturn(Optional.of(stateAccount));
+        when(accountRepository.findByClientIdAndStatusOrderByAvailableBalanceDesc(
+                100L, AccountStatus.ACTIVE)).thenReturn(List.of(clientRsd));
+        when(accountRepository.findForUpdateById(10L)).thenReturn(Optional.of(clientRsd));
+        when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        TaxCollectRequest req = new TaxCollectRequest(100L, new BigDecimal("300.00"), "Porez 2026-05");
+        TaxCollectResponse response = service.collectTax(req);
+
+        assertThat(response.collected()).isTrue();
+        assertThat(response.collectedAmount()).isEqualByComparingTo("300.00");
+        // klijent debitovan
+        assertThat(clientRsd.getBalance()).isEqualByComparingTo("4700.00");
+        assertThat(clientRsd.getAvailableBalance()).isEqualByComparingTo("4700.00");
+        // drzava kreditovana
+        assertThat(stateAccount.getBalance()).isEqualByComparingTo("300.00");
+        assertThat(stateAccount.getAvailableBalance()).isEqualByComparingTo("300.00");
+    }
+
+    @Test
+    void collectTax_insufficientFunds_returnsCollectedFalseWithoutThrowing() {
+        Account stateAccount = buildPlainAccount("178000000000000001", "0.00", 50L);
+        // klijentov RSD racun ima samo 100 — nedovoljno za porez 300
+        Account clientRsd = buildPlainAccount("222000300000000002", "100.00", 11L);
+
+        when(accountRepository.findBankAccountForUpdateByCurrency("17858459", "RSD"))
+                .thenReturn(Optional.of(stateAccount));
+        when(accountRepository.findByClientIdAndStatusOrderByAvailableBalanceDesc(
+                101L, AccountStatus.ACTIVE)).thenReturn(List.of(clientRsd));
+
+        TaxCollectRequest req = new TaxCollectRequest(101L, new BigDecimal("300.00"), "Porez");
+        TaxCollectResponse response = service.collectTax(req);
+
+        // Verno monolitu: NE baca izuzetak, samo collected=false
+        assertThat(response.collected()).isFalse();
+        assertThat(response.collectedAmount()).isEqualByComparingTo("0.00");
+        assertThat(response.payerClientId()).isEqualTo(101L);
+        // nijedan racun nije diran
+        assertThat(clientRsd.getBalance()).isEqualByComparingTo("100.00");
+        assertThat(stateAccount.getBalance()).isEqualByComparingTo("0.00");
+        verify(accountRepository, never()).save(any());
+    }
+
+    @Test
+    void collectTax_noStateAccount_returnsCollectedFalse() {
+        when(accountRepository.findBankAccountForUpdateByCurrency("17858459", "RSD"))
+                .thenReturn(Optional.empty());
+
+        TaxCollectRequest req = new TaxCollectRequest(102L, new BigDecimal("300.00"), "Porez");
+        TaxCollectResponse response = service.collectTax(req);
+
+        assertThat(response.collected()).isFalse();
+        assertThat(response.collectedAmount()).isEqualByComparingTo("0.00");
+        verify(accountRepository, never()).save(any());
+    }
+
+    @Test
+    void collectTax_clientHasNoRsdAccount_returnsCollectedFalse() {
+        Account stateAccount = buildPlainAccount("178000000000000001", "0.00", 50L);
+        // klijent ima samo EUR racun
+        Account clientEur = buildPlainAccount("222000300000000003", "5000.00", 12L);
+        Currency eur = new Currency();
+        eur.setId(2L);
+        eur.setCode("EUR");
+        eur.setName("Euro");
+        eur.setSymbol("E");
+        eur.setCountry("DE");
+        org.springframework.test.util.ReflectionTestUtils.setField(clientEur, "currency", eur);
+
+        when(accountRepository.findBankAccountForUpdateByCurrency("17858459", "RSD"))
+                .thenReturn(Optional.of(stateAccount));
+        when(accountRepository.findByClientIdAndStatusOrderByAvailableBalanceDesc(
+                103L, AccountStatus.ACTIVE)).thenReturn(List.of(clientEur));
+
+        TaxCollectRequest req = new TaxCollectRequest(103L, new BigDecimal("300.00"), "Porez");
+        TaxCollectResponse response = service.collectTax(req);
+
+        assertThat(response.collected()).isFalse();
+        verify(accountRepository, never()).save(any());
+    }
+
+    @Test
+    void collectTaxIdempotent_cachedKey_returnsCachedResponseWithoutReExecuting() throws Exception {
+        String cachedJson = "{\"payerClientId\":100,\"collectedAmount\":300.00,\"collected\":true}";
+        InternalRequest cachedRequest = new InternalRequest();
+        cachedRequest.setIdempotencyKey("idem-tax-1");
+        cachedRequest.setEndpoint("/internal/funds/tax-collect");
+        cachedRequest.setHttpStatus(200);
+        cachedRequest.setResponseBody(cachedJson);
+
+        when(idempotencyService.findCached("idem-tax-1")).thenReturn(Optional.of(cachedRequest));
+        TaxCollectResponse expected = new TaxCollectResponse(100L, new BigDecimal("300.00"), true);
+        when(objectMapper.readValue(cachedJson, TaxCollectResponse.class)).thenReturn(expected);
+
+        TaxCollectRequest req = new TaxCollectRequest(100L, new BigDecimal("300.00"), "Porez");
+        TaxCollectResponse response = service.collectTaxIdempotent("idem-tax-1", req);
+
+        assertThat(response.collected()).isTrue();
+        verify(accountRepository, never()).findBankAccountForUpdateByCurrency(anyString(), anyString());
+        verify(accountRepository, never()).save(any());
+    }
+
     // ─── Helpers ─────────────────────────────────────────────────────────────
 
     private FundReservation buildReservation(String rid, Long accountId,
@@ -388,5 +651,23 @@ class InternalFundsServiceTest {
         r.setCurrencyCode("RSD");
         r.setStatus(status);
         return r;
+    }
+
+    /** RSD CHECKING racun sa datim brojem, balansom i ID-em (balance == available). */
+    private Account buildPlainAccount(String accountNumber, String balance, Long id) {
+        Account a = Account.builder()
+                .accountNumber(accountNumber)
+                .accountType(AccountType.CHECKING)
+                .currency(rsd)
+                .balance(new BigDecimal(balance))
+                .availableBalance(new BigDecimal(balance))
+                .reservedAmount(BigDecimal.ZERO)
+                .dailyLimit(BigDecimal.ZERO)
+                .monthlyLimit(BigDecimal.ZERO)
+                .dailySpending(BigDecimal.ZERO)
+                .monthlySpending(BigDecimal.ZERO)
+                .build();
+        org.springframework.test.util.ReflectionTestUtils.setField(a, "id", id);
+        return a;
     }
 }
