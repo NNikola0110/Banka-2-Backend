@@ -11,6 +11,8 @@ import rs.raf.banka2.contracts.internal.InternalErrorDto;
 import rs.raf.banka2.contracts.internal.InternalListingDto;
 import rs.raf.banka2.contracts.internal.InternalPortfolioHoldingDto;
 import rs.raf.banka2.contracts.internal.InternalPublicStockSellerDto;
+import rs.raf.banka2.contracts.internal.ReassignFundManagerRequest;
+import rs.raf.banka2.contracts.internal.ReassignFundManagerResponse;
 import rs.raf.banka2.contracts.internal.ReleaseStockRequest;
 import rs.raf.banka2.contracts.internal.ReleaseStockResponse;
 import rs.raf.banka2.contracts.internal.ReserveStockRequest;
@@ -21,19 +23,23 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * HTTP klijent ka trading-service internom {@code /internal/portfolio/**} seam-u
+ * HTTP klijent ka trading-service internom {@code /internal/**} seam-u
  * (faza 2f). Mirror trading-service-ovog {@code BankaCoreClient} — drugi smer
  * iste interne komunikacije.
  *
- * <p>Posle 2f cutover-a {@code portfolios}/{@code listings} tabele zive samo u
- * trading_db. banka-core {@code interbank} paket (inter-bank OTC + 2PC settlement)
- * vise ne radi in-process JPA pristup tim tabelama nego ih cita/menja preko ovog
- * klijenta. Pozivalac (npr. {@code InterbankReservationApplier},
- * {@code TransactionExecutorService}) prevodi {@link TradingServiceClientException}
- * u {@code InterbankExceptions} tipove.
+ * <p>Posle 2f cutover-a {@code portfolios}/{@code listings}/{@code investment_funds}
+ * tabele zive samo u trading_db. banka-core vise ne radi in-process JPA pristup
+ * tim tabelama nego ih cita/menja preko ovog klijenta:
+ * <ul>
+ *   <li>{@code interbank} paket (inter-bank OTC + 2PC settlement) → {@code /internal/portfolio/**};</li>
+ *   <li>{@code employee} paket (bulk reassign menadzera fondova) → {@code /internal/funds/**}.</li>
+ * </ul>
+ * Pozivalac (npr. {@code InterbankReservationApplier}, {@code TransactionExecutorService})
+ * prevodi {@link TradingServiceClientException} u {@code InterbankExceptions} tipove.
  *
- * <p>Mutirajuci pozivi (reserve/commit/release) salju {@code X-Idempotency-Key} —
- * trading-service kesira odgovor tako da retry ne primeni kretanje hartija dvaput.
+ * <p>Mutirajuci pozivi (reserve/commit/release/reassign-manager) salju
+ * {@code X-Idempotency-Key} — trading-service kesira odgovor tako da retry ne
+ * primeni operaciju dvaput.
  */
 @Component
 public class TradingServiceInternalClient {
@@ -66,6 +72,26 @@ public class TradingServiceInternalClient {
     public ReleaseStockResponse releaseStock(String idempotencyKey, ReleaseStockRequest req) {
         return postIdempotent("/internal/portfolio/release-stock", idempotencyKey, req,
                 ReleaseStockResponse.class);
+    }
+
+    /**
+     * Bulk prebacivanje vlasnistva nad fondovima — svi fondovi kojima upravlja
+     * {@code oldManagerEmployeeId} dobijaju {@code newManagerEmployeeId} kao novog
+     * menadzera. Poziva ga {@code employee} paket kada admin oduzme SUPERVISOR
+     * permisiju supervizoru.
+     *
+     * <p>Idempotency kljuc je deterministican ({@code reassign-mgr-{old}-{new}}):
+     * operacija je apsolutan JPA {@code update} keyed na {@code oldManagerEmployeeId},
+     * pa ponovljen poziv vraca kesiran broj iz prvog poziva.
+     *
+     * @return broj fondova kojima je promenjen menadzer
+     */
+    public ReassignFundManagerResponse reassignFundManager(Long oldManagerEmployeeId,
+                                                           Long newManagerEmployeeId) {
+        String idempotencyKey = "reassign-mgr-" + oldManagerEmployeeId + "-" + newManagerEmployeeId;
+        return postIdempotent("/internal/funds/reassign-manager", idempotencyKey,
+                new ReassignFundManagerRequest(oldManagerEmployeeId, newManagerEmployeeId),
+                ReassignFundManagerResponse.class);
     }
 
     // ── Read-side pozivi ─────────────────────────────────────────────────────

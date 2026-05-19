@@ -16,9 +16,11 @@ import rs.raf.banka2_bek.employee.model.Employee;
 import rs.raf.banka2_bek.employee.repository.ActivationTokenRepository;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.employee.service.implementation.EmployeeServiceImpl;
+import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.HashSet;
 import java.util.Optional;
 import java.util.Set;
 
@@ -27,6 +29,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -44,6 +47,9 @@ class EmployeeServiceImplTest {
 
     @Mock
     private NotificationPublisher notificationPublisher;
+
+    @Mock
+    private TradingServiceInternalClient tradingServiceInternalClient;
 
     @InjectMocks
     private EmployeeServiceImpl employeeService;
@@ -158,5 +164,57 @@ class EmployeeServiceImplTest {
         assertThatThrownBy(() -> employeeService.deactivateEmployee(3L))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Admin employees cannot be deactivated");
+    }
+
+    @Test
+    void updateEmployeeStrippingSupervisorReassignsFundsViaTradingService() {
+        // Faza 2f: kad admin oduzme SUPERVISOR permisiju supervizoru, bulk
+        // reassign menadzera fondova ide preko trading-service internog
+        // endpoint-a (ne vise in-process InvestmentFundService).
+        Employee supervisor = Employee.builder()
+                .id(20L)
+                .email("sup@test.com")
+                .permissions(new HashSet<>(Set.of("SUPERVISOR")))
+                .active(true)
+                .build();
+        Employee admin = Employee.builder()
+                .id(7L)
+                .permissions(Set.of("ADMIN"))
+                .active(true)
+                .build();
+
+        when(employeeRepository.findById(20L)).thenReturn(Optional.of(supervisor));
+        // resolveCurrentAdminId fallback: prvi aktivan ADMIN iz baze
+        when(employeeRepository.findAll()).thenReturn(java.util.List.of(admin));
+        when(employeeRepository.save(any(Employee.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        UpdateEmployeeRequestDto request = new UpdateEmployeeRequestDto();
+        request.setPermissions(Set.of("VIEW_STOCKS")); // SUPERVISOR uklonjen
+
+        employeeService.updateEmployee(20L, request);
+
+        // bulk reassign poslat trading-service-u: stari menadzer 20 -> admin 7
+        verify(tradingServiceInternalClient).reassignFundManager(20L, 7L);
+    }
+
+    @Test
+    void updateEmployeeKeepingSupervisorDoesNotReassignFunds() {
+        // Kad supervizor zadrzi SUPERVISOR permisiju, nema reassign-a fondova.
+        Employee supervisor = Employee.builder()
+                .id(21L)
+                .email("sup2@test.com")
+                .permissions(new HashSet<>(Set.of("SUPERVISOR")))
+                .active(true)
+                .build();
+
+        when(employeeRepository.findById(21L)).thenReturn(Optional.of(supervisor));
+        when(employeeRepository.save(any(Employee.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        UpdateEmployeeRequestDto request = new UpdateEmployeeRequestDto();
+        request.setPermissions(Set.of("SUPERVISOR", "VIEW_STOCKS")); // i dalje supervizor
+
+        employeeService.updateEmployee(21L, request);
+
+        verify(tradingServiceInternalClient, never()).reassignFundManager(any(), any());
     }
 }

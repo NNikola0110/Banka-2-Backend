@@ -3,7 +3,6 @@ package rs.raf.banka2_bek.exchange;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import rs.raf.banka2_bek.exchange.dto.ExchangeRateDto;
-import rs.raf.banka2_bek.order.exception.UnsupportedCurrencyException;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;

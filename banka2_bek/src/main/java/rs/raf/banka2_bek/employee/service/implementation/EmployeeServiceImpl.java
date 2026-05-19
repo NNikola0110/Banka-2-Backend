@@ -14,7 +14,7 @@ import rs.raf.banka2_bek.employee.model.Employee;
 import rs.raf.banka2_bek.notification.NotificationPublisher;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.employee.service.EmployeeService;
-import rs.raf.banka2_bek.investmentfund.service.InvestmentFundService;
+import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
 
 import java.security.SecureRandom;
 import java.time.LocalDateTime;
@@ -50,7 +50,7 @@ public class EmployeeServiceImpl implements EmployeeService {
     private final ActivationTokenRepository activationTokenRepository;
     private final PasswordEncoder passwordEncoder;
     private final NotificationPublisher notificationPublisher;
-    private final InvestmentFundService investmentFundService;
+    private final TradingServiceInternalClient tradingServiceInternalClient;
 
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
@@ -152,9 +152,15 @@ public class EmployeeServiceImpl implements EmployeeService {
             // Ako se SUPERVISOR permisija UKLANJA supervizoru koji upravlja fondovima,
             // vlasnistvo svih njegovih fondova prebacuje se na admina koji menja
             // permisije (currentAdminId iz security konteksta — fallback: prvi
-            // aktivan admin u bazi). Ovo MORA da se desi PRE save-a permisija
-            // tako da audit log u InvestmentFundService.reassignFundManager
-            // zabeleyi pravu vrednost menadzera.
+            // aktivan admin u bazi).
+            //
+            // Faza 2f: investment_funds tabela posle cutover-a zivi samo u
+            // trading_db, pa bulk reassign ide preko trading-service internog
+            // endpoint-a (TradingServiceInternalClient.reassignFundManager).
+            // Poziv je u istoj @Transactional metodi — ako trading-service vrati
+            // gresku, TradingServiceClientException propagira i cela izmena
+            // zaposlenog se rollback-uje (isto ponasanje kao stari in-process
+            // poziv koji je obarao transakciju).
             Set<String> oldPermissions = employee.getPermissions() != null
                     ? new HashSet<>(employee.getPermissions())
                     : new HashSet<>();
@@ -165,7 +171,7 @@ public class EmployeeServiceImpl implements EmployeeService {
                     || newPermissions.contains("ADMIN");
             if (wasSupervisor && !isSupervisor) {
                 Long newManagerId = resolveCurrentAdminId(id);
-                investmentFundService.reassignFundManager(id, newManagerId);
+                tradingServiceInternalClient.reassignFundManager(id, newManagerId);
             }
             employee.setPermissions(request.getPermissions());
         }

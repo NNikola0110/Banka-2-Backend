@@ -15,6 +15,7 @@ import rs.raf.banka2.contracts.internal.InternalErrorDto;
 import rs.raf.banka2.contracts.internal.InternalListingDto;
 import rs.raf.banka2.contracts.internal.InternalPortfolioHoldingDto;
 import rs.raf.banka2.contracts.internal.InternalPublicStockSellerDto;
+import rs.raf.banka2.contracts.internal.ReassignFundManagerResponse;
 import rs.raf.banka2.contracts.internal.ReleaseStockRequest;
 import rs.raf.banka2.contracts.internal.ReleaseStockResponse;
 import rs.raf.banka2.contracts.internal.ReserveStockRequest;
@@ -106,6 +107,42 @@ class TradingServiceInternalClientTest {
                 new ReleaseStockRequest(42L, "CLIENT", "AAPL", 5));
 
         assertThat(resp.reservedQuantity()).isZero();
+        mockServer.verify();
+    }
+
+    @Test
+    @DisplayName("reassignFundManager: salje deterministican X-Idempotency-Key, vraca count")
+    void reassignFundManager_sendsDeterministicKey_andReturnsCount() throws Exception {
+        ReassignFundManagerResponse stub = new ReassignFundManagerResponse(3);
+        mockServer.expect(requestTo(BASE_URL + "/internal/funds/reassign-manager"))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andExpect(header("X-Idempotency-Key", "reassign-mgr-100-200"))
+                .andExpect(jsonPath("$.oldManagerEmployeeId").value(100))
+                .andExpect(jsonPath("$.newManagerEmployeeId").value(200))
+                .andRespond(withSuccess(objectMapper.writeValueAsString(stub),
+                        MediaType.APPLICATION_JSON));
+
+        ReassignFundManagerResponse resp = client.reassignFundManager(100L, 200L);
+
+        assertThat(resp.reassignedCount()).isEqualTo(3);
+        mockServer.verify();
+    }
+
+    @Test
+    @DisplayName("reassignFundManager: 500 → TradingServiceClientException sa porukom iz InternalErrorDto")
+    void reassignFundManager_serverError_throwsWithErrorBody() throws Exception {
+        InternalErrorDto err = new InternalErrorDto("INTERNAL_ERROR", "fond reassign nije uspeo");
+        mockServer.expect(requestTo(BASE_URL + "/internal/funds/reassign-manager"))
+                .andRespond(withStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .body(objectMapper.writeValueAsString(err)));
+
+        assertThatThrownBy(() -> client.reassignFundManager(100L, 200L))
+                .isInstanceOf(TradingServiceClientException.class)
+                .hasMessageContaining("fond reassign nije uspeo")
+                .satisfies(e -> assertThat(((TradingServiceClientException) e).getHttpStatus())
+                        .isEqualTo(500));
         mockServer.verify();
     }
 

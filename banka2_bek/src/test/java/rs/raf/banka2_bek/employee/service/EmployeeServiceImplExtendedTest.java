@@ -15,6 +15,7 @@ import rs.raf.banka2_bek.notification.NotificationPublisher;
 import rs.raf.banka2_bek.employee.repository.ActivationTokenRepository;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.employee.service.implementation.EmployeeServiceImpl;
+import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
 
 import java.time.LocalDate;
 import java.util.Collections;
@@ -34,6 +35,7 @@ class EmployeeServiceImplExtendedTest {
     @Mock private ActivationTokenRepository activationTokenRepository;
     @Mock private PasswordEncoder passwordEncoder;
     @Mock private NotificationPublisher notificationPublisher;
+    @Mock private TradingServiceInternalClient tradingServiceInternalClient;
     @InjectMocks private EmployeeServiceImpl service;
 
     private CreateEmployeeRequestDto buildReq() {

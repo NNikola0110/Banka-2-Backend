@@ -7,7 +7,6 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import rs.raf.banka2_bek.exchange.dto.ExchangeRateDto;
-import rs.raf.banka2_bek.order.exception.UnsupportedCurrencyException;
 
 import java.math.BigDecimal;
 import java.util.List;
