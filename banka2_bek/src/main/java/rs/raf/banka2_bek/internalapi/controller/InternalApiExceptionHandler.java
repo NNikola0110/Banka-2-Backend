@@ -1,5 +1,7 @@
 package rs.raf.banka2_bek.internalapi.controller;
 
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -13,7 +15,12 @@ import rs.raf.banka2.contracts.internal.InternalErrorDto;
  *   IllegalArgumentException  → 404 NOT_FOUND   (racun/rezervacija ne postoji, pogresna valuta, ...)
  *   IllegalStateException     → 409 CONFLICT     (nedovoljno sredstava, neaktivna rezervacija, ...)
  *   Exception (ostalo)        → 500 INTERNAL_ERROR
+ *
+ * {@code @Order(HIGHEST_PRECEDENCE)} — interni API mora da pobedi globalni
+ * {@code GlobalExceptionHandler} (koji IllegalArgumentException mapira u 400);
+ * @RestControllerAdvice samo po basePackages ne garantuje prioritet.
  */
+@Order(Ordered.HIGHEST_PRECEDENCE)
 @RestControllerAdvice(basePackages = "rs.raf.banka2_bek.internalapi")
 public class InternalApiExceptionHandler {
 
