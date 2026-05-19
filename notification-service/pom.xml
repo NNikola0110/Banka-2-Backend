@@ -31,6 +31,13 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
+        <!-- Micrometer Prometheus registry — formatira metrike u Prometheus exposition
+             formatu na /actuator/prometheus (observability parity sa banka-core za
+             bonus MLA scraping). Verzija je managed od spring-boot-starter-parent. -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
         <dependency>
             <groupId>rs.raf</groupId>
             <artifactId>banka2-contracts</artifactId>
