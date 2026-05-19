@@ -7,10 +7,16 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
+import rs.raf.banka2.contracts.internal.CreditFundsRequest;
+import rs.raf.banka2.contracts.internal.CreditFundsResponse;
 import rs.raf.banka2.contracts.internal.FxRateDto;
 import rs.raf.banka2.contracts.internal.InternalAccountDto;
+import rs.raf.banka2.contracts.internal.InternalOtpVerifyResponse;
+import rs.raf.banka2.contracts.internal.InternalUserDto;
 import rs.raf.banka2.contracts.internal.ReserveFundsRequest;
 import rs.raf.banka2.contracts.internal.ReserveFundsResponse;
+import rs.raf.banka2.contracts.internal.TaxCollectRequest;
+import rs.raf.banka2.contracts.internal.TaxCollectResponse;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -169,6 +175,238 @@ class BankaCoreClientTest {
         assertThat(result.get(0).rate()).isEqualTo(1.0);
         assertThat(result.get(1).currency()).isEqualTo("EUR");
         assertThat(result.get(1).rate()).isEqualTo(0.0085);
+
+        mockServer.verify();
+    }
+
+    // ── Identitet (faza 2c) ──────────────────────────────────────────────────
+
+    @Test
+    void getUserByEmail_happyPath_returnsDeserializedInternalUserDto() throws Exception {
+        InternalUserDto stub = new InternalUserDto(
+                7L, "CLIENT", "stefan.jovanovic@gmail.com", "Stefan", "Jovanovic", true);
+        String responseJson = objectMapper.writeValueAsString(stub);
+
+        // RestClient URL-enkoduje '@' u path varijabli u %40 (RFC 3986).
+        mockServer.expect(requestTo(BASE_URL + "/internal/users/by-email/stefan.jovanovic%40gmail.com"))
+                .andExpect(method(HttpMethod.GET))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        InternalUserDto result = bankaCoreClient.getUserByEmail("stefan.jovanovic@gmail.com");
+
+        assertThat(result.userId()).isEqualTo(7L);
+        assertThat(result.userRole()).isEqualTo("CLIENT");
+        assertThat(result.email()).isEqualTo("stefan.jovanovic@gmail.com");
+        assertThat(result.firstName()).isEqualTo("Stefan");
+        assertThat(result.lastName()).isEqualTo("Jovanovic");
+        assertThat(result.active()).isTrue();
+
+        mockServer.verify();
+    }
+
+    @Test
+    void getUserByEmail_notFound_throwsBankaCoreClientExceptionWith404() {
+        mockServer.expect(requestTo(BASE_URL + "/internal/users/by-email/missing%40example.com"))
+                .andExpect(method(HttpMethod.GET))
+                .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        assertThatThrownBy(() -> bankaCoreClient.getUserByEmail("missing@example.com"))
+                .isInstanceOf(BankaCoreClientException.class)
+                .satisfies(ex -> {
+                    BankaCoreClientException bcEx = (BankaCoreClientException) ex;
+                    assertThat(bcEx.getHttpStatus()).isEqualTo(404);
+                });
+
+        mockServer.verify();
+    }
+
+    @Test
+    void getUserById_happyPath_returnsDeserializedInternalUserDto() throws Exception {
+        InternalUserDto stub = new InternalUserDto(
+                3L, "EMPLOYEE", "tamara.pavlovic@banka.rs", "Tamara", "Pavlovic", true);
+        String responseJson = objectMapper.writeValueAsString(stub);
+
+        mockServer.expect(requestTo(BASE_URL + "/internal/users/EMPLOYEE/3"))
+                .andExpect(method(HttpMethod.GET))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        InternalUserDto result = bankaCoreClient.getUserById("EMPLOYEE", 3L);
+
+        assertThat(result.userId()).isEqualTo(3L);
+        assertThat(result.userRole()).isEqualTo("EMPLOYEE");
+        assertThat(result.firstName()).isEqualTo("Tamara");
+        assertThat(result.lastName()).isEqualTo("Pavlovic");
+
+        mockServer.verify();
+    }
+
+    @Test
+    void verifyOtp_codeCorrect_returnsVerifiedTrue() throws Exception {
+        InternalOtpVerifyResponse stub = new InternalOtpVerifyResponse(true, false);
+        String responseJson = objectMapper.writeValueAsString(stub);
+
+        mockServer.expect(requestTo(BASE_URL + "/internal/otp/verify"))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        InternalOtpVerifyResponse result = bankaCoreClient.verifyOtp("stefan@gmail.com", "123456");
+
+        assertThat(result.verified()).isTrue();
+        assertThat(result.blocked()).isFalse();
+
+        mockServer.verify();
+    }
+
+    @Test
+    void verifyOtp_codeWrong_returnsVerifiedFalse() throws Exception {
+        InternalOtpVerifyResponse stub = new InternalOtpVerifyResponse(false, false);
+        String responseJson = objectMapper.writeValueAsString(stub);
+
+        mockServer.expect(requestTo(BASE_URL + "/internal/otp/verify"))
+                .andExpect(method(HttpMethod.POST))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        InternalOtpVerifyResponse result = bankaCoreClient.verifyOtp("stefan@gmail.com", "000000");
+
+        assertThat(result.verified()).isFalse();
+        assertThat(result.blocked()).isFalse();
+
+        mockServer.verify();
+    }
+
+    @Test
+    void provisionFundAccount_happyPath_returnsDeserializedInternalAccountDto() throws Exception {
+        InternalAccountDto stub = new InternalAccountDto(
+                55L, "222000999000000001", "Banka 2 Stable Income",
+                BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, "RSD", "ACTIVE");
+        String responseJson = objectMapper.writeValueAsString(stub);
+
+        mockServer.expect(requestTo(BASE_URL + "/internal/accounts/fund"))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        InternalAccountDto result = bankaCoreClient.provisionFundAccount("Banka 2 Stable Income", 1L);
+
+        assertThat(result.id()).isEqualTo(55L);
+        assertThat(result.accountNumber()).isEqualTo("222000999000000001");
+        assertThat(result.ownerName()).isEqualTo("Banka 2 Stable Income");
+        assertThat(result.currencyCode()).isEqualTo("RSD");
+        assertThat(result.status()).isEqualTo("ACTIVE");
+
+        mockServer.verify();
+    }
+
+    @Test
+    void getBankTradingAccount_happyPath_returnsDeserializedInternalAccountDto() throws Exception {
+        InternalAccountDto stub = new InternalAccountDto(
+                90L, "222000111000000099", "Banka 2",
+                new BigDecimal("1000000.00"), new BigDecimal("1000000.00"),
+                BigDecimal.ZERO, "EUR", "ACTIVE");
+        String responseJson = objectMapper.writeValueAsString(stub);
+
+        mockServer.expect(requestTo(BASE_URL + "/internal/accounts/bank-trading/EUR"))
+                .andExpect(method(HttpMethod.GET))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        InternalAccountDto result = bankaCoreClient.getBankTradingAccount("EUR");
+
+        assertThat(result.id()).isEqualTo(90L);
+        assertThat(result.currencyCode()).isEqualTo("EUR");
+        assertThat(result.status()).isEqualTo("ACTIVE");
+
+        mockServer.verify();
+    }
+
+    @Test
+    void findEmployees_withQueryParams_sendsFiltersAndReturnsList() throws Exception {
+        List<InternalUserDto> stub = List.of(
+                new InternalUserDto(3L, "EMPLOYEE", "tamara.pavlovic@banka.rs",
+                        "Tamara", "Pavlovic", true));
+        String responseJson = objectMapper.writeValueAsString(stub);
+
+        // Blank email/position se izostavljaju; firstName/lastName postaju query params.
+        mockServer.expect(requestTo(BASE_URL + "/internal/employees?firstName=Tamara&lastName=Pavlovic"))
+                .andExpect(method(HttpMethod.GET))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        List<InternalUserDto> result =
+                bankaCoreClient.findEmployees("Tamara", "Pavlovic", null, "  ");
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).userId()).isEqualTo(3L);
+        assertThat(result.get(0).firstName()).isEqualTo("Tamara");
+
+        mockServer.verify();
+    }
+
+    @Test
+    void findEmployees_noFilters_sendsBarePathAndReturnsList() throws Exception {
+        List<InternalUserDto> stub = List.of(
+                new InternalUserDto(3L, "EMPLOYEE", "a@banka.rs", "A", "B", true),
+                new InternalUserDto(4L, "EMPLOYEE", "c@banka.rs", "C", "D", true));
+        String responseJson = objectMapper.writeValueAsString(stub);
+
+        mockServer.expect(requestTo(BASE_URL + "/internal/employees"))
+                .andExpect(method(HttpMethod.GET))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        List<InternalUserDto> result = bankaCoreClient.findEmployees(null, null, null, null);
+
+        assertThat(result).hasSize(2);
+
+        mockServer.verify();
+    }
+
+    @Test
+    void creditFunds_happyPath_sendsXIdempotencyKeyHeader_andReturnsResponse() throws Exception {
+        CreditFundsResponse stub = new CreditFundsResponse(
+                42L, new BigDecimal("750.00"), new BigDecimal("4250.00"));
+        String responseJson = objectMapper.writeValueAsString(stub);
+
+        mockServer.expect(requestTo(BASE_URL + "/internal/funds/credit"))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andExpect(header("X-Idempotency-Key", "credit-key-001"))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        CreditFundsRequest request = new CreditFundsRequest(
+                42L, new BigDecimal("750.00"), new BigDecimal("7.00"), "RSD", "SELL prihod");
+
+        CreditFundsResponse result = bankaCoreClient.creditFunds("credit-key-001", request);
+
+        assertThat(result.accountId()).isEqualTo(42L);
+        assertThat(result.creditedAmount()).isEqualByComparingTo(new BigDecimal("750.00"));
+        assertThat(result.balanceAfter()).isEqualByComparingTo(new BigDecimal("4250.00"));
+
+        mockServer.verify();
+    }
+
+    @Test
+    void collectTax_happyPath_sendsXIdempotencyKeyHeader_andReturnsResponse() throws Exception {
+        TaxCollectResponse stub = new TaxCollectResponse(
+                7L, new BigDecimal("120.00"), true);
+        String responseJson = objectMapper.writeValueAsString(stub);
+
+        mockServer.expect(requestTo(BASE_URL + "/internal/funds/tax-collect"))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andExpect(header("X-Idempotency-Key", "tax-key-001"))
+                .andRespond(withSuccess(responseJson, MediaType.APPLICATION_JSON));
+
+        TaxCollectRequest request = new TaxCollectRequest(
+                7L, new BigDecimal("120.00"), "Porez na kapitalnu dobit");
+
+        TaxCollectResponse result = bankaCoreClient.collectTax("tax-key-001", request);
+
+        assertThat(result.payerClientId()).isEqualTo(7L);
+        assertThat(result.collectedAmount()).isEqualByComparingTo(new BigDecimal("120.00"));
+        assertThat(result.collected()).isTrue();
 
         mockServer.verify();
     }

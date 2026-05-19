@@ -101,6 +101,11 @@
             <artifactId>influxdb-client-java</artifactId>
             <version>${influxdb-client.version}</version>
         </dependency>
+        <!-- Caffeine - kes za TradingUserResolver (email -> numericki UserContext) -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
     </dependencies>
 
     <build>
