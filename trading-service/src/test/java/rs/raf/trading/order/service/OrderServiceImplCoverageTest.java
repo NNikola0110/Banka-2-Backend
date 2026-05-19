@@ -452,4 +452,55 @@ class OrderServiceImplCoverageTest {
         assertThat(ai.getUsedLimit()).isNotNull();
         verify(actuaryInfoRepository).save(ai);
     }
+
+    // ─── cancelOrder parcijalni — agent usedLimit rollback (holisticki review I-1) ─
+
+    @Test
+    @DisplayName("cancelOrder parcijalni BUY — agent usedLimit se vraca po ORIGINALNOJ rezervaciji")
+    void partialCancelRollsBackUsedLimitFromOriginalReservation() {
+        // AGENT BUY order, APPROVED: qty 10, originalna rezervacija 1000.
+        // Parcijalni cancel 4 komada → usedLimit rollback mora biti
+        // 1000 * 4/10 = 400 (verno monolitu — iz originalne rezervacije),
+        // a NE 600 * 4/10 = 240 (iz prepisane umanjene re-rezervacije).
+        when(tradingUserResolver.resolveCurrent()).thenReturn(new UserContext(10L, "EMPLOYEE"));
+        when(tradingUserResolver.resolveName(10L, "EMPLOYEE")).thenReturn("Agent Petar");
+
+        Order approved = new Order();
+        approved.setId(55L);
+        approved.setStatus(OrderStatus.APPROVED);
+        approved.setDirection(OrderDirection.BUY);
+        approved.setUserRole("EMPLOYEE");
+        approved.setUserId(10L);
+        approved.setListing(listing(ListingType.STOCK, "NASDAQ"));
+        approved.setQuantity(10);
+        approved.setRemainingPortions(10);
+        approved.setContractSize(1);
+        approved.setReservedAccountId(900L);
+        approved.setReservedAmount(new BigDecimal("1000.0000"));
+        approved.setBankaCoreReservationId("res-orig-55");
+        approved.setReservationReleased(false);
+
+        ActuaryInfo ai = new ActuaryInfo();
+        ai.setActuaryType(ActuaryType.AGENT);
+        ai.setUsedLimit(new BigDecimal("1000.0000")); // koliko je order zauzeo
+
+        when(orderRepository.findByIdForUpdate(55L)).thenReturn(Optional.of(approved));
+        when(bankaCoreClient.getAccount(900L)).thenReturn(bankUsd);
+        when(bankaCoreClient.reserveFunds(anyString(), any()))
+                .thenReturn(new rs.raf.banka2.contracts.internal.ReserveFundsResponse(
+                        "res-rereserve-55", 900L, new BigDecimal("600.0000"),
+                        new BigDecimal("9999400")));
+        when(orderStatusService.getAgentInfo(10L)).thenReturn(Optional.of(ai));
+        when(orderRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        orderService.cancelOrder(55L, 4);
+
+        // Rollback = originalReservedAmount(1000) * cancelQty(4) / originalQty(10) = 400.
+        // usedLimit 1000 - 400 = 600.
+        assertThat(ai.getUsedLimit()).isEqualByComparingTo("600.0000");
+        // order.reservedAmount je i dalje prepisan na umanjenu re-rezervaciju (600) —
+        // to je namerno (per-fill commit nad novom, manjom rezervacijom).
+        assertThat(approved.getReservedAmount()).isEqualByComparingTo("600.0000");
+        verify(actuaryInfoRepository).save(ai);
+    }
 }

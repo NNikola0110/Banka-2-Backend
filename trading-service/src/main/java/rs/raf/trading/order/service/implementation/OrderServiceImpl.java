@@ -571,6 +571,11 @@ public class OrderServiceImpl implements OrderService {
         // Neto efekat = oslobadjanje tacno cancelQty/originalQty dela, isto kao
         // monolitno umanjenje — klijentu se raspoloziva sredstva odmah povecaju.
         // Per-fill commit model i dalje nesmetano radi nad novom rezervacijom.
+        // Originalna rezervacija PRE re-rezervacije — agent usedLimit rollback
+        // (nize) mora citati ovu vrednost, ne prepisani (umanjeni) order.reservedAmount.
+        // Verno monolitu, koji u cancelOrder uopste ne prepisuje order.reservedAmount
+        // pa njegov rollback uvek koristi originalnu rezervaciju.
+        BigDecimal originalReservedAmount = order.getReservedAmount();
         if (order.getDirection() == OrderDirection.BUY
                 && order.getReservedAccountId() != null
                 && order.getReservedAmount() != null
@@ -625,10 +630,15 @@ public class OrderServiceImpl implements OrderService {
             portfolioRepository.save(portfolio);
         }
 
-        // Rollback proporcionalnog usedLimit-a za AGENT-a
+        // Rollback proporcionalnog usedLimit-a za AGENT-a.
+        // VAZNO: rollback se racuna iz originalReservedAmount (rezervacija PRE
+        // parcijalnog cancel-a), ne iz order.getReservedAmount() koji je gore vec
+        // prepisan na umanjenu re-rezervaciju — inace bi usedLimit bio premalo
+        // vracen agentu (npr. order qty 10, original 1000, cancel 4 → treba
+        // 1000*4/10 = 400, a sa prepisanom vrednoscu bi bilo samo 600*4/10 = 240).
         if (order.getDirection() == OrderDirection.BUY
                 && UserRole.isEmployee(order.getUserRole())
-                && order.getReservedAmount() != null
+                && originalReservedAmount != null
                 && originalQty != null && originalQty > 0) {
             Optional<ActuaryInfo> actuaryOpt = orderStatusService.getAgentInfo(order.getUserId());
             int cancelQtyFinal = cancelQty;
@@ -636,7 +646,7 @@ public class OrderServiceImpl implements OrderService {
                 if (actuary.getActuaryType() == ActuaryType.AGENT) {
                     BigDecimal fraction = new BigDecimal(cancelQtyFinal)
                             .divide(new BigDecimal(originalQty), 10, RoundingMode.HALF_UP);
-                    BigDecimal rollback = order.getReservedAmount().multiply(fraction)
+                    BigDecimal rollback = originalReservedAmount.multiply(fraction)
                             .setScale(4, RoundingMode.HALF_UP);
                     BigDecimal current = actuary.getUsedLimit() != null
                             ? actuary.getUsedLimit() : BigDecimal.ZERO;

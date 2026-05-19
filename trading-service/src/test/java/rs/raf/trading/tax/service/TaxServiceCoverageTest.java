@@ -73,9 +73,13 @@ class TaxServiceCoverageTest {
     @InjectMocks
     private TaxService taxService;
 
-    /** Idempotency key prefiks koji {@code collectTaxFromUser} koristi za dati userId. */
-    private static String taxKey(long userId) {
-        return "tax-" + userId + "-" + YearMonth.now();
+    /**
+     * Idempotency key koji {@code collectTaxFromUser} koristi: ukljucuje userId,
+     * tekuci mesec I iznos naplate ({@code unpaidTax.toPlainString()}) — vidi
+     * holisticki review fix I-2 (kljuc bez iznosa se sudara pri intra-mesecnom re-run-u).
+     */
+    private static String taxKey(long userId, String unpaidAmount) {
+        return "tax-" + userId + "-" + YearMonth.now() + "-" + unpaidAmount;
     }
 
     @BeforeEach
@@ -127,7 +131,7 @@ class TaxServiceCoverageTest {
         when(bankaCoreClient.getUserById("CLIENT", 1L)).thenReturn(user(1L, "CLIENT", "Marko", "P"));
         when(taxRecordRepository.findByUserIdAndUserType(1L, "CLIENT")).thenReturn(Optional.empty());
         // banka-core uspesno naplatio
-        when(bankaCoreClient.collectTax(eq(taxKey(1L)), any()))
+        when(bankaCoreClient.collectTax(eq(taxKey(1L, "150.0000")), any()))
                 .thenReturn(new TaxCollectResponse(1L, new BigDecimal("150.0000"), true));
 
         taxService.calculateTaxForAllUsers();
@@ -139,7 +143,7 @@ class TaxServiceCoverageTest {
         assertThat(recCap.getValue().getTaxPaid()).isEqualByComparingTo("150.0000");
 
         // banka-core collectTax pozvan sa ispravnim zahtevom (payerClientId, neplaceni iznos)
-        verify(bankaCoreClient).collectTax(eq(taxKey(1L)), argThat((TaxCollectRequest req) ->
+        verify(bankaCoreClient).collectTax(eq(taxKey(1L, "150.0000")), argThat((TaxCollectRequest req) ->
                 req.payerClientId().equals(1L)
                         && req.amount().compareTo(new BigDecimal("150.0000")) == 0));
     }
@@ -154,7 +158,7 @@ class TaxServiceCoverageTest {
         when(bankaCoreClient.getUserById("CLIENT", 1L)).thenReturn(user(1L, "CLIENT", "M", "P"));
         when(taxRecordRepository.findByUserIdAndUserType(1L, "CLIENT")).thenReturn(Optional.empty());
         // banka-core: klijent nema RSD racun → collected=false (collectedAmount=0)
-        when(bankaCoreClient.collectTax(eq(taxKey(1L)), any()))
+        when(bankaCoreClient.collectTax(eq(taxKey(1L, "150.0000")), any()))
                 .thenReturn(new TaxCollectResponse(1L, BigDecimal.ZERO, false));
 
         taxService.calculateTaxForAllUsers();
@@ -164,7 +168,7 @@ class TaxServiceCoverageTest {
         assertThat(rc.getValue().getTaxOwed()).isEqualByComparingTo("150.0000");
         // collected=false → TaxRecord ostaje neplacen
         assertThat(rc.getValue().getTaxPaid()).isEqualByComparingTo(BigDecimal.ZERO);
-        verify(bankaCoreClient).collectTax(eq(taxKey(1L)), any());
+        verify(bankaCoreClient).collectTax(eq(taxKey(1L, "150.0000")), any());
     }
 
     @Test
@@ -177,7 +181,8 @@ class TaxServiceCoverageTest {
         when(bankaCoreClient.getUserById("CLIENT", 1L)).thenReturn(user(1L, "CLIENT", "M", "P"));
         when(taxRecordRepository.findByUserIdAndUserType(1L, "CLIENT")).thenReturn(Optional.empty());
         // banka-core: RSD racun ali nedovoljno sredstava → collected=false
-        when(bankaCoreClient.collectTax(eq(taxKey(1L)), any()))
+        // profit = 10000 → taxOwed = 1500.0000
+        when(bankaCoreClient.collectTax(eq(taxKey(1L, "1500.0000")), any()))
                 .thenReturn(new TaxCollectResponse(1L, BigDecimal.ZERO, false));
 
         taxService.calculateTaxForAllUsers();
@@ -197,7 +202,7 @@ class TaxServiceCoverageTest {
         when(bankaCoreClient.getUserById("CLIENT", 1L)).thenReturn(user(1L, "CLIENT", "M", "P"));
         when(taxRecordRepository.findByUserIdAndUserType(1L, "CLIENT")).thenReturn(Optional.empty());
         // banka-core HTTP greska → collectTaxFromUser hvata, vraca false
-        when(bankaCoreClient.collectTax(eq(taxKey(1L)), any()))
+        when(bankaCoreClient.collectTax(eq(taxKey(1L, "150.0000")), any()))
                 .thenThrow(new BankaCoreClientException(500, "banka-core down"));
 
         taxService.calculateTaxForAllUsers();
@@ -247,8 +252,8 @@ class TaxServiceCoverageTest {
         when(orderRepository.findByIsDoneTrue()).thenReturn(List.of(buy, sell));
         when(bankaCoreClient.getUserById("CLIENT", 1L)).thenReturn(user(1L, "CLIENT", "M", "P"));
         when(taxRecordRepository.findByUserIdAndUserType(1L, "CLIENT")).thenReturn(Optional.of(existing));
-        // novi tax = 150, placeno 75 => unpaid = 75 → collectTax sa 75
-        when(bankaCoreClient.collectTax(eq(taxKey(1L)), any()))
+        // novi tax = 150, placeno 75 => unpaid = 75.0000 → collectTax sa 75
+        when(bankaCoreClient.collectTax(eq(taxKey(1L, "75.0000")), any()))
                 .thenReturn(new TaxCollectResponse(1L, new BigDecimal("75.0000"), true));
 
         taxService.calculateTaxForAllUsers();
@@ -256,8 +261,67 @@ class TaxServiceCoverageTest {
         // taxPaid postavljen na pun taxOwed posle uspesne naplate
         assertThat(existing.getTaxPaid()).isEqualByComparingTo("150.0000");
         // collectTax pozvan sa SAMO inkrementalnim iznosom (75), ne punim 150
-        verify(bankaCoreClient).collectTax(eq(taxKey(1L)), argThat((TaxCollectRequest req) ->
+        verify(bankaCoreClient).collectTax(eq(taxKey(1L, "75.0000")), argThat((TaxCollectRequest req) ->
                 req.amount().compareTo(new BigDecimal("75")) == 0));
+    }
+
+    // ─── intra-mesecni re-run: idempotency key sa iznosom (holisticki review I-2) ──
+
+    @Test
+    @DisplayName("dva re-run-a u istom mesecu sa rastucim porezom → razliciti idempotency kljucevi, drugi nosi inkrement")
+    void intraMonthRerun_distinctIdempotencyKeys_secondCarriesIncrement() {
+        // Run 1: profit 1000 → taxOwed 150.0000, prior 0 → unpaidTax 150.0000.
+        // Run 2 (isti mesec, nove trgovine): profit 3000 → taxOwed 450.0000,
+        // prior placeno 150 → unpaidTax 300.0000.
+        // Bez fix-a I-2: oba run-a koriste isti kljuc tax-1-{ym} → banka-core
+        // replay-uje prvu naplatu i drugi (veci) porez se laznja obelezi placen.
+        // Sa fix-om: razlicit unpaidTax → razlicit kljuc → drugi run stvarno naplati 300.
+        Listing l = listing(1L, "RSD");
+
+        Order buy1 = order(1L, "CLIENT", l, OrderDirection.BUY, "100", 1);
+        Order sell1 = order(1L, "CLIENT", l, OrderDirection.SELL, "1100", 1); // profit 1000
+        Order sell2 = order(1L, "CLIENT", l, OrderDirection.SELL, "2000", 1); // jos 2000 → ukupno 3000
+
+        when(bankaCoreClient.getUserById("CLIENT", 1L)).thenReturn(user(1L, "CLIENT", "M", "P"));
+
+        // Run 1 vidi samo buy1+sell1; Run 2 vidi sve (buy1+sell1+sell2).
+        when(orderRepository.findByIsDoneTrue())
+                .thenReturn(List.of(buy1, sell1))
+                .thenReturn(List.of(buy1, sell1, sell2));
+
+        // Run 1: nema postojeceg record-a. Run 2: record sa taxPaid=150 (placeno u run 1).
+        TaxRecord afterRun1 = TaxRecord.builder()
+                .id(1L).userId(1L).userType("CLIENT")
+                .totalProfit(new BigDecimal("1000"))
+                .taxOwed(new BigDecimal("150.0000"))
+                .taxPaid(new BigDecimal("150.0000"))
+                .currency("RSD")
+                .build();
+        when(taxRecordRepository.findByUserIdAndUserType(1L, "CLIENT"))
+                .thenReturn(Optional.empty())
+                .thenReturn(Optional.of(afterRun1));
+
+        when(bankaCoreClient.collectTax(eq(taxKey(1L, "150.0000")), any()))
+                .thenReturn(new TaxCollectResponse(1L, new BigDecimal("150.0000"), true));
+        when(bankaCoreClient.collectTax(eq(taxKey(1L, "300.0000")), any()))
+                .thenReturn(new TaxCollectResponse(1L, new BigDecimal("300.0000"), true));
+
+        taxService.calculateTaxForAllUsers(); // run 1
+        taxService.calculateTaxForAllUsers(); // run 2 (intra-mesecni re-run)
+
+        // collectTax pozvan tacno dvaput, sa RAZLICITIM kljucevima.
+        ArgumentCaptor<String> keyCap = ArgumentCaptor.forClass(String.class);
+        verify(bankaCoreClient, times(2)).collectTax(keyCap.capture(), any());
+        assertThat(keyCap.getAllValues())
+                .containsExactly(taxKey(1L, "150.0000"), taxKey(1L, "300.0000"));
+        assertThat(keyCap.getAllValues().get(0))
+                .isNotEqualTo(keyCap.getAllValues().get(1));
+
+        // Drugi zahtev nosi tacno inkrementalni neplaceni porez (300, ne 450 ni 150).
+        ArgumentCaptor<TaxCollectRequest> reqCap = ArgumentCaptor.forClass(TaxCollectRequest.class);
+        verify(bankaCoreClient, times(2)).collectTax(any(), reqCap.capture());
+        assertThat(reqCap.getAllValues().get(0).amount()).isEqualByComparingTo("150.0000");
+        assertThat(reqCap.getAllValues().get(1).amount()).isEqualByComparingTo("300.0000");
     }
 
     @Test
@@ -275,7 +339,7 @@ class TaxServiceCoverageTest {
         when(orderRepository.findByIsDoneTrue()).thenReturn(List.of(sell));
         when(bankaCoreClient.getUserById("CLIENT", 1L)).thenReturn(user(1L, "CLIENT", "M", "P"));
         when(taxRecordRepository.findByUserIdAndUserType(1L, "CLIENT")).thenReturn(Optional.of(existing));
-        when(bankaCoreClient.collectTax(eq(taxKey(1L)), any()))
+        when(bankaCoreClient.collectTax(eq(taxKey(1L, "150.0000")), any()))
                 .thenReturn(new TaxCollectResponse(1L, new BigDecimal("150.0000"), true));
 
         taxService.calculateTaxForAllUsers();

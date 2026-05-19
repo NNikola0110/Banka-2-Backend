@@ -375,14 +375,21 @@ public class TaxService {
      * belezi, novac se interno prebacuje (no-op u banka-core seam-u, verno
      * monolitu koji je za zaposlene odmah vracao {@code true}).
      *
-     * <p>Idempotency key {@code "tax-" + userId + "-" + yearMonth} je
-     * determinisicki po korisnik-mesec — ponovljeno izvrsenje (npr. retry
-     * mesecnog obracuna u istom mesecu) banka-core replay-uje, nikad ne
-     * naplacuje dvaput.
+     * <p>Idempotency key {@code "tax-" + userId + "-" + yearMonth + "-" + amount}
+     * ukljucuje i iznos naplate, ne samo korisnik-mesec. Razlog: kljuc samo po
+     * korisnik-mesecu se sudara pri intra-mesecnom ponovnom obracunu — drugi
+     * pokretanje (sa novim trgovinama, pa vecim neplacenim porezom) bi reuse-ovao
+     * isti kljuc, banka-core bi replay-ovao prvu kesiranu naplatu ({@code collected=true})
+     * i {@code TaxService} bi sad-veci porez obelezio kao placen iako nije naplacen.
+     * Sa iznosom u kljucu: pravi SAGA retry iste naplate vidi isti {@code unpaidTax}
+     * (taxPaid jos nije perzistiran) → isti kljuc → banka-core bezbedno replay-uje
+     * (nema dvostruke naplate); razlicit intra-mesecni re-run ima razlicit
+     * {@code unpaidTax} → razlicit kljuc → korektno naplacuje inkrement.
      */
     private boolean collectTaxFromUser(Long userId, String userType, BigDecimal amount, LocalDateTime calculatedAt) {
         if (UserRole.isClient(userType)) {
-            String idempotencyKey = "tax-" + userId + "-" + YearMonth.from(calculatedAt);
+            String idempotencyKey = "tax-" + userId + "-" + YearMonth.from(calculatedAt)
+                    + "-" + amount.toPlainString();
             try {
                 TaxCollectResponse response = bankaCoreClient.collectTax(idempotencyKey,
                         new TaxCollectRequest(userId, amount, "Porez na kapitalnu dobit"));
