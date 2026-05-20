@@ -142,7 +142,6 @@ public class GlobalSecurityConfig  {
                         // browser-a), NE X-Api-Key. MORA biti DEKLARISAN PRE generic
                         // /interbank/** matcher-a (Spring uzima prvi match).
                         .requestMatchers("/interbank/otc/**").authenticated()
-                        .requestMatchers("/interbank/payments/**").authenticated()
                         // Inter-bank /interbank endpoint je JEDINSTVEN ulaz za druge banke;
                         // InterbankAuthFilter validira X-Api-Key i postavlja ROLE_INTERBANK
                         // authority pre nego sto request stigne ovde (vidi protokol §2.10).

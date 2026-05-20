@@ -87,6 +87,17 @@ public final class InterbankExceptions {
     }
 
     /**
+     * §3.3-§3.6 — PUT/GET/DELETE /negotiations/{rn}/{id} za nepostojeci pregovor.
+     * Spec trazi HTTP 404 Not Found. Razlikujemo od 409 Conflict (turn violation /
+     * zatvoreni pregovor) i 400 Bad Request (malformed input).
+     */
+    public static class InterbankNegotiationNotFoundException extends InterbankException {
+        public InterbankNegotiationNotFoundException(String message) {
+            super(message);
+        }
+    }
+
+    /**
      * §2.7.2 — exercise opcije pozvan na ugovor koji nije ACTIVE, ili posle
      * settlementDate-a, ili od strane koja nije kupac, ili na ugovoru koji ne
      * pripada pozivacu. HTTP 409 Conflict (ne 400, jer su payload-i ispravni —

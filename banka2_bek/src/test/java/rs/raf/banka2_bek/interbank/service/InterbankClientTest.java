@@ -292,6 +292,39 @@ class InterbankClientTest {
         mockServer.verify();
     }
 
+    @Test
+    @DisplayName("putCounterOffer 409 throws InterbankNegotiationConflictException (Fix 3: distinct status mapping)")
+    void putCounterOffer_409_throwsNegotiationConflictException() {
+        // Verifies that Fix 3 (I-4) maps 409 Conflict distinctly to
+        // InterbankNegotiationConflictException, not the generic
+        // InterbankCommunicationException that was returned before the fix.
+        ForeignBankId negId = new ForeignBankId(REMOTE_RN, "neg-uuid-conflict");
+
+        mockServer.expect(requestTo(BASE_URL + "/negotiations/" + REMOTE_RN + "/neg-uuid-conflict"))
+                .andExpect(method(HttpMethod.PUT))
+                .andExpect(header("X-Api-Key", OUT_TOKEN))
+                .andRespond(withStatus(HttpStatus.CONFLICT));
+
+        assertThatThrownBy(() -> client.putCounterOffer(negId, buildOffer()))
+                .isInstanceOf(InterbankExceptions.InterbankNegotiationConflictException.class);
+        mockServer.verify();
+    }
+
+    @Test
+    @DisplayName("putCounterOffer 404 throws InterbankNegotiationNotFoundException (Fix 3: distinct status mapping)")
+    void putCounterOffer_404_throwsNegotiationNotFoundException() {
+        ForeignBankId negId = new ForeignBankId(REMOTE_RN, "neg-uuid-gone");
+
+        mockServer.expect(requestTo(BASE_URL + "/negotiations/" + REMOTE_RN + "/neg-uuid-gone"))
+                .andExpect(method(HttpMethod.PUT))
+                .andExpect(header("X-Api-Key", OUT_TOKEN))
+                .andRespond(withStatus(HttpStatus.NOT_FOUND));
+
+        assertThatThrownBy(() -> client.putCounterOffer(negId, buildOffer()))
+                .isInstanceOf(InterbankExceptions.InterbankNegotiationNotFoundException.class);
+        mockServer.verify();
+    }
+
     // -------------------------------------------------------------------------
     // §3.4 getNegotiation
     // -------------------------------------------------------------------------

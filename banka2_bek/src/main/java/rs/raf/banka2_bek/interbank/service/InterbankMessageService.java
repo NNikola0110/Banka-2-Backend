@@ -101,6 +101,17 @@ public class InterbankMessageService {
         );
     }
 
+    /**
+     * Returns true for 4xx status codes that are transient / retry-able.
+     * 408 Request Timeout, 425 Too Early, 429 Too Many Requests — these are
+     * temporary conditions where a retry may succeed.
+     * All other 4xx codes indicate a permanent protocol or content error —
+     * retrying will not help and the message should be marked FAILED_PERMANENT.
+     */
+    private static boolean isTransient4xx(int status) {
+        return status == 408 || status == 425 || status == 429;
+    }
+
     @Transactional
     public void markOutboundSent(IdempotenceKey key, Integer httpStatus, String responseBody) {
         InterbankMessage ibMessage =
@@ -117,13 +128,23 @@ public class InterbankMessageService {
             ibMessage.setHttpStatus(httpStatus);
             ibMessage.setResponseBody(responseBody);
             ibMessage.setLastAttemptAt(LocalDateTime.now());
-        }
-        else if (httpStatus.equals(HttpStatus.ACCEPTED.value())){
+            repository.save(ibMessage);
+        } else if (httpStatus.equals(HttpStatus.ACCEPTED.value())) {
             ibMessage.setRetryCount(ibMessage.getRetryCount() + 1);
             ibMessage.setLastAttemptAt(LocalDateTime.now());
-        }
-        else {
-            markOutboundFailed(key, "Outbound message sending failed.");
+            repository.save(ibMessage);
+        } else if (httpStatus >= 400 && httpStatus < 500 && !isTransient4xx(httpStatus)) {
+            // Permanent 4xx: the partner rejected our message due to a protocol/content error.
+            // Retrying will not help — mark terminal so the retry scheduler skips it.
+            ibMessage.setStatus(InterbankMessageStatus.FAILED_PERMANENT);
+            ibMessage.setHttpStatus(httpStatus);
+            ibMessage.setLastAttemptAt(LocalDateTime.now());
+            ibMessage.setLastError("Partner returned permanent " + httpStatus + " — will not retry.");
+            log.warn("Interbank outbound message FAILED_PERMANENT for key={}, HTTP {}", key, httpStatus);
+            repository.save(ibMessage);
+        } else {
+            // 5xx or transient 4xx — keep existing retry behaviour
+            markOutboundFailed(key, "Outbound message sending failed with HTTP " + httpStatus + ".");
         }
 
     }

@@ -42,6 +42,13 @@ public class OtcNegotiationExceptionHandler {
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", ex.getMessage()));
     }
 
+    /** §3.3-§3.6 — nepostojeci pregovor -> 404 Not Found. */
+    @ExceptionHandler(InterbankExceptions.InterbankNegotiationNotFoundException.class)
+    public ResponseEntity<Map<String, String>> handleNegotiationNotFound(
+            InterbankExceptions.InterbankNegotiationNotFoundException ex) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", ex.getMessage()));
+    }
+
     @ExceptionHandler(InterbankExceptions.InterbankIdempotencyException.class)
     public ResponseEntity<Map<String, String>> handleIdempotency(InterbankExceptions.InterbankIdempotencyException ex) {
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", ex.getMessage()));

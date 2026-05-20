@@ -4,6 +4,7 @@ import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.stereotype.Component;
+import rs.raf.banka2_bek.interbank.util.SecurityUtils;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -60,7 +61,8 @@ public class InterbankProperties {
             return Optional.empty();
         }
         return partners.stream()
-                .filter(p -> p.getInboundToken() != null && p.getInboundToken().equals(apiKey))
+                .filter(p -> p.getInboundToken() != null
+                        && SecurityUtils.constantTimeEquals(p.getInboundToken(), apiKey))
                 .findFirst();
     }
 

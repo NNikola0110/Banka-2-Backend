@@ -30,6 +30,12 @@ public class InterbankClient {
     private final ObjectMapper objectMapper;
     private final RestClient restClient;
 
+    /** Strips any trailing slash from a base URL so concatenated paths are correct. */
+    private static String normalizeBaseUrl(String baseUrl) {
+        if (baseUrl == null) return "";
+        return baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+    }
+
     public <Req, Resp> Resp sendMessage(int targetRoutingNumber,
                                          MessageType type,
                                          Message<Req> envelope,
@@ -44,7 +50,7 @@ public class InterbankClient {
             String serializedEnvelope = objectMapper.writeValueAsString(envelope);
             ResponseEntity<String> response = restClient
                     .post()
-                    .uri(partnerBank.getBaseUrl() + "/interbank")
+                    .uri(normalizeBaseUrl(partnerBank.getBaseUrl()) + "/interbank")
                     .header("X-Api-Key", partnerBank.getOutboundToken())
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(serializedEnvelope)
@@ -91,7 +97,7 @@ public class InterbankClient {
         try {
             return restClient
                     .get()
-                    .uri(partnerBank.getBaseUrl() + "/public-stock")
+                    .uri(normalizeBaseUrl(partnerBank.getBaseUrl()) + "/public-stock")
                     .header("X-Api-Key", partnerBank.getOutboundToken())
                     .retrieve()
                     .onStatus(status -> status.is4xxClientError() || status.is5xxServerError(),
@@ -121,7 +127,7 @@ public class InterbankClient {
         try {
             return restClient
                     .post()
-                    .uri(partnerBank.getBaseUrl() + "/negotiations")
+                    .uri(normalizeBaseUrl(partnerBank.getBaseUrl()) + "/negotiations")
                     .header("X-Api-Key", partnerBank.getOutboundToken())
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(offer)
@@ -153,7 +159,7 @@ public class InterbankClient {
         try {
             restClient
                     .put()
-                    .uri(partnerBank.getBaseUrl() + "/negotiations/{rn}/{id}",
+                    .uri(normalizeBaseUrl(partnerBank.getBaseUrl()) + "/negotiations/{rn}/{id}",
                             negotiationId.routingNumber(), negotiationId.id())
                     .header("X-Api-Key", partnerBank.getOutboundToken())
                     .contentType(MediaType.APPLICATION_JSON)
@@ -161,12 +167,17 @@ public class InterbankClient {
                     .retrieve()
                     .onStatus(status -> status.is4xxClientError() || status.is5xxServerError(),
                             (req, res) -> {
-                                if (res.getStatusCode().value() == 401)
-                                    throw new InterbankExceptions.InterbankAuthException(
-                                            "Invalid API key for routing " + negotiationId.routingNumber() + ".");
+                                int sc = res.getStatusCode().value();
+                                if (sc == 401) throw new InterbankExceptions.InterbankAuthException(
+                                        "Invalid API key for routing " + negotiationId.routingNumber() + ".");
+                                if (sc == 404) throw new InterbankExceptions.InterbankNegotiationNotFoundException(
+                                        "Negotiation " + negotiationId + " not found at partner bank.");
+                                if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
+                                        "Negotiation " + negotiationId + " conflict: not your turn or already closed.");
+                                if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
+                                        "Bad request on PUT negotiation " + negotiationId + ".");
                                 throw new InterbankExceptions.InterbankCommunicationException(
-                                        "HTTP " + res.getStatusCode().value()
-                                                + " from negotiation " + negotiationId + " on PUT");
+                                        "HTTP " + sc + " from negotiation " + negotiationId + " on PUT");
                             })
                     .toBodilessEntity();
         } catch (InterbankExceptions.InterbankException e) {
@@ -186,18 +197,23 @@ public class InterbankClient {
         try {
             return restClient
                     .get()
-                    .uri(partnerBank.getBaseUrl() + "/negotiations/{rn}/{id}",
+                    .uri(normalizeBaseUrl(partnerBank.getBaseUrl()) + "/negotiations/{rn}/{id}",
                             negotiationId.routingNumber(), negotiationId.id())
                     .header("X-Api-Key", partnerBank.getOutboundToken())
                     .retrieve()
                     .onStatus(status -> status.is4xxClientError() || status.is5xxServerError(),
                             (req, res) -> {
-                                if (res.getStatusCode().value() == 401)
-                                    throw new InterbankExceptions.InterbankAuthException(
-                                            "Invalid API key for routing " + negotiationId.routingNumber() + ".");
+                                int sc = res.getStatusCode().value();
+                                if (sc == 401) throw new InterbankExceptions.InterbankAuthException(
+                                        "Invalid API key for routing " + negotiationId.routingNumber() + ".");
+                                if (sc == 404) throw new InterbankExceptions.InterbankNegotiationNotFoundException(
+                                        "Negotiation " + negotiationId + " not found at partner bank.");
+                                if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
+                                        "Negotiation " + negotiationId + " conflict on GET.");
+                                if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
+                                        "Bad request on GET negotiation " + negotiationId + ".");
                                 throw new InterbankExceptions.InterbankCommunicationException(
-                                        "HTTP " + res.getStatusCode().value()
-                                                + " from negotiation " + negotiationId + " on GET");
+                                        "HTTP " + sc + " from negotiation " + negotiationId + " on GET");
                             })
                     .body(OtcNegotiation.class);
         } catch (InterbankExceptions.InterbankException e) {
@@ -217,18 +233,23 @@ public class InterbankClient {
         try {
             restClient
                     .delete()
-                    .uri(partnerBank.getBaseUrl() + "/negotiations/{rn}/{id}",
+                    .uri(normalizeBaseUrl(partnerBank.getBaseUrl()) + "/negotiations/{rn}/{id}",
                             negotiationId.routingNumber(), negotiationId.id())
                     .header("X-Api-Key", partnerBank.getOutboundToken())
                     .retrieve()
                     .onStatus(status -> status.is4xxClientError() || status.is5xxServerError(),
                             (req, res) -> {
-                                if (res.getStatusCode().value() == 401)
-                                    throw new InterbankExceptions.InterbankAuthException(
-                                            "Invalid API key for routing " + negotiationId.routingNumber() + ".");
+                                int sc = res.getStatusCode().value();
+                                if (sc == 401) throw new InterbankExceptions.InterbankAuthException(
+                                        "Invalid API key for routing " + negotiationId.routingNumber() + ".");
+                                if (sc == 404) throw new InterbankExceptions.InterbankNegotiationNotFoundException(
+                                        "Negotiation " + negotiationId + " not found at partner bank.");
+                                if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
+                                        "Negotiation " + negotiationId + " conflict on DELETE.");
+                                if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
+                                        "Bad request on DELETE negotiation " + negotiationId + ".");
                                 throw new InterbankExceptions.InterbankCommunicationException(
-                                        "HTTP " + res.getStatusCode().value()
-                                                + " from negotiation " + negotiationId + " on DELETE");
+                                        "HTTP " + sc + " from negotiation " + negotiationId + " on DELETE");
                             })
                     .toBodilessEntity();
         } catch (InterbankExceptions.InterbankException e) {
@@ -249,18 +270,23 @@ public class InterbankClient {
         try {
             restClient
                     .get()
-                    .uri(partnerBank.getBaseUrl() + "/negotiations/{rn}/{id}/accept",
+                    .uri(normalizeBaseUrl(partnerBank.getBaseUrl()) + "/negotiations/{rn}/{id}/accept",
                             negotiationId.routingNumber(), negotiationId.id())
                     .header("X-Api-Key", partnerBank.getOutboundToken())
                     .retrieve()
                     .onStatus(status -> status.is4xxClientError() || status.is5xxServerError(),
                             (req, res) -> {
-                                if (res.getStatusCode().value() == 401)
-                                    throw new InterbankExceptions.InterbankAuthException(
-                                            "Invalid API key for routing " + negotiationId.routingNumber() + ".");
+                                int sc = res.getStatusCode().value();
+                                if (sc == 401) throw new InterbankExceptions.InterbankAuthException(
+                                        "Invalid API key for routing " + negotiationId.routingNumber() + ".");
+                                if (sc == 404) throw new InterbankExceptions.InterbankNegotiationNotFoundException(
+                                        "Negotiation " + negotiationId + " not found at partner bank.");
+                                if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
+                                        "Negotiation " + negotiationId + " conflict on accept.");
+                                if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
+                                        "Bad request on accept negotiation " + negotiationId + ".");
                                 throw new InterbankExceptions.InterbankCommunicationException(
-                                        "HTTP " + res.getStatusCode().value()
-                                                + " from negotiation " + negotiationId + " on accept");
+                                        "HTTP " + sc + " from negotiation " + negotiationId + " on accept");
                             })
                     .toBodilessEntity();
         } catch (InterbankExceptions.InterbankException e) {
@@ -286,7 +312,7 @@ public class InterbankClient {
         try {
             return restClient
                     .get()
-                    .uri(partnerBank.getBaseUrl() + pathTemplate,
+                    .uri(normalizeBaseUrl(partnerBank.getBaseUrl()) + pathTemplate,
                             userId.routingNumber(), userId.id())
                     .header("X-Api-Key", partnerBank.getOutboundToken())
                     .retrieve()

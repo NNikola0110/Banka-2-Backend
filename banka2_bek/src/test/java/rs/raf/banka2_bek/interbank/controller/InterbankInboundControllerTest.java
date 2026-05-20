@@ -14,6 +14,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import rs.raf.banka2_bek.interbank.config.InterbankProperties;
 import rs.raf.banka2_bek.interbank.exception.InterbankExceptionHandler;
+import rs.raf.banka2_bek.interbank.exception.InterbankExceptions;
 import rs.raf.banka2_bek.interbank.protocol.*;
 import rs.raf.banka2_bek.interbank.service.InterbankMessageService;
 import rs.raf.banka2_bek.interbank.service.TransactionExecutorService;
@@ -233,6 +234,65 @@ class InterbankInboundControllerTest {
         verify(executorService).handleRollbackTx(any(RollbackTransaction.class), any(IdempotenceKey.class));
     }
 
+
+    // -------------------------------------------------------------------------
+    // Fix 1 (I-1): constant-time comparison — wrong token of different length must still return 401
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("POST /interbank with token of different length returns 401 (constant-time safe)")
+    void receiveMessage_wrongTokenDifferentLength_returns401() throws Exception {
+        // A shorter token must be rejected the same as any other wrong token.
+        // This verifies that constant-time comparison does not leak token length.
+        mockMvc.perform(post("/interbank")
+                        .header("X-Api-Key", "short")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(buildNewTxEnvelope()))
+                .andExpect(status().isUnauthorized());
+
+        verifyNoInteractions(messageService, executorService);
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix 2 (I-2): @RestControllerAdvice must handle service exceptions (no broad try/catch)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("InterbankProtocolException thrown by service maps to 400 via @RestControllerAdvice")
+    void receiveMessage_serviceThrowsProtocolException_returns400() throws Exception {
+        when(messageService.findCachedResponse(any())).thenReturn(Optional.empty());
+        when(executorService.handleNewTx(any(Transaction.class), any(IdempotenceKey.class)))
+                .thenThrow(new InterbankExceptions.InterbankProtocolException("malformed transaction"));
+
+        mockMvc.perform(post("/interbank")
+                        .header("X-Api-Key", VALID_INBOUND_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(buildNewTxEnvelope()))
+                .andExpect(status().isBadRequest());
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix 4 (I-6): idempotenceKey.locallyGeneratedKey exceeding 64 chars must return 400
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("POST /interbank with locallyGeneratedKey > 64 chars returns 400")
+    void receiveMessage_oversizeLocallyGeneratedKey_returns400() throws Exception {
+        // 65-character key — one byte over the §2.2 limit.
+        String oversizeKey = "a".repeat(65);
+        ForeignBankId txId = new ForeignBankId(PARTNER_RN, "uuid-tx-oversize");
+        Transaction tx = new Transaction(List.of(), txId, "test", null, null, null);
+        String envelope = buildEnvelopeJson(PARTNER_RN, oversizeKey, MessageType.NEW_TX,
+                objectMapper.writeValueAsString(tx));
+
+        mockMvc.perform(post("/interbank")
+                        .header("X-Api-Key", VALID_INBOUND_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(envelope))
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(messageService, executorService);
+    }
 
     // -------------------------------------------------------------------------
     // Helpers
