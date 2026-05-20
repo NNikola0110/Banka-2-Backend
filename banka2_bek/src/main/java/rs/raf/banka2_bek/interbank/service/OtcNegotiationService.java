@@ -137,13 +137,24 @@ public class OtcNegotiationService {
 
     @Transactional
     public void postCounterOffer(ForeignBankId negotiationId, OtcOffer updated) {
+        postCounterOffer(negotiationId, negotiationId.routingNumber(), updated);
+    }
+
+    /**
+     * T2-J overload (Tim 1 cross-bank Stage C, 2026-05-20): counter sa eksplicitnim
+     * {@code targetPartnerRouting}-om. Wrapper koristi ovo kad smo MI autoritativni
+     * (negotiationId.routingNumber == myRouting) — partner banka je {@code foreignPartyRouting},
+     * URL path zadrzava {rn, id} jer Tim 1 to prepoznaje kao njihov mirror kljuc.
+     */
+    @Transactional
+    public void postCounterOffer(ForeignBankId negotiationId, int targetPartnerRouting, OtcOffer updated) {
         if (negotiationId == null) throw new IllegalArgumentException("negotiationId ne sme biti null");
         validateOutboundOffer(updated);
         ensureLocalParty(updated.lastModifiedBy(),
                 "Counter-offer mora biti potpisan od strane korisnika nase banke");
-        client.putCounterOffer(negotiationId, updated);
-        log.info("OTC outbound: counter-offered negotiation {} (lastModifiedBy={})",
-                negotiationId, updated.lastModifiedBy());
+        client.putCounterOffer(negotiationId, targetPartnerRouting, updated);
+        log.info("OTC outbound: counter-offered negotiation {} via partner routing {} (lastModifiedBy={})",
+                negotiationId, targetPartnerRouting, updated.lastModifiedBy());
     }
 
     @Transactional
@@ -154,9 +165,16 @@ public class OtcNegotiationService {
 
     @Transactional
     public void closeNegotiation(ForeignBankId negotiationId) {
+        closeNegotiation(negotiationId, negotiationId.routingNumber());
+    }
+
+    /** T2-J overload: DELETE sa eksplicitnim targetPartnerRouting-om. */
+    @Transactional
+    public void closeNegotiation(ForeignBankId negotiationId, int targetPartnerRouting) {
         if (negotiationId == null) throw new IllegalArgumentException("negotiationId ne sme biti null");
-        client.deleteNegotiation(negotiationId);
-        log.info("OTC outbound: closed negotiation {}", negotiationId);
+        client.deleteNegotiation(negotiationId, targetPartnerRouting);
+        log.info("OTC outbound: closed negotiation {} via partner routing {}",
+                negotiationId, targetPartnerRouting);
     }
 
     @Transactional

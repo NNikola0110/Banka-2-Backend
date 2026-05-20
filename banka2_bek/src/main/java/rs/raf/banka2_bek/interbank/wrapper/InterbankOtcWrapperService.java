@@ -338,15 +338,24 @@ public class InterbankOtcWrapperService {
         entity.setLastModifiedByIdString(myParty.id());
         negotiationRepository.save(entity);
 
-        // T2-H fix (Stage C polish, 2026-05-20): outbound PUT counter ide na
-        // partnerovu (autoritativnu) banku SAMO kad je pregovor autoritativan
-        // KOD PARTNERA (negotiationId.routingNumber != myRouting). Ako smo MI
-        // autoritativni (mi smo seller, negotiation u nasoj DB), partner nema
-        // mirror copy (pull model — vide stanje kroz GET); ne saljemo outbound
-        // PUT samima sebi sto bi pucalo sa "Target routing X could not be resolved".
-        if (foreignId.routingNumber() != myRouting) {
-            negotiationService.postCounterOffer(foreignId, outbound);
-        }
+        // T2-J fix (Tim 1 cross-bank Stage C, 2026-05-20): outbound PUT counter UVEK
+        // ide ka partnerovoj banci — bez obzira ko je autoritativni. Razlikujemo
+        // SAMO "kome saljemo HTTP" (target partner routing) od "vlasnika {rn,id}"
+        // (URL path):
+        //
+        //   1) Mi NE-autoritativni (foreignId.rn != myRouting): partner = autoritativni
+        //      = foreignId.rn. URL: /negotiations/{foreignId.rn}/{foreignId.id}.
+        //      Spec §3.3 default — BUYER counter na SELLER-authoritative.
+        //
+        //   2) Mi autoritativni (foreignId.rn == myRouting): partner = foreignParty
+        //      (kontra strana). URL i dalje /negotiations/{myRouting}/{id} jer Tim 1
+        //      prepoznaje da je {222, negId} njihov mirror kljuc. T2-H je gresio
+        //      sto je SKIPOVAO ovaj slucaj — partner mirror nije dobijao update.
+        //      T2-J ga propusta ka pravom partner routing-u.
+        int targetPartnerRouting = (foreignId.routingNumber() == myRouting)
+                ? entity.getForeignPartyRoutingNumber()
+                : foreignId.routingNumber();
+        negotiationService.postCounterOffer(foreignId, targetPartnerRouting, outbound);
         return mapNegotiationToDto(entity);
     }
 
@@ -361,18 +370,23 @@ public class InterbankOtcWrapperService {
         entity.setStatus(InterbankOtcNegotiationStatus.DECLINED);
         negotiationRepository.save(entity);
 
-        // T2-H mirror: outbound DELETE ide na partnerovu (autoritativnu) banku
-        // SAMO kad pregovor nije autoritativan kod nas. Ako smo mi autoritativni,
-        // partner pull-uje stanje (vidi DECLINED kroz GET) — bez outbound DELETE
-        // samima sebi (sto bi pucalo na resolve partnera sa nasim rn-om).
+        // T2-J mirror (zamena za T2-H skip): outbound DELETE UVEK ide ka partneru —
+        // izbor target routing-a:
+        //   1) Mi NE-autoritativni: partner = foreignId.rn (autoritativni vlasnik).
+        //   2) Mi autoritativni: partner = foreignParty (kontra strana); URL path
+        //      i dalje /negotiations/{myRouting}/{id} (partner mirror kljuc).
+        // Bez T2-J, partner nikad ne sazna za nas decline na nase-autoritativni
+        // pregovor (T2-H je SKIPOVAO outbound). Close je i dalje idempotentan:
+        // RuntimeException se logguje WARN-om i ne ruzimo lokalno azuriranje.
         int myRouting = requireMyRoutingNumber();
-        if (foreignId.routingNumber() != myRouting) {
-            try {
-                negotiationService.closeNegotiation(foreignId);
-            } catch (RuntimeException e) {
-                // Close je idempotentno; partner mozda vec zatvorio. Logujemo ali ne ruzimo.
-                log.warn("Outbound DELETE pregovora {} nije uspelo: {}", foreignId, e.getMessage());
-            }
+        int targetPartnerRouting = (foreignId.routingNumber() == myRouting)
+                ? entity.getForeignPartyRoutingNumber()
+                : foreignId.routingNumber();
+        try {
+            negotiationService.closeNegotiation(foreignId, targetPartnerRouting);
+        } catch (RuntimeException e) {
+            log.warn("Outbound DELETE pregovora {} (target partner {}) nije uspelo: {}",
+                    foreignId, targetPartnerRouting, e.getMessage());
         }
         return mapNegotiationToDto(entity);
     }

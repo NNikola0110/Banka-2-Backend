@@ -153,9 +153,28 @@ public class InterbankClient {
     /**
      * §3.3 — PUT /negotiations/{rn}/{id}. Kontraponuda. Pozivac mora biti strana cija je tura
      * (proverava se preko {@code lastModifiedBy} polja u OtcOffer-u).
+     *
+     * <p>Defaultno, partner banka se resolve-uje po {@code negotiationId.routingNumber()}
+     * (autoritativna banka — sluciaj BUYER counter na SELLER-authoritative pregovor).
      */
     public void putCounterOffer(ForeignBankId negotiationId, OtcOffer offer) {
-        InterbankProperties.PartnerBank partnerBank = resolvePartner(negotiationId.routingNumber());
+        putCounterOffer(negotiationId, negotiationId.routingNumber(), offer);
+    }
+
+    /**
+     * T2-J overload (Tim 1 cross-bank Stage C, 2026-05-20): PUT counter sa
+     * EKSPLICITNIM targetPartnerRouting-om. Koristimo kad smo MI autoritativni
+     * (negotiationId.routingNumber == myRouting) — onda treba slati PUT ka
+     * partnerovom mirror-u (BUYER bank), a URL path zadrzava nas authoritative
+     * {rn, id} (Tim 1 prepoznaje da je {222, negId} njihov mirror i azurira ga).
+     *
+     * <p>Bez ovog overload-a, T2-H je skipovao outbound u tom slucaju jer je
+     * default resolve gadjao {@code routingNumber=222} (samima sebi → "Target
+     * routing 222 could not be resolved"). T2-J razdvaja "ko je vlasnik
+     * negotiationId-a" (URL path) od "kome saljemo HTTP" (partnerRouting).
+     */
+    public void putCounterOffer(ForeignBankId negotiationId, int targetPartnerRouting, OtcOffer offer) {
+        InterbankProperties.PartnerBank partnerBank = resolvePartner(targetPartnerRouting);
         try {
             restClient
                     .put()
@@ -229,7 +248,17 @@ public class InterbankClient {
      * Idempotentno: ponovno DELETE-ovanje istog id-a vraca 204.
      */
     public void deleteNegotiation(ForeignBankId negotiationId) {
-        InterbankProperties.PartnerBank partnerBank = resolvePartner(negotiationId.routingNumber());
+        deleteNegotiation(negotiationId, negotiationId.routingNumber());
+    }
+
+    /**
+     * T2-J overload: DELETE sa EKSPLICITNIM targetPartnerRouting-om (analogno
+     * {@link #putCounterOffer(ForeignBankId, int, OtcOffer)}). Koristimo kad smo
+     * MI autoritativni — DELETE ka partnerovom mirror-u, URL path zadrzava
+     * authoritative {rn, id}.
+     */
+    public void deleteNegotiation(ForeignBankId negotiationId, int targetPartnerRouting) {
+        InterbankProperties.PartnerBank partnerBank = resolvePartner(targetPartnerRouting);
         try {
             restClient
                     .delete()
