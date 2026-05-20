@@ -457,9 +457,18 @@ public class OtcNegotiationService {
      * </ol>
      */
     public void acceptReceivedNegotiation(ForeignBankId negotiationId) {
+        acceptReceivedNegotiation(negotiationId, null);
+    }
+
+    /**
+     * T2-F overload (Tim 1 cross-bank Stage C, 2026-05-20): accept sa sender routing-om
+     * za turn check. Bez sender param-a (legacy poziv iz internih putova) turn check
+     * se preskace — partner banke uvek pozivaju kroz overload sa sender-om.
+     */
+    public void acceptReceivedNegotiation(ForeignBankId negotiationId, Integer senderRoutingNumber) {
         if (negotiationId == null) throw new IllegalArgumentException("negotiationId ne sme biti null");
 
-        AcceptPrep prep = self.persistAcceptArtifacts(negotiationId);
+        AcceptPrep prep = self.persistAcceptArtifacts(negotiationId, senderRoutingNumber);
 
         // OUT-OF-TX: rezervacija hartija (§3.6 zadnji paragraf, C-3 fix).
         // Idempotency kljuc deterministicki po negotiationId-u — partnerov retry,
@@ -499,10 +508,31 @@ public class OtcNegotiationService {
      */
     @Transactional
     public AcceptPrep persistAcceptArtifacts(ForeignBankId negotiationId) {
+        return persistAcceptArtifacts(negotiationId, null);
+    }
+
+    /**
+     * T2-F overload — sa sender routing-om za turn-check (sender != lastModifier).
+     * Spec semantika §3.6: BUYER prihvata SELLER-ovu poslednju ponudu (ili kontra-ponudu).
+     * Ako sender (X-Api-Key) pripada istoj banci kao lastModifier, accept je
+     * "ja accept-ujem svoj sopstveni offer" — strange semantically, blokiramo 409.
+     */
+    @Transactional
+    public AcceptPrep persistAcceptArtifacts(ForeignBankId negotiationId, Integer senderRoutingNumber) {
         InterbankOtcNegotiation entity = lookupByNegotiationId(negotiationId);
         if (!entity.isOngoing() || entity.getStatus() != InterbankOtcNegotiationStatus.ACTIVE) {
-            throw new InterbankExceptions.InterbankProtocolException(
+            // T2-E fix (Tim 1 cross-bank Stage C, 2026-05-20): zatvoreni pregovor je
+            // 409 Conflict, ne 400 (mirror Tim 1 ponasanju + Tim 2 §6.6 spec).
+            throw new InterbankExceptions.InterbankNegotiationConflictException(
                     "Pregovor " + negotiationId + " nije aktivan (status=" + entity.getStatus() + ")");
+        }
+        // T2-F turn check (Tim 1 cross-bank Stage C, 2026-05-20): sender ne sme
+        // biti lastModifier — strana koja je upravo modifikovala ne moze odmah
+        // accept-ovati sopstveni offer. Mirror Tim 1 "Not your turn to accept".
+        if (senderRoutingNumber != null
+                && entity.getLastModifiedByRoutingNumber() == senderRoutingNumber) {
+            throw new InterbankExceptions.InterbankNegotiationConflictException(
+                    "Nije turn za accept — vasa banka je poslednja modifikovala pregovor");
         }
         if (entity.getLocalPartyType() != InterbankPartyType.SELLER) {
             throw new InterbankExceptions.InterbankProtocolException(
@@ -769,7 +799,7 @@ public class OtcNegotiationService {
         return negotiationRepository
                 .findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
                         negotiationId.routingNumber(), negotiationId.id())
-                .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
+                .orElseThrow(() -> new InterbankExceptions.InterbankNegotiationNotFoundException(
                         "Pregovor " + negotiationId + " ne postoji"));
     }
 

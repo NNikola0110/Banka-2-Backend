@@ -367,6 +367,22 @@ public class TransactionExecutorService {
      */
     @Transactional
     public TransactionVote handleNewTx(Transaction tx, IdempotenceKey key) {
+        // T2-A fix (Tim 1 cross-bank Stage A, 2026-05-20): pre-check za null
+        // postings i transactionId pre nego sto udjemo u validation/reservation
+        // logiku. Bez ovog NPE bubbles up kao 400 sa NPE-derived porukom umesto
+        // razumnog "transaction.postings is required" odgovora. Po Tim 2 spec
+        // §6.1 malformed/incomplete NEW_TX body mora biti 400 + jasan razlog.
+        if (tx == null) {
+            throw new IllegalArgumentException("transaction message is required");
+        }
+        if (tx.transactionId() == null) {
+            throw new IllegalArgumentException("transaction.transactionId is required");
+        }
+        if (tx.postings() == null || tx.postings().isEmpty()) {
+            throw new IllegalArgumentException(
+                    "transaction.postings is required and must contain at least one balanced double-entry pair");
+        }
+
         Optional<String> cached = messageService.findCachedResponse(key);
         if (cached.isPresent()) {
             try {
@@ -713,12 +729,41 @@ public class TransactionExecutorService {
                 // racunu (option-as-asset zivi van Account-a; stvarna rezervacija
                 // hartija ide kroz acceptReceivedNegotiation-ov reservationApplier.
                 // C-3 fix). Validan posting — no-op.
-                //
-                // NB: Monas+Person je NAMERNO neprihvacen (UNACCEPTABLE_ASSET) —
-                // §3.6 koristi Person samo za remote (foreign) buyer, koji nikad
-                // ne dolazi do nase validacije (skipped kroz isPostingRemote).
-                // Lokalni Monas+Person je nedvosmislena greska; ostavimo da
-                // padne u else branch ispod.
+
+            } else if (asset instanceof Asset.Monas m && account instanceof TxAccount.Person pe) {
+                // T2-B fix (Tim 1 cross-bank Stage A, 2026-05-20): Person+Monas
+                // defenzivna grana — partner banka moze poslati MONAS leg sa
+                // TxAccount.Person umesto TxAccount.Account kad nema otkrivene
+                // konkretne brojeve racuna nase strane (spec §2.6: Person je
+                // opaque foreign-bank-id koji receiver bank resolve-uje). isPostingRemote
+                // je vec uklonio partner-side Person (line 605); ovde stizemo samo
+                // za lokalne (myRouting) Person. Mirror Tim 1 P0.1 resolvePersonToAccount.
+                Long ownerId;
+                try {
+                    String foreignId = pe.id().id();
+                    if (foreignId != null && (foreignId.startsWith("C-") || foreignId.startsWith("E-"))) {
+                        foreignId = foreignId.substring(2);
+                    }
+                    ownerId = Long.valueOf(foreignId);
+                } catch (NumberFormatException ex) {
+                    violations.add(new NoVoteReason(NoVoteReason.Reason.NO_SUCH_ACCOUNT, p));
+                    continue;
+                }
+                String postingCcy = m.asset().currency().name();
+                Optional<Account> resolved = accountRepository
+                        .findByClientIdAndStatusOrderByAvailableBalanceDesc(ownerId, AccountStatus.ACTIVE)
+                        .stream()
+                        .filter(a -> a.getCurrency() != null
+                                && postingCcy.equals(a.getCurrency().getCode()))
+                        .findFirst();
+                if (resolved.isEmpty()) {
+                    violations.add(new NoVoteReason(NoVoteReason.Reason.NO_SUCH_ACCOUNT, p));
+                    continue;
+                }
+                if (isCredit && resolved.get().getAvailableBalance().compareTo(abs) < 0) {
+                    violations.add(new NoVoteReason(NoVoteReason.Reason.INSUFFICIENT_ASSET, p));
+                }
+
             } else {
                 violations.add(new NoVoteReason(NoVoteReason.Reason.UNACCEPTABLE_ASSET, p));
             }
@@ -746,6 +791,27 @@ public class TransactionExecutorService {
 
                 if (asset instanceof Asset.Monas && account instanceof TxAccount.Account a) {
                     reservationApplier.reserveMonas(a.num(), abs);
+
+                } else if (asset instanceof Asset.Monas m && account instanceof TxAccount.Person pe) {
+                    // T2-B reservation pair: Person+Monas — resolve do 18-cifrenog
+                    // racuna pa rezervisi normalno. validacija je vec prosla u Pass 1
+                    // (NO_SUCH_ACCOUNT / INSUFFICIENT_ASSET) pa ovde garantovano postoji.
+                    String foreignId = pe.id().id();
+                    if (foreignId != null && (foreignId.startsWith("C-") || foreignId.startsWith("E-"))) {
+                        foreignId = foreignId.substring(2);
+                    }
+                    Long ownerId = Long.valueOf(foreignId);
+                    String postingCcy = m.asset().currency().name();
+                    Account resolvedAcct = accountRepository
+                            .findByClientIdAndStatusOrderByAvailableBalanceDesc(ownerId, AccountStatus.ACTIVE)
+                            .stream()
+                            .filter(acc -> acc.getCurrency() != null
+                                    && postingCcy.equals(acc.getCurrency().getCode()))
+                            .findFirst()
+                            .orElseThrow(() -> new IllegalStateException(
+                                    "Person+Monas reservation: missing account for ownerId=" + pe.id().id()
+                                            + " currency=" + postingCcy + " (validation prosao ali resolve fail)"));
+                    reservationApplier.reserveMonas(resolvedAcct.getAccountNumber(), abs);
 
                 } else if (asset instanceof Asset.Stock s && account instanceof TxAccount.Person pe) {
                     Long userId = Long.parseLong(pe.id().id());

@@ -89,7 +89,12 @@ public class InterbankInboundController {
         }
 
         if (idempotenceKey.routingNumber() != partnerBank.getRoutingNumber()) {
-            return ResponseEntity.status(401).build();
+            // Routing mismatch — partner pokusava da impersonira drugu banku.
+            // Spec: ovo NIJE autentifikacijski failure (X-Api-Key je validan),
+            // vec malformed payload — vraca se 400 Bad Request (mirror-uje
+            // Tim 1 inbound controller za simetricno ponasanje izmedju banaka).
+            throw new InterbankExceptions.InterbankProtocolException(
+                    "idempotenceKey.routingNumber mismatches X-Api-Key sender");
         }
 
         Optional<String> cachedResponseOpt = interbankMessageService.findCachedResponse(idempotenceKey);
@@ -101,7 +106,11 @@ public class InterbankInboundController {
                 return ResponseEntity.noContent().build();
             }
 
-            return ResponseEntity.ok(objectMapper.readTree(cachedResponse));
+            // Idempotency cache replay (live test fix, 2026-05-20): parse u Object umesto JsonNode,
+            // jer Spring serializuje JsonNode preko bean-getters (isArray/isBigDecimal/...),
+            // sto rezultuje introspekcijom umesto pravog body-ja. Object (Map/List/String/Number)
+            // se serijalizuje korektno kao originalni JSON.
+            return ResponseEntity.ok(objectMapper.readValue(cachedResponse, Object.class));
         }
 
         return dispatchByMessageType(messageType, idempotenceKey, messageNode);

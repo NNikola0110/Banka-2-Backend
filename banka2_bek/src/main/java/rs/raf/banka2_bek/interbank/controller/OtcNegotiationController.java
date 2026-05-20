@@ -2,6 +2,8 @@ package rs.raf.banka2_bek.interbank.controller;
 
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -38,6 +40,11 @@ public class OtcNegotiationController {
     /** §3.2 — partner banka kreira pregovor; mi smo seller (autoritativni vlasnik). */
     @PostMapping("/negotiations")
     public ResponseEntity<ForeignBankId> createNegotiation(@RequestBody OtcOffer offer) {
+        // T2-D fix (Tim 1 cross-bank Stage C, 2026-05-20): lastModifiedBy.routingNumber
+        // mora odgovarati X-Api-Key sender-u. Bez ovog, partner banka moze "podmetnuti"
+        // lastModifier kao iz nase strane (npr. {222, C-1}) i tako falsifikovati ko je
+        // izmenio pregovor — sledeci PUT bi prosao turn check kao da je nas red.
+        requireSenderRoutingMatchesLastModifier(offer);
         ForeignBankId id = negotiationService.acceptCreatedNegotiation(offer);
         return ResponseEntity.ok(id);
     }
@@ -56,8 +63,33 @@ public class OtcNegotiationController {
             @PathVariable int routingNumber,
             @PathVariable String id,
             @RequestBody OtcOffer offer) {
+        // T2-D fix — vidi createNegotiation komentar.
+        requireSenderRoutingMatchesLastModifier(offer);
         negotiationService.receiveCounterOffer(new ForeignBankId(routingNumber, id), offer);
         return ResponseEntity.noContent().build();
+    }
+
+    /**
+     * T2-D helper: izvuci sender routing iz {@code InterbankAuthFilter}-ovog
+     * {@code SecurityContextHolder} i odbij zahtev sa 400 ako
+     * {@code offer.lastModifiedBy.routingNumber} ne odgovara senderu. Spec §3.2/§3.3
+     * eksplicitno trazi ovu proveru — bez nje partner banka moze falsifikovati
+     * lastModifier i razbiti turn check.
+     */
+    private void requireSenderRoutingMatchesLastModifier(OtcOffer offer) {
+        if (offer == null || offer.lastModifiedBy() == null) {
+            throw new IllegalArgumentException("offer.lastModifiedBy je obavezan");
+        }
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || !(auth.getPrincipal() instanceof Integer senderRouting)) {
+            throw new IllegalStateException(
+                    "Sender routing nedostaje — InterbankAuthFilter preduslov");
+        }
+        if (offer.lastModifiedBy().routingNumber() != senderRouting) {
+            throw new IllegalArgumentException(
+                    "lastModifiedBy.routingNumber (" + offer.lastModifiedBy().routingNumber()
+                            + ") mora odgovarati X-Api-Key sender-u (" + senderRouting + ")");
+        }
     }
 
     /** §3.5 — bilo koja strana zatvara pregovor (idempotentno). */
@@ -78,8 +110,20 @@ public class OtcNegotiationController {
     public ResponseEntity<Void> acceptNegotiation(
             @PathVariable int routingNumber,
             @PathVariable String id) {
-        negotiationService.acceptReceivedNegotiation(new ForeignBankId(routingNumber, id));
+        // T2-F fix (Tim 1 cross-bank Stage C, 2026-05-20): prosledi sender
+        // routing za turn-check (sender != lastModifier).
+        Integer senderRouting = currentSenderRoutingOrNull();
+        negotiationService.acceptReceivedNegotiation(new ForeignBankId(routingNumber, id), senderRouting);
         return ResponseEntity.noContent().build();
+    }
+
+    /** T2-F helper: izvuci sender routing iz {@code InterbankAuthFilter} principal-a, ili null. */
+    private Integer currentSenderRoutingOrNull() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth != null && auth.getPrincipal() instanceof Integer rn) {
+            return rn;
+        }
+        return null;
     }
 
     /**

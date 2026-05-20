@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import rs.raf.banka2_bek.auth.dto.MessageResponseDto;
 import rs.raf.banka2_bek.auth.exception.AuthenticationFailedException;
 import rs.raf.banka2_bek.auth.service.AccountLockoutService;
+import rs.raf.banka2_bek.interbank.exception.InterbankExceptions;
 import org.springframework.security.access.AccessDeniedException;
 
 @RestControllerAdvice
@@ -107,6 +108,50 @@ public class GlobalExceptionHandler {
             status = HttpStatus.FORBIDDEN;
         }
         return ResponseEntity.status(status).body(new MessageResponseDto(message));
+    }
+
+    // ===== Inter-bank protokol exception mappinzi (Tim 1 cross-bank live test, 2026-05-20)
+    // ============================================================================
+    // GlobalExceptionHandler catch-all `handleRuntimeException` hvata generic
+    // RuntimeException-e PRE scoped `OtcNegotiationExceptionHandler`, pa moramo
+    // ovde eksplicitno mapirati interbank-domain exception tipove na ispravne
+    // HTTP status code-ove per Tim 2 §3.7 (404 user not found), §6.3 (404 negotiation
+    // not found, 409 conflict), §6.4 (401 outbound auth).
+
+    /** §3.7 GET /user/{rn}/{id} sa nepoznatim id-em — Tim 2 spec trazi 404. */
+    @ExceptionHandler(InterbankExceptions.InterbankUserNotFoundException.class)
+    public ResponseEntity<MessageResponseDto> handleInterbankUserNotFound(
+            InterbankExceptions.InterbankUserNotFoundException ex) {
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /** §3.3-§3.6 GET/PUT/DELETE/accept za nepostojeci pregovor — Tim 2 spec trazi 404. */
+    @ExceptionHandler(InterbankExceptions.InterbankNegotiationNotFoundException.class)
+    public ResponseEntity<MessageResponseDto> handleInterbankNegotiationNotFound(
+            InterbankExceptions.InterbankNegotiationNotFoundException ex) {
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /** §3.3 turn violation ili zatvoreni pregovor — Tim 2 spec trazi 409. */
+    @ExceptionHandler(InterbankExceptions.InterbankNegotiationConflictException.class)
+    public ResponseEntity<MessageResponseDto> handleInterbankNegotiationConflict(
+            InterbankExceptions.InterbankNegotiationConflictException ex) {
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /** Outbound 401 od partnera — propagiramo kao 502 Bad Gateway (problem je sa partner-om, ne sa nama). */
+    @ExceptionHandler(InterbankExceptions.InterbankAuthException.class)
+    public ResponseEntity<MessageResponseDto> handleInterbankAuthFailure(
+            InterbankExceptions.InterbankAuthException ex) {
+        return ResponseEntity
+                .status(HttpStatus.BAD_GATEWAY)
+                .body(new MessageResponseDto(ex.getMessage()));
     }
 
     @ExceptionHandler(RuntimeException.class)

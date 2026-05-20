@@ -150,6 +150,11 @@ services:
       PARTNER1_USER_PATH: ${PARTNER1_USER_PATH:-/interbank/user/{rn}/{id}}
       # Tim 1 routing broj
       PARTNER1_ROUTING: ${PARTNER1_ROUTING:-111}
+      # Inbound token: X-Api-Key koji Tim 1 salje nama; default je dev pre prvog
+      # cross-bank handshake-a, prod se postavlja kroz env override (random 64-hex).
+      PARTNER1_INBOUND_TOKEN: ${PARTNER1_INBOUND_TOKEN:-dev-outbound-banka1-to-banka2}
+      # Outbound token: X-Api-Key koji mi saljemo Tim 1 — dodeljuje ga Tim 1.
+      PARTNER1_OUTBOUND_TOKEN: ${PARTNER1_OUTBOUND_TOKEN:-dev-inbound-banka2-to-banka1}
       # Arbitro Phase 6 — Whisper STT sidecar (faster-whisper tiny, port 8094 na hostu).
       # Pokrece se kroz Banka-2-Tools/docker-compose.yml. Iz BE container-a
       # se pristupa preko host.docker.internal (isti pattern kao Ollama+TTS).
@@ -286,8 +291,8 @@ services:
     image: rabbitmq:3.13-management-alpine
     container_name: banka2_rabbitmq
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "${RABBITMQ_HOST_PORT:-5672}:5672"
+      - "${RABBITMQ_MGMT_HOST_PORT:-15672}:15672"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s

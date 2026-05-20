@@ -23,6 +23,7 @@ import rs.raf.banka2_bek.interbank.protocol.CurrencyCode;
 import rs.raf.banka2_bek.interbank.protocol.ForeignBankId;
 import rs.raf.banka2_bek.interbank.protocol.MonetaryAsset;
 import rs.raf.banka2_bek.interbank.protocol.MonetaryValue;
+import rs.raf.banka2_bek.interbank.protocol.OtcNegotiation;
 import rs.raf.banka2_bek.interbank.protocol.OtcOffer;
 import rs.raf.banka2_bek.interbank.protocol.Posting;
 import rs.raf.banka2_bek.interbank.protocol.PublicStock;
@@ -205,15 +206,95 @@ public class InterbankOtcWrapperService {
         return mapNegotiationToDto(entity);
     }
 
-    @Transactional(readOnly = true)
+    // NOTE: NE koristimo @Transactional na ovoj metodi — pull-sync radi outbound
+    // HTTP GET ka partner bankama (autoritativne kopije). Iste razloge kao u
+    // listRemoteListings (vidi komentar gore): RuntimeException pod @Transactional
+    // ostavlja Tx u rollback-only stanju, pa Spring vraca 400 cak i ako su lokalni
+    // save-ovi prosli. Bez Tx ovde, svaki repository.save() otvara per-call Tx
+    // (Spring Data JPA default), a partner-unreachable se gracefully logguje.
     public List<OtcInterbankOffer> listMyOffers(Long userId, String userRole) {
         List<InterbankOtcNegotiation> mine = negotiationRepository
                 .findByLocalPartyIdAndLocalPartyRoleAndStatus(userId, userRole, InterbankOtcNegotiationStatus.ACTIVE);
+
+        // T2-I fix (Tim 1 cross-bank Stage C mirror sync, 2026-05-20):
+        // pull-sync sa autoritativne banke pre nego sto mapiramo DTO-e. Bez ovog
+        // mirror moze biti stale kad partner uradi counter/decline/accept jer
+        // Tim 1 (i nas seller-strana) koristi pull model — bez outbound push na
+        // autoritativni update. Posledica je da FE pokazuje staru poruku ("ceka
+        // na Vas") iako je u stvarnosti partner vec odgovorio. Spec §3.4 jeste
+        // namenjena upravo ovome (read current state), pa je GET legitiman pre-list.
+        //
+        // Pull samo za pregovore gde je partner autoritativni
+        // (foreignNegotiationRoutingNumber != myRouting). Pregovori autoritativni
+        // kod nas su izvor istine — nema sta da sinhronizujemo. Pull se izvodi
+        // best-effort; ako partner ne odgovori, fall-back na stale local mirror
+        // sa WARN log-om (graceful degradation, FE i dalje dobija nesto).
+        int myRouting = requireMyRoutingNumber();
+        for (InterbankOtcNegotiation n : mine) {
+            if (n.getForeignNegotiationRoutingNumber() == null
+                    || n.getForeignNegotiationRoutingNumber() == myRouting) {
+                continue; // autoritativni kod nas — mirror je izvor istine
+            }
+            ForeignBankId foreignId = new ForeignBankId(
+                    n.getForeignNegotiationRoutingNumber(),
+                    n.getForeignNegotiationIdString());
+            try {
+                OtcNegotiation remote = negotiationService.readNegotiation(foreignId);
+                applyRemoteSnapshot(n, remote);
+            } catch (RuntimeException e) {
+                log.warn("T2-I pull-sync pregovora {} nije uspeo (zadrzavamo stale mirror): {}",
+                        foreignId, e.getMessage());
+            }
+        }
+
         List<OtcInterbankOffer> result = new ArrayList<>(mine.size());
         for (InterbankOtcNegotiation n : mine) {
             result.add(mapNegotiationToDto(n));
         }
         return result;
+    }
+
+    /**
+     * T2-I helper: primeni svezi snapshot iz autoritativne banke na lokalnu
+     * mirror kopiju. Salje update kroz {@code repository.save()} koji otvara
+     * per-call Tx (zato pozivajuca metoda ne mora biti @Transactional).
+     *
+     * <p>Ako daljinski {@code isOngoing == false} a nas mirror je jos ACTIVE,
+     * to znaci da je partner zatvorio pregovor (DELETE §3.5) ili je on prihvacen
+     * (§3.6). Razliku ne mozemo da znamo iz §3.4 response-a sam (vraca samo
+     * {@code isOngoing}), pa najsigurnije markiramo kao CLOSED — accept flow
+     * ide kroz {@link OtcNegotiationService#acceptReceivedNegotiation} koji
+     * eksplicitno postavlja ACCEPTED, tako da je CLOSED ovde "ne-accept zatvaranje".
+     */
+    private void applyRemoteSnapshot(InterbankOtcNegotiation entity, OtcNegotiation remote) {
+        if (remote == null) return;
+        entity.setAmount(remote.amount());
+        if (remote.pricePerUnit() != null) {
+            entity.setPricePerUnit(remote.pricePerUnit().amount());
+            if (remote.pricePerUnit().currency() != null) {
+                entity.setPriceCurrency(remote.pricePerUnit().currency().name());
+            }
+        }
+        if (remote.premium() != null) {
+            entity.setPremium(remote.premium().amount());
+            if (remote.premium().currency() != null) {
+                entity.setPremiumCurrency(remote.premium().currency().name());
+            }
+        }
+        if (remote.settlementDate() != null) {
+            entity.setSettlementDate(remote.settlementDate());
+        }
+        if (remote.lastModifiedBy() != null) {
+            entity.setLastModifiedByRoutingNumber(remote.lastModifiedBy().routingNumber());
+            entity.setLastModifiedByIdString(remote.lastModifiedBy().id());
+        }
+        if (!remote.isOngoing() && entity.isOngoing()) {
+            entity.setOngoing(false);
+            if (entity.getStatus() == InterbankOtcNegotiationStatus.ACTIVE) {
+                entity.setStatus(InterbankOtcNegotiationStatus.CLOSED);
+            }
+        }
+        negotiationRepository.save(entity);
     }
 
     @Transactional
@@ -248,7 +329,7 @@ public class InterbankOtcWrapperService {
                 myParty
         );
 
-        // Lokalni update + outbound poziv (PUT /negotiations/{rn}/{id}).
+        // Lokalni update entiteta (ovo radimo uvek — mi cuvamo mirror ili autoritativnu kopiju).
         entity.setAmount(request.quantity());
         entity.setPricePerUnit(request.pricePerStock());
         entity.setPremium(request.premium());
@@ -257,7 +338,15 @@ public class InterbankOtcWrapperService {
         entity.setLastModifiedByIdString(myParty.id());
         negotiationRepository.save(entity);
 
-        negotiationService.postCounterOffer(foreignId, outbound);
+        // T2-H fix (Stage C polish, 2026-05-20): outbound PUT counter ide na
+        // partnerovu (autoritativnu) banku SAMO kad je pregovor autoritativan
+        // KOD PARTNERA (negotiationId.routingNumber != myRouting). Ako smo MI
+        // autoritativni (mi smo seller, negotiation u nasoj DB), partner nema
+        // mirror copy (pull model — vide stanje kroz GET); ne saljemo outbound
+        // PUT samima sebi sto bi pucalo sa "Target routing X could not be resolved".
+        if (foreignId.routingNumber() != myRouting) {
+            negotiationService.postCounterOffer(foreignId, outbound);
+        }
         return mapNegotiationToDto(entity);
     }
 
@@ -267,16 +356,23 @@ public class InterbankOtcWrapperService {
         InterbankOtcNegotiation entity = lookupOrThrow(foreignId);
         ensureMyParty(entity, userId, userRole);
 
-        // Local close + DELETE outbound.
+        // Local close + (uslovni) DELETE outbound.
         entity.setOngoing(false);
         entity.setStatus(InterbankOtcNegotiationStatus.DECLINED);
         negotiationRepository.save(entity);
 
-        try {
-            negotiationService.closeNegotiation(foreignId);
-        } catch (RuntimeException e) {
-            // Close je idempotentno; partner mozda vec zatvorio. Logujemo ali ne ruzimo.
-            log.warn("Outbound DELETE pregovora {} nije uspelo: {}", foreignId, e.getMessage());
+        // T2-H mirror: outbound DELETE ide na partnerovu (autoritativnu) banku
+        // SAMO kad pregovor nije autoritativan kod nas. Ako smo mi autoritativni,
+        // partner pull-uje stanje (vidi DECLINED kroz GET) — bez outbound DELETE
+        // samima sebi (sto bi pucalo na resolve partnera sa nasim rn-om).
+        int myRouting = requireMyRoutingNumber();
+        if (foreignId.routingNumber() != myRouting) {
+            try {
+                negotiationService.closeNegotiation(foreignId);
+            } catch (RuntimeException e) {
+                // Close je idempotentno; partner mozda vec zatvorio. Logujemo ali ne ruzimo.
+                log.warn("Outbound DELETE pregovora {} nije uspelo: {}", foreignId, e.getMessage());
+            }
         }
         return mapNegotiationToDto(entity);
     }
@@ -288,8 +384,14 @@ public class InterbankOtcWrapperService {
         ensureMyParty(entity, userId, userRole);
 
         if (entity.getLocalPartyType() != InterbankPartyType.BUYER) {
+            // T2-G (Stage C UX polish, 2026-05-20): user-friendly poruka. Per
+            // inter-bank protokol §3.6, accept moze samo kupac — premium debit
+            // ide sa kupcevog racuna pa coordinator runs na buyer-strani.
+            // Prodavac u inter-bank pregovoru moze samo: kontra-ponudu (PUT)
+            // ili odbijanje (DELETE).
             throw new InterbankExceptions.InterbankProtocolException(
-                    "Acceptance se izvrsava na strani kupca; mi smo SELLER u ovom pregovoru");
+                    "Inter-bank ponudu prihvata kupac. Vi ste prodavac u ovom "
+                            + "pregovoru — mozete poslati kontra-ponudu ili odbiti ponudu.");
         }
 
         // Outbound GET .../accept — sinhrono ceka da prodavceva banka commit-uje 2PC.
