@@ -108,6 +108,9 @@ public class GlobalSecurityConfig  {
                                 "/actuator/prometheus"
                         ).permitAll()
                         .requestMatchers("/employees/**").hasAnyRole("ADMIN", "EMPLOYEE")
+                        // Self-lookup za klijenta — vraca svoj zapis po JWT email.
+                        // MORA biti PRE generic /clients/** matchera (longest-prefix wins).
+                        .requestMatchers(org.springframework.http.HttpMethod.GET, "/clients/me").authenticated()
                         .requestMatchers("/clients/**").hasAnyRole("ADMIN", "EMPLOYEE")
                         .requestMatchers(org.springframework.http.HttpMethod.PATCH, "/accounts/requests/*/approve").hasAnyRole("ADMIN", "EMPLOYEE")
                         .requestMatchers(org.springframework.http.HttpMethod.PATCH, "/accounts/requests/*/reject").hasAnyRole("ADMIN", "EMPLOYEE")

@@ -16,6 +16,7 @@ public interface ClientService {
         return getClients(page, limit, firstName, lastName, email, null);
     }
     ClientResponseDto getClientById(Long id);
+    ClientResponseDto getClientByEmail(String email);
     ClientResponseDto updateClient(Long id, UpdateClientRequestDto request);
 
     /**

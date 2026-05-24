@@ -91,6 +91,14 @@ public class ClientServiceImpl implements ClientService {
     }
 
     @Override
+    @Transactional(readOnly = true)
+    public ClientResponseDto getClientByEmail(String email) {
+        Client client = clientRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("Klijent sa email-om " + email + " nije pronadjen"));
+        return toResponse(client);
+    }
+
+    @Override
     @Transactional
     public ClientResponseDto updateClient(Long id, UpdateClientRequestDto request) {
         Client client = clientRepository.findById(id)

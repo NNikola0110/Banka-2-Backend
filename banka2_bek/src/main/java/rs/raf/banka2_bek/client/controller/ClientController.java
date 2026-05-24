@@ -46,6 +46,24 @@ public class ClientController {
         return ResponseEntity.ok(clientService.getClients(page, limit, firstName, lastName, email, search));
     }
 
+    /**
+     * Self-lookup za autentifikovanog klijenta. Vraca njegov vlastiti Client zapis
+     * po JWT principal email-u. CLIENT moze; ADMIN/EMPLOYEE ne mogu (oni
+     * koriste /clients ili /clients/{id}). Razlog: AuthContext na FE-u (CLIENT
+     * login flow) treba clientove numericki id (JWT nema id claim) — pre ovog
+     * endpoint-a FE je zvao /clients?email=, sto je trazio role ADMIN/EMPLOYEE
+     * (vidi GlobalSecurityConfig "/clients/**") pa klijent dobijao 403 i fallback
+     * userId=0 koji rusi OTC operacije.
+     */
+    @Operation(summary = "Self lookup za prijavljenog klijenta")
+    @GetMapping("/me")
+    public ResponseEntity<ClientResponseDto> getMyClient(java.security.Principal principal) {
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        return ResponseEntity.ok(clientService.getClientByEmail(principal.getName()));
+    }
+
     @Operation(summary = "Get client by ID")
     @GetMapping("/{id}")
     public ResponseEntity<ClientResponseDto> getClientById(@PathVariable Long id) {
