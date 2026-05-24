@@ -14,19 +14,21 @@ import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.web.client.DefaultResponseErrorHandler;
 import org.springframework.web.client.RestTemplate;
+import com.warrenstrange.googleauth.GoogleAuthenticator;
 import rs.raf.banka2_bek.IntegrationTestCleanup;
 import rs.raf.banka2_bek.TestObjectMapperConfig;
+import rs.raf.banka2_bek.auth.model.User;
+import rs.raf.banka2_bek.auth.repository.UserRepository;
 import rs.raf.banka2_bek.client.model.Client;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.employee.model.Employee;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
-import rs.raf.banka2_bek.otp.model.OtpVerification;
-import rs.raf.banka2_bek.otp.repository.OtpVerificationRepository;
+import rs.raf.banka2_bek.otp.model.TotpSecret;
+import rs.raf.banka2_bek.otp.repository.TotpSecretRepository;
 
 import javax.sql.DataSource;
 import java.io.IOException;
 import java.time.LocalDate;
-import java.time.LocalDateTime;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -52,9 +54,12 @@ class InternalUsersOtpControllerIntegrationTest {
 
     @Autowired private ClientRepository clientRepository;
     @Autowired private EmployeeRepository employeeRepository;
-    @Autowired private OtpVerificationRepository otpRepository;
+    @Autowired private UserRepository userRepository;
+    @Autowired private TotpSecretRepository totpSecretRepository;
     @Autowired private DataSource dataSource;
     @Autowired private ObjectMapper objectMapper;
+
+    private static final String TEST_SECRET = "JBSWY3DPEHPK3PXP";
 
     @BeforeEach
     void setUp() {
@@ -176,9 +181,13 @@ class InternalUsersOtpControllerIntegrationTest {
 
     @Test
     void otpVerify_correctCode_returnsVerified() throws Exception {
-        persistOtp("otp-ok@test.com", "123456");
+        // TOTP (RFC 6238) migration (B3 port): user + totp_secret must exist;
+        // server resolves email -> userId -> secret -> current 30s code.
+        Long userId = persistUserWithTotp("otp-ok@test.com", TEST_SECRET);
+        String currentCode = String.format("%06d",
+                new GoogleAuthenticator().getTotpPassword(TEST_SECRET));
 
-        String body = "{ \"email\": \"otp-ok@test.com\", \"code\": \"123456\" }";
+        String body = "{ \"email\": \"otp-ok@test.com\", \"code\": \"" + currentCode + "\" }";
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 url("/internal/otp/verify"),
                 new HttpEntity<>(body, jsonInternalHeaders()), String.class);
@@ -187,13 +196,14 @@ class InternalUsersOtpControllerIntegrationTest {
         JsonNode json = objectMapper.readTree(resp.getBody());
         assertThat(json.path("verified").asBoolean()).isTrue();
         assertThat(json.path("blocked").asBoolean()).isFalse();
+        assertThat(userId).isNotNull();
     }
 
     // ─── OTP verify: wrong code → verified false ─────────────────────────────
 
     @Test
     void otpVerify_wrongCode_returnsNotVerified() throws Exception {
-        persistOtp("otp-wrong@test.com", "654321");
+        persistUserWithTotp("otp-wrong@test.com", TEST_SECRET);
 
         String body = "{ \"email\": \"otp-wrong@test.com\", \"code\": \"000000\" }";
         ResponseEntity<String> resp = restTemplate.postForEntity(
@@ -271,11 +281,13 @@ class InternalUsersOtpControllerIntegrationTest {
                 .build());
     }
 
-    private void persistOtp(String email, String code) {
-        otpRepository.save(OtpVerification.builder()
-                .email(email)
-                .code(code)
-                .expiresAt(LocalDateTime.now().plusMinutes(5))
+    private Long persistUserWithTotp(String email, String secret) {
+        User user = userRepository.save(
+                new User("Internal", "OtpUser", email, "x", true, "CLIENT"));
+        totpSecretRepository.save(TotpSecret.builder()
+                .userId(user.getId())
+                .secret(secret)
                 .build());
+        return user.getId();
     }
 }
