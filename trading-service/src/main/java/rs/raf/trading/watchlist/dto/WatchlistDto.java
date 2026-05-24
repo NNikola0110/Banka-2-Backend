@@ -15,15 +15,29 @@ package rs.raf.trading.watchlist.dto;
 //
 // Lombok: @Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
 //
-// Konvencija: pratiti trgovinski paket `investmentfund` kao sablon (npr. FundDto).
+// Konvencija: pratiti paket `savings` kao sablon (npr. SavingsDepositDto).
 // Spec: Zadaci_Backend.pdf, zadatak B6.
 // ============================================================
 
-import lombok.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
 
-// Napomena: skeleton je prazan pa nosi samo @NoArgsConstructor. Pri dodavanju
-// polja vratiti @AllArgsConstructor i @Builder (videti Lombok napomenu u TODO-u).
-@Getter @Setter
+import java.time.LocalDateTime;
+
+@Getter
+@Setter
 @NoArgsConstructor
+@AllArgsConstructor
+@Builder
 public class WatchlistDto {
+
+    private Long id;
+    private Long ownerId;
+    private String ownerType;
+    private String name;
+    private int itemCount;
+    private LocalDateTime createdAt;
 }
