@@ -12,6 +12,7 @@ import rs.raf.banka2.contracts.internal.TransferFundsRequest;
 import rs.raf.trading.client.BankaCoreClient;
 import rs.raf.trading.client.BankaCoreClientException;
 import rs.raf.trading.common.UserRole;
+import rs.raf.trading.investmentfund.dto.FundDividendHistoryDto;
 import rs.raf.trading.investmentfund.model.ClientFundPosition;
 import rs.raf.trading.investmentfund.model.ClientFundTransaction;
 import rs.raf.trading.investmentfund.model.ClientFundTransactionStatus;
@@ -135,6 +136,56 @@ public class FundDividendService {
                 fundId,
                 ClientFundTransactionStatus.DIVIDEND_INFLOW
         );
+    }
+
+    /**
+     * Vraca istoriju svih dividendnih transakcija za zadati fond (B11).
+     *
+     * <p>Filtriramo sve {@link ClientFundTransaction} redove ciji status pripada
+     * dividendnom lifecyclu (INFLOW / REINVESTED / DISTRIBUTED). Ne ukljucujemo
+     * regularne invest/withdraw redove (status PENDING/COMPLETED/FAILED).</p>
+     *
+     * <p>Endpoint: {@code GET /funds/{fundId}/dividends}. Sortirano po
+     * {@code createdAt DESC} (najnovije prvo).</p>
+     */
+    @Transactional(readOnly = true)
+    public List<FundDividendHistoryDto> getFundDividendHistory(Long fundId) {
+        if (fundId == null) {
+            throw new IllegalArgumentException("Fund id je obavezan.");
+        }
+        // Garantujemo da fond postoji — vraca 404 ako ne (resolvuje GlobalExceptionHandler).
+        investmentFundRepository.findById(fundId)
+                .orElseThrow(() -> new EntityNotFoundException("Fond ne postoji: " + fundId));
+
+        return clientFundTransactionRepository.findByFundIdOrderByCreatedAtDesc(fundId).stream()
+                .filter(tx -> tx.getStatus() == ClientFundTransactionStatus.DIVIDEND_INFLOW
+                        || tx.getStatus() == ClientFundTransactionStatus.DIVIDEND_REINVESTED
+                        || tx.getStatus() == ClientFundTransactionStatus.DIVIDEND_DISTRIBUTED)
+                .map(this::toDividendHistoryDto)
+                .toList();
+    }
+
+    private FundDividendHistoryDto toDividendHistoryDto(ClientFundTransaction tx) {
+        Long listingId = extractListingId(tx);
+        String ticker = null;
+        if (listingId != null) {
+            ticker = listingRepository.findById(listingId)
+                    .map(Listing::getTicker)
+                    .orElse(null);
+        }
+        return FundDividendHistoryDto.builder()
+                .id(tx.getId())
+                .fundId(tx.getFundId())
+                .listingId(listingId)
+                .listingTicker(ticker)
+                .paymentDate(tx.getCreatedAt() != null ? tx.getCreatedAt().toLocalDate() : null)
+                .createdAt(tx.getCreatedAt())
+                .completedAt(tx.getCompletedAt())
+                .grossAmount(scale(tx.getAmountRsd()))
+                .status(tx.getStatus() != null ? tx.getStatus().name() : null)
+                .currency(RSD)
+                .note(tx.getFailureReason())
+                .build();
     }
 
     @Transactional

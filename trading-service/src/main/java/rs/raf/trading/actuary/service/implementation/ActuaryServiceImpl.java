@@ -33,20 +33,6 @@ import java.util.stream.Collectors;
  * NAPOMENA (mikroservisi): koristimo trading-service lokalni AuditLogService
  * (rs.raf.trading.audit.*) — duplicirano iz banka-core jer je audit cross-cutting
  * i svaki servis pise u svoju bazu po servisu (CLAUDE.md 19.05.2026 2e).
- *
- * TODO (legacy): pratiti pattern iz PR-a — stari komentari iz skeleton-a:
- *
- * Pri promeni limita agentu (updateLimit) i pri resetovanju iskoriscenog
- * limita (resetUsedLimit / ActuaryLimitResetScheduler) evidentirati akciju
- * u audit servis:
- *   - ko je pokrenuo akciju (korisnicko ime / email inicijatora iz SecurityContext-a)
- *   - kada se desilo (LocalDateTime.now())
- *   - stara vrednost limita / iskoriscenog limita pre izmene
- *   - nova vrednost limita / iskoriscenog limita posle izmene
- *
- * Primer poziva (pseudokod):
- *   auditService.log(AuditEvent.ACTUARY_LIMIT_CHANGED, actuaryId, oldLimit, newLimit, initiator);
- *   auditService.log(AuditEvent.ACTUARY_LIMIT_RESET, actuaryId, oldUsed, 0, "SCHEDULER");
  */
 
 /**

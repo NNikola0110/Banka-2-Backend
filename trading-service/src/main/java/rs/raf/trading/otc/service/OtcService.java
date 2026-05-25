@@ -83,24 +83,6 @@ import java.util.Optional;
  * deterministicki po (operacija, offer/contract id) — retry replay-uje umesto
  * da dvaput naplati.
  */
-/*
- * TODO [B4 + B10 - Notifikacije + istorija pregovora | Nosioci: Petar Poznanovic, Aja Timotic]
- *
- * [B4] Pozvati notifikacioni servis pri sledecim OTC dogadjajima:
- *   - counterOffer(): obavestiti drugu stranu da je stigla kontraponuda
- *       notificationService.notify(offer.getWaitingOnUserId(), NotifType.OTC_COUNTER, offer.getId());
- *   - acceptOffer(): obavestiti prodavca da je ponuda prihvacena i ugovor sklopljen
- *       notificationService.notify(contract.getSellerId(), NotifType.OTC_ACCEPTED, contract.getId());
- *   - declineOffer(): obavestiti drugu stranu da je ponuda odbijena
- *       notificationService.notify(otherPartyId, NotifType.OTC_DECLINED, offer.getId());
- *
- * [B10] Pri svakoj kontraponudi (counterOffer()) upisati zapis u istoriju
- * OTC pregovora kako bi se sacuvali stari i novi pregovaracki parametri:
- *   otcNegotiationHistoryService.record(offer, oldValues, newValues, initiatorId);
- * Klasa nosioc: OtcNegotiationHistoryService (vec postoji u ovom paketu).
- * Snimiti: stara kolicina, stara premija, stara strike cena, stari settlementDate,
- * nove vrednosti istih polja, ko je napravio izmenu i kada.
- */
 @Slf4j
 @Service
 public class OtcService {

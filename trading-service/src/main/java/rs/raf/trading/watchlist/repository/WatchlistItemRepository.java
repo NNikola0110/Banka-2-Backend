@@ -1,27 +1,5 @@
 package rs.raf.trading.watchlist.repository;
 
-// ============================================================
-// TODO [B6 - Watchlist | Nosilac: L. Draskovic]
-//
-// JPA repozitorijum za entitet WatchlistItem.
-//
-// IMPLEMENTIRATI (custom metode):
-//   - List<WatchlistItem> findByWatchlistIdOrderByAddedAtAsc(Long watchlistId)
-//       -- vraca sve stavke date liste sortirane po datumu dodavanja
-//   - Optional<WatchlistItem> findByWatchlistIdAndListingId(Long watchlistId, Long listingId)
-//       -- pronalazi konkretnu stavku po listi i listingu (koristi se pre brisanja)
-//   - void deleteByWatchlistIdAndListingId(Long watchlistId, Long listingId)
-//       -- brise stavku po listi i listingu; anotovati sa @Modifying + @Transactional
-//   - void deleteAllByWatchlistId(Long watchlistId)
-//       -- brise sve stavke liste (poziva se pre brisanja cele liste)
-//       anotovati sa @Modifying + @Transactional
-//   - boolean existsByWatchlistIdAndListingId(Long watchlistId, Long listingId)
-//       -- provera da li je hartija vec na listi pre dodavanja
-//
-// Konvencija: pratiti paket `savings` kao sablon.
-// Spec: Zadaci_Backend.pdf, zadatak B6.
-// ============================================================
-
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.transaction.annotation.Transactional;

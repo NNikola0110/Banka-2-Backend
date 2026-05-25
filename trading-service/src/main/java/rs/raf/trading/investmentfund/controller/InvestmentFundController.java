@@ -7,8 +7,10 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 import rs.raf.trading.common.UserContext;
+import rs.raf.trading.investmentfund.dto.FundDividendHistoryDto;
 import rs.raf.trading.investmentfund.dto.FundStatisticsDto;
 import rs.raf.trading.investmentfund.dto.InvestmentFundDtos.*;
+import rs.raf.trading.investmentfund.service.FundDividendService;
 import rs.raf.trading.investmentfund.service.FundStatisticsService;
 import rs.raf.trading.investmentfund.service.InvestmentFundService;
 import rs.raf.trading.security.TradingUserResolver;
@@ -23,6 +25,7 @@ public class InvestmentFundController {
 
     private final InvestmentFundService investmentFundService;
     private final FundStatisticsService fundStatisticsService;
+    private final FundDividendService fundDividendService;
     private final TradingUserResolver userResolver;
 
     @GetMapping
@@ -72,6 +75,16 @@ public class InvestmentFundController {
     @GetMapping("/{id}/statistics")
     public ResponseEntity<FundStatisticsDto> statistics(@PathVariable Long id) {
         return ResponseEntity.ok(fundStatisticsService.computeStatistics(id));
+    }
+
+    /**
+     * B11 — Istorija dividendi koje je primio fond (TODO_final C4 #14).
+     * Bez {@code @PreAuthorize}: pristup za sve authenticated korisnike, paritet sa
+     * Funds Discovery i {@link #statistics(Long)}.
+     */
+    @GetMapping("/{id}/dividends")
+    public ResponseEntity<List<FundDividendHistoryDto>> getFundDividendHistory(@PathVariable Long id) {
+        return ResponseEntity.ok(fundDividendService.getFundDividendHistory(id));
     }
 
     @PostMapping

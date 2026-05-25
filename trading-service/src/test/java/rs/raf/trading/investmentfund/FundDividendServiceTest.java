@@ -13,6 +13,7 @@ import rs.raf.banka2.contracts.internal.InternalAccountDto;
 import rs.raf.banka2.contracts.internal.TransferFundsRequest;
 import rs.raf.trading.client.BankaCoreClient;
 import rs.raf.trading.common.UserRole;
+import rs.raf.trading.investmentfund.dto.FundDividendHistoryDto;
 import rs.raf.trading.investmentfund.model.ClientFundPosition;
 import rs.raf.trading.investmentfund.model.ClientFundTransaction;
 import rs.raf.trading.investmentfund.model.ClientFundTransactionStatus;
@@ -440,6 +441,73 @@ class FundDividendServiceTest {
 
         verify(spyService).reinvestDividends(1L);
         verify(spyService).reinvestDividends(2L);
+    }
+
+    @Test
+    @DisplayName("getFundDividendHistory returns only dividend-lifecycle transactions sorted desc")
+    void getFundDividendHistory_returnsOnlyDividendStatuses() {
+        InvestmentFund fund = activeFund(1L, 100L);
+        ClientFundTransaction inflowTx = dividendTx(1L, 10L, "300.0000",
+                ClientFundTransactionStatus.DIVIDEND_INFLOW);
+        ClientFundTransaction reinvestedTx = dividendTx(1L, 11L, "200.0000",
+                ClientFundTransactionStatus.DIVIDEND_REINVESTED);
+        ClientFundTransaction distributedTx = dividendTx(1L, 12L, "150.0000",
+                ClientFundTransactionStatus.DIVIDEND_DISTRIBUTED);
+        // Regularan invest red — NE sme se pojaviti u rezultatu.
+        ClientFundTransaction investTx = dividendTx(1L, 13L, "999.0000",
+                ClientFundTransactionStatus.COMPLETED);
+
+        Listing listing10 = stockListing(10L, "AAPL", "150.0000");
+        Listing listing11 = stockListing(11L, "MSFT", "300.0000");
+        Listing listing12 = stockListing(12L, "GOOG", "120.0000");
+
+        when(investmentFundRepository.findById(1L)).thenReturn(Optional.of(fund));
+        when(clientFundTransactionRepository.findByFundIdOrderByCreatedAtDesc(1L))
+                .thenReturn(List.of(inflowTx, reinvestedTx, distributedTx, investTx));
+        when(listingRepository.findById(10L)).thenReturn(Optional.of(listing10));
+        when(listingRepository.findById(11L)).thenReturn(Optional.of(listing11));
+        when(listingRepository.findById(12L)).thenReturn(Optional.of(listing12));
+
+        List<FundDividendHistoryDto> result = service.getFundDividendHistory(1L);
+
+        assertEquals(3, result.size());
+        assertEquals("AAPL", result.get(0).getListingTicker());
+        assertEquals("DIVIDEND_INFLOW", result.get(0).getStatus());
+        assertEquals("RSD", result.get(0).getCurrency());
+        assertBigDecimalEquals("300.0000", result.get(0).getGrossAmount());
+
+        assertEquals("MSFT", result.get(1).getListingTicker());
+        assertEquals("DIVIDEND_REINVESTED", result.get(1).getStatus());
+
+        assertEquals("GOOG", result.get(2).getListingTicker());
+        assertEquals("DIVIDEND_DISTRIBUTED", result.get(2).getStatus());
+    }
+
+    @Test
+    @DisplayName("getFundDividendHistory throws EntityNotFoundException when fund does not exist")
+    void getFundDividendHistory_fundMissing_throws() {
+        when(investmentFundRepository.findById(999L)).thenReturn(Optional.empty());
+
+        assertThrows(
+                EntityNotFoundException.class,
+                () -> service.getFundDividendHistory(999L)
+        );
+
+        verifyNoInteractions(clientFundTransactionRepository);
+    }
+
+    @Test
+    @DisplayName("getFundDividendHistory returns empty list when fund has no dividend transactions")
+    void getFundDividendHistory_noDividendsReturnsEmpty() {
+        InvestmentFund fund = activeFund(1L, 100L);
+
+        when(investmentFundRepository.findById(1L)).thenReturn(Optional.of(fund));
+        when(clientFundTransactionRepository.findByFundIdOrderByCreatedAtDesc(1L))
+                .thenReturn(List.of());
+
+        List<FundDividendHistoryDto> result = service.getFundDividendHistory(1L);
+
+        assertTrue(result.isEmpty());
     }
 
     private InvestmentFund activeFund(Long fundId, Long accountId) {

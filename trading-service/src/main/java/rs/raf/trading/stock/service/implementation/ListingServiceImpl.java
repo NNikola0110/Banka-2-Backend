@@ -17,6 +17,7 @@ import rs.raf.banka2.contracts.internal.FxRateDto;
 import rs.raf.trading.berza.model.Exchange;
 import rs.raf.trading.berza.repository.ExchangeRepository;
 import rs.raf.trading.client.BankaCoreClient;
+import rs.raf.trading.pricealert.service.PriceAlertService;
 import rs.raf.trading.stock.dto.ListingDailyPriceDto;
 import rs.raf.trading.stock.dto.ListingDto;
 import rs.raf.trading.stock.mapper.ListingMapper;
@@ -45,26 +46,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 
-/*
- * TODO [B5 - Cenovni alarmi | Nosilac: Aleksa Vucinic]
- *
- * Pri svakom ciklusu osvezavanja cena (u scheduled metodi koja azurira
- * currentPrice svakog listinga — tipicno @Scheduled unutar ovog servisa
- * ili kroz pozivanje refreshPrices / simulateGbm) pozvati servis za
- * cenovne alarme kako bi se okinula obavestenja korisnicima:
- *
- *   priceAlertScheduler.checkAlerts();
- *   // ili direktno:
- *   priceAlertService.evaluateAlertsForListing(listing);
- *
- * Klase nosioci logike: PriceAlertScheduler i PriceAlertService
- * (paket rs.raf.trading.stock.pricealert ili rs.raf.trading.pricealert).
- *
- * Alarm se okida kada nova cena presece zadatu gornju ili donju granicu
- * (cenovni alarm koji je klijent postavio na berzi). Posle okidanja alarm
- * treba deaktivirati ili oznaciti kao okinut kako se ne bi okidao ponovo
- * pri svakom narednom osvezavanju.
- */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -77,6 +58,15 @@ public class ListingServiceImpl implements ListingService {
     private final BankaCoreClient bankaCoreClient;
     private final ExchangeRepository exchangeRepository;
     private final ObjectProvider<ListingPriceRecorder> priceRecorderProvider;
+    /**
+     * B5 — Price alert hook. ObjectProvider izbegava cirkularnu zavisnost u
+     * Spring DI grafu (PriceAlertService cita ListingRepository, sto je OK;
+     * lazy lookup garantuje da provajder bude potpuno inicijalizovan pre
+     * prvog poziva). Primarni mehanizam je {@code PriceAlertScheduler} koji
+     * radi na 60s, ali ovaj hook daje brzu reakciju cim se cena osvezi
+     * (15min cron) i ne zahteva polling kad nista nije promenjeno.
+     */
+    private final ObjectProvider<PriceAlertService> priceAlertServiceProvider;
 
     @Value("${stock.api.keys:demo}")
     private String stockApiKeys;
@@ -347,6 +337,24 @@ public class ListingServiceImpl implements ListingService {
         }
 
         listingRepository.saveAll(listings);
+
+        // B5 — Cenovni alarmi: posle osvezenja cena pozovi PriceAlertService
+        // da evaluira sve aktivne alarme za promenjene listinge. Best-effort —
+        // greska ne sme da prekine refresh-prices ciklus. PriceAlertScheduler
+        // u pozadini i dalje radi na 60s kao primarni mehanizam (ovde je hook
+        // za brzu reakciju cim se cena osvezi).
+        try {
+            PriceAlertService priceAlertService = priceAlertServiceProvider != null
+                    ? priceAlertServiceProvider.getIfAvailable() : null;
+            if (priceAlertService != null && !listings.isEmpty()) {
+                int triggered = priceAlertService.checkAlerts(listings);
+                if (triggered > 0) {
+                    log.info("B5 PriceAlert hook: triggered {} alerts after price refresh", triggered);
+                }
+            }
+        } catch (RuntimeException ex) {
+            log.warn("B5 PriceAlert evaluation hook pukao: {}", ex.getMessage());
+        }
     }
 
     /**

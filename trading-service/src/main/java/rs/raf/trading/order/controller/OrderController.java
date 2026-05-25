@@ -19,31 +19,6 @@ import rs.raf.trading.order.service.OrderService;
 import java.time.LocalDate;
 import java.util.Map;
 
-// TODO [B4 - Filteri istorije ordera + B7 audit | Nosioci: Petar Poznanovic, Stasa Draskovic]
-//
-// [B4 - Filteri istorije ordera | Petar Poznanovic]
-// Na ruti GET /orders/my dodati opcione query parametre za filtriranje istorije:
-//   - status    : npr. ?status=DONE,PENDING,DECLINED  (OrderStatus enum)
-//   - dateFrom  : npr. ?dateFrom=2026-01-01  (ISO 8601, LocalDate)
-//   - dateTo    : npr. ?dateTo=2026-05-31
-//   - assetType : npr. ?assetType=STOCK,FUTURE,FOREX  (tip hartije)
-// Primer signature metode:
-//   @GetMapping("/my")
-//   public Page<OrderDto> getMyOrders(
-//       @RequestParam(required = false) List<OrderStatus> status,
-//       @RequestParam(required = false) @DateTimeFormat(iso=ISO.DATE) LocalDate dateFrom,
-//       @RequestParam(required = false) @DateTimeFormat(iso=ISO.DATE) LocalDate dateTo,
-//       @RequestParam(required = false) String assetType,
-//       Pageable pageable) { ... }
-// OrderService i OrderRepository treba da podrze odgovarajucu Specification ili JPQL.
-//
-// [B7 - Audit hook | Stasa Draskovic]
-// Endpoint-i za odobravanje i odbijanje ordera treba da evidentiraju akciju u audit log:
-//   - PATCH /orders/{id}/approve -> posle poziva orderService.approveOrder(id):
-//       auditServis.logOrderOdobren(id, supervisorEmail, LocalDateTime.now());
-//   - PATCH /orders/{id}/decline -> posle poziva orderService.declineOrder(id, ...):
-//       auditServis.logOrderOdbijen(id, supervisorEmail, razlog, LocalDateTime.now());
-// Videti takodje OrderServiceImpl za audit hook na service nivou.
 /**
  * Controller za kreiranje i upravljanje orderima.
  * SecurityConfig je vec konfigurisan za ove rute.

@@ -15,20 +15,6 @@ import rs.raf.trading.tax.service.TaxService;
 
 import java.util.List;
 
-/*
- * TODO [B7 - Audit log | Nosilac: Stasa Draskovic]
- *
- * Pri rucnom pokretanju obracuna poreza (POST /tax/calculate, metoda
- * calculateTax()) evidentirati akciju u audit servis:
- *   - ko je pokrenuo obracun (email supervizora / admina iz SecurityContext-a)
- *   - kada se desilo (LocalDateTime.now())
- *   - broj korisnika za koje je obracun pokrenut (broj obradjenih TaxRecord redova)
- *   - napomena da je obracun pokrenut rucno (ne automatski CRON-om)
- *
- * Primer poziva (pseudokod):
- *   auditService.log(AuditEvent.TAX_CALCULATION_MANUAL_TRIGGERED,
- *       initiatorEmail, LocalDateTime.now(), "manual");
- */
 @RestController
 @RequestMapping("/tax")
 @RequiredArgsConstructor
