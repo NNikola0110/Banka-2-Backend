@@ -7,7 +7,9 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 import rs.raf.trading.common.UserContext;
+import rs.raf.trading.investmentfund.dto.FundStatisticsDto;
 import rs.raf.trading.investmentfund.dto.InvestmentFundDtos.*;
+import rs.raf.trading.investmentfund.service.FundStatisticsService;
 import rs.raf.trading.investmentfund.service.InvestmentFundService;
 import rs.raf.trading.security.TradingUserResolver;
 
@@ -20,6 +22,7 @@ import java.util.List;
 public class InvestmentFundController {
 
     private final InvestmentFundService investmentFundService;
+    private final FundStatisticsService fundStatisticsService;
     private final TradingUserResolver userResolver;
 
     @GetMapping
@@ -60,6 +63,15 @@ public class InvestmentFundController {
     public ResponseEntity<List<ClientFundTransactionDto>> transactions(@PathVariable Long id) {
         UserContext current = userResolver.resolveCurrent();
         return ResponseEntity.ok(investmentFundService.listTransactions(id, current.userId(), current.userRole()));
+    }
+
+    /**
+     * B12 — Statistika fondova (TODO_final C4 #15). Bez {@code @PreAuthorize}:
+     * statistike su javne (svi authenticated korisnici), paritet sa Funds Discovery.
+     */
+    @GetMapping("/{id}/statistics")
+    public ResponseEntity<FundStatisticsDto> statistics(@PathVariable Long id) {
+        return ResponseEntity.ok(fundStatisticsService.computeStatistics(id));
     }
 
     @PostMapping
