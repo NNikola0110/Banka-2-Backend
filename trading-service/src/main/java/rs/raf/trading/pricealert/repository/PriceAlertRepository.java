@@ -1,38 +1,50 @@
 package rs.raf.trading.pricealert.repository;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
 import rs.raf.trading.pricealert.model.PriceAlert;
+import rs.raf.trading.pricealert.model.PriceAlertCondition;
 
-// ============================================================
-// TODO [B5 - Cenovni alarmi (Price Alert) | Nosilac: Aleksa Vucinic]
-//
-// Spring Data JPA repozitorijum za entitet PriceAlert.
-//
-// IMPLEMENTIRATI (dodati custom query metode):
-//   - List<PriceAlert> findByOwnerIdAndOwnerTypeOrderByCreatedAtDesc(
-//         Long ownerId, String ownerType)
-//       Vraca sve alarme datog korisnika (klijenta ili zaposlenog)
-//       sortirane od najnovijeg. Koristiti za GET /price-alerts
-//       (lista sopstvenih alarma).
-//
-//   - List<PriceAlert> findByListingIdAndActiveTrue(Long listingId)
-//       Vraca sve aktivne alarme za konkretnu hartiju. Koristiti u
-//       PriceAlertService.checkAlerts(listingId, currentPrice) tokom
-//       ciklusa osvezavanja cena — metoda prolazi samo kroz aktivne
-//       alarme kako bi minimizirala rad nad ugaslim alarmima.
-//
-//   - Optional<PriceAlert> findByIdAndOwnerIdAndOwnerType(
-//         Long id, Long ownerId, String ownerType)
-//       Kombinovani lookup po id + vlasniku; koristi se u DELETE/GET
-//       radi provere vlasnistva bez dodatnog service-level poziva.
-//
-//   - void deleteByOwnerIdAndOwnerType(Long ownerId, String ownerType)
-//       Bulk brisanje svih alarma korisnika. Korisno pri brisanju
-//       naloga (GDPR cleanup), ali takodje moze biti izlozeno kao
-//       administratorska akcija.
-//
-// Konvencija: pratiti paket `savings` kao sablon.
-// Spec: Zadaci_Backend.pdf, zadatak B5.
-// ============================================================
+import java.util.List;
+import java.util.Optional;
+
+/**
+ * [B5 - Cenovni alarmi] Spring Data JPA repozitorijum za {@link PriceAlert}.
+ */
+@Repository
 public interface PriceAlertRepository extends JpaRepository<PriceAlert, Long> {
+
+    /**
+     * Vraca sve alarme datog korisnika sortirano od najnovijeg.
+     * Koristi se za {@code GET /price-alerts/my} (bez filtera).
+     */
+    List<PriceAlert> findByOwnerIdAndOwnerTypeOrderByCreatedAtDesc(Long ownerId, String ownerType);
+
+    /**
+     * Vraca alarme datog korisnika filtrirano po {@code active} flagu, sortirano DESC.
+     * Koristi se za {@code GET /price-alerts/my?active=true|false}.
+     */
+    List<PriceAlert> findByOwnerIdAndOwnerTypeAndActiveOrderByCreatedAtDesc(
+            Long ownerId, String ownerType, Boolean active);
+
+    /**
+     * Aktivan alarm istog korisnika za isti listing + isti smer. Sprecava duplikate
+     * (createAlert baca 400 ako vec postoji).
+     */
+    Optional<PriceAlert> findByOwnerIdAndOwnerTypeAndListingIdAndConditionAndActiveTrue(
+            Long ownerId, String ownerType, Long listingId, PriceAlertCondition condition);
+
+    /** Svi aktivni alarmi — koristi scheduler za scan. */
+    List<PriceAlert> findByActiveTrue();
+
+    /** Aktivni alarmi za konkretne listinge — koristi scheduler za batch evaluaciju. */
+    List<PriceAlert> findByActiveTrueAndListingIdIn(List<Long> listingIds);
+
+    /** Lookup po id-u uz ownership check (koristi se u DELETE flow-u). */
+    Optional<PriceAlert> findByIdAndOwnerIdAndOwnerType(Long id, Long ownerId, String ownerType);
+
+    /** Distinct listingId-evi sa aktivnim alarmima (efikasno scheduler scan). */
+    @Query("SELECT DISTINCT a.listingId FROM PriceAlert a WHERE a.active = true")
+    List<Long> findDistinctListingIdsByActiveTrue();
 }

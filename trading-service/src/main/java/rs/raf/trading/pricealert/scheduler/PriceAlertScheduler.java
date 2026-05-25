@@ -2,66 +2,67 @@ package rs.raf.trading.pricealert.scheduler;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import rs.raf.trading.pricealert.repository.PriceAlertRepository;
+import rs.raf.trading.pricealert.service.PriceAlertService;
+import rs.raf.trading.stock.model.Listing;
+import rs.raf.trading.stock.repository.ListingRepository;
 
-// ============================================================
-// TODO [B5 - Cenovni alarmi (Price Alert) | Nosilac: Aleksa Vucinic]
-//
-// Scheduled komponenta koja periodicno pokusava da obare alarme
-// cija cena je vec presla prag, ali koji nisu okidani u realnom
-// vremenu (npr. zbog pada servera, privremene nedostupnosti
-// Alpha Vantage-a, ili alarma postavljenih retroaktivno).
-//
-// Napomena (mikroservisi): ovaj paket zivi u `trading-service`. Trzisne cene
-// hartija (Listing) su LOKALNE — citaju se direktno iz ListingRepository, bez
-// HTTP poziva. @Scheduled je aktivan preko SchedulingConfig (property
-// trading.scheduling.enabled, default true; test profil ga gasi).
-//
-// IMPLEMENTIRATI:
-//
-// Zavisnosti (polja za injekciju):
-//   - PriceAlertRepository alertRepository
-//       Za dohvatanje aktivnih alarma koji jos nisu okidani.
-//   - PriceAlertService priceAlertService
-//       Za poziv checkAlerts(listingId, currentPrice) po listingu.
-//   - ListingRepository listingRepository (paket rs.raf.trading.stock.repository)
-//       Za dohvatanje trenutnih cena svih hartija na kojima postoje
-//       aktivni alarmi — LOKALNO u trading-service-u.
-//
-// Metoda koja SE MORA implementirati:
-//
-//   @Scheduled(fixedRate = 60_000)   // svakih 60 sekundi
-//   public void scanActiveAlerts()
-//       Tok:
-//         1. alertRepository.findDistinctListingIdsByActiveTrue()
-//            (ovu metodu takodje dodati u PriceAlertRepository —
-//            @Query("SELECT DISTINCT a.listingId FROM PriceAlert a
-//                    WHERE a.active = true"))
-//            -> List<Long> listingIds
-//         2. Za svaki listingId:
-//            a. Dohvatiti trenutnu cenu hartije iz listings tabele
-//               (listing.getCurrentPrice() ili ekvivalentno polje
-//               u projektu — proveriti sa koordinatorom koji paket
-//               cuva trzisnu cenu).
-//            b. Pozvati priceAlertService.checkAlerts(listingId, price).
-//            c. Uhvatiti svaki Exception po listingu (try/catch),
-//               logovati na WARN i nastaviti sa sledecim — greska
-//               jednog listinga ne sme da zaustavi ceo scan.
-//         3. log.info na kraju: "PriceAlertScheduler: scan zavrsen,
-//            {} listinga provereno" sa brojacem.
-//
-// Napomena: @Scheduled metoda namerno NIJE deklarisana u skeleton-u
-// (bila bi pokrenuta prazna i ne bi radila nista korisno). Koordinator
-// ce je dodati nakon implementacije service-a. @EnableScheduling je vec
-// aktivno u trading-service-u (rs.raf.trading.config.SchedulingConfig) —
-// NE dodavati duplikat. Metoda ne sme biti @Transactional direktno —
-// delegira transakcije na PriceAlertService.
-//
-// Konvencija: pratiti trgovinski scheduler `rs.raf.trading.order.scheduler.OrderScheduler` kao sablon.
-// Spec: Zadaci_Backend.pdf, zadatak B5.
-// ============================================================
+import java.util.List;
+
+/**
+ * [B5 - Cenovni alarmi] Periodicni scanner aktivnih alarma.
+ *
+ * <p>Svake minute (60s) cita sve aktivne alarme, povlaci svezu cenu njihovih
+ * listinga lokalno (Listing entitet) i pita {@code PriceAlertService.checkAlerts}
+ * da okine sve koji su ispunili uslov.
+ *
+ * <p>Aktivacija je gejtovana globalnim {@code trading.scheduling.enabled}
+ * property-jem (preko {@code SchedulingConfig}); test profil ga gasi pa
+ * scheduler ostaje inertan tokom unit/integration testova.
+ */
 @Component
 @RequiredArgsConstructor
 @Slf4j
 public class PriceAlertScheduler {
+
+    private final PriceAlertRepository alertRepository;
+    private final ListingRepository listingRepository;
+    private final PriceAlertService priceAlertService;
+
+    /**
+     * Skenira sve listing-e sa aktivnim alarmima i prosledjuje service-u na
+     * evaluaciju. Greske se logiraju ali ne propagiraju (scheduler mora da
+     * preživi privremene padove).
+     */
+    @Scheduled(fixedRate = 60_000L)
+    public void scanActiveAlerts() {
+        List<Long> listingIds;
+        try {
+            listingIds = alertRepository.findDistinctListingIdsByActiveTrue();
+        } catch (RuntimeException ex) {
+            log.warn("PriceAlertScheduler: dohvat aktivnih listing-ova pukla: {}", ex.getMessage());
+            return;
+        }
+
+        if (listingIds.isEmpty()) {
+            log.debug("PriceAlertScheduler: nema aktivnih alarma");
+            return;
+        }
+
+        try {
+            List<Listing> listings = listingRepository.findAllById(listingIds);
+            int triggered = priceAlertService.checkAlerts(listings);
+            if (triggered > 0) {
+                log.info("PriceAlertScheduler: scan zavrsen, {} alarm(a) okidano, {} listing-a provereno",
+                        triggered, listings.size());
+            } else {
+                log.debug("PriceAlertScheduler: scan zavrsen, 0 alarma okidano, {} listing-a provereno",
+                        listings.size());
+            }
+        } catch (RuntimeException ex) {
+            log.warn("PriceAlertScheduler: evaluacija pukla: {}", ex.getMessage());
+        }
+    }
 }
