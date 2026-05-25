@@ -290,26 +290,6 @@
                         <exclude>rs/raf/banka2_bek/**/mapper/**</exclude>
                         <!-- Arbitro AI asistent (Celina 6 internal, NIJE deo Celine 1-5 KT3 spec-a) -->
                         <exclude>rs/raf/banka2_bek/assistant/**</exclude>
-                        <!--
-                            Skeleton fajlovi sledeceg razvojnog ciklusa (zadaci B1-B12) — prazni
-                            stubovi sa TODO blokovima, JOS NISU implementirani. Iskljuceni iz
-                            coverage merenja dok se ne implementiraju. KAD zadatak bude gotov +
-                            ispraceni testovima, nosilac UKLANJA svoj exclude red odavde.
-                        -->
-                        <!-- B5/B6/B8/B9 skeleton paketi (pricealert/watchlist/
-                             recurringorder/dividend) su trgovinski — premesteni u
-                             trading-service (Faza 2e), pa vise nisu u monolitovom
-                             coverage scope-u. -->
-                        <exclude>rs/raf/banka2_bek/audit/**</exclude>
-                        <!-- B1 (in-app notifikacije) implementiran 19.05.2026; vise nije
-                             skeleton, pa je vracen u coverage scope. -->
-                        <exclude>rs/raf/banka2_bek/otp/model/TotpSecret*</exclude>
-                        <exclude>rs/raf/banka2_bek/otp/repository/TotpSecretRepository*</exclude>
-                        <exclude>rs/raf/banka2_bek/otp/service/TotpService*</exclude>
-                        <!-- B10/B11/B12 skeleton-i (OtcNegotiationHistory*, FundDividendService*,
-                             FundStatisticsService*) su uklonjeni iz ovog exclude liste —
-                             otc/investmentfund paketi su iseljeni u trading-service
-                             (pod-faza 2f cutover). -->
                     </excludes>
                 </configuration>
                 <executions>
@@ -355,25 +335,16 @@
                                     <limits>
                                         <limit>
                                             <!--
-                                                Prag 75% — spusten posle 18.05.2026 Faza 1
-                                                (mikroservisi): email masinerija
-                                                (MailNotificationService + HtmlMailSender + 6
-                                                email template-a) preseljena iz monolita u
-                                                notification-service modul. Brisanjem tog
-                                                dobro-pokrivenog koda BUNDLE LINE coverage
-                                                monolita pada sa ~0.76 na 0.7523 (6954/9244
-                                                pokrivenih linija) — ocekivano, jer se uklanja
-                                                kod ciji je coverage bio iznad proseka bundle-a;
-                                                coverage email koda sad zivi u notification-service
-                                                modulu (svoj JaCoCo). Raniji prag 0.76 je i sam
-                                                bio privremeno spusten (sa 0.77, Card kategorije
-                                                runda 14.05.2026).
-                                                TODO: vratiti postepeno na 0.77 → 0.80 → 0.84
-                                                dodavanjem testova za nepokrivene monolit-servise.
+                                                Prag 0.77. Trenutno coverage = 0.7949
+                                                (5242/6595 LINE) — sa marginom ~2.5%.
+                                                Posle TODO_final implementacije + cleanup runde
+                                                25.05.2026, uklonjeni svi skeleton excludes
+                                                (audit/**, otp/*) — paketi su sad puno implementirani
+                                                sa testovima. Sledeci ciljevi: 0.80 → 0.84.
                                             -->
                                             <counter>LINE</counter>
                                             <value>COVEREDRATIO</value>
-                                            <minimum>0.75</minimum>
+                                            <minimum>0.77</minimum>
                                         </limit>
                                     </limits>
                                 </rule>
