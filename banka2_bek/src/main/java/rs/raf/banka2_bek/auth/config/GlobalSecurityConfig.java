@@ -67,22 +67,6 @@ public class GlobalSecurityConfig  {
                         // originalna REQUEST dispatch je vec autorizovana, ASYNC je
                         // samo nastavak iste request-response transakcije.
                         .dispatcherTypeMatchers(jakarta.servlet.DispatcherType.ASYNC, jakarta.servlet.DispatcherType.ERROR).permitAll()
-                        // ============================================================
-                        // TODO [Razvojni ciklus - nove rute za bezbednosnu konfiguraciju]
-                        //
-                        // Pri implementaciji novih feature-a dodati requestMatchers za sledece rute
-                        // (pratiti postojeci obrazac u ovom fajlu — npr. /actuaries/** za role-based,
-                        // /otc/** za authenticated):
-                        //   - /audit/**                    -> ADMIN + SUPERVISOR samo         [B7 - Audit log]
-                        //   - /otc/negotiation-history/**  -> authenticated()                 [B10 - Istorija OTC pregovora]
-                        // Specificne rute moraju doci PRE generickih matcher-a.
-                        // Spec: Zadaci_Backend.pdf.
-                        //
-                        // Napomena: zadaci B5 (Price Alert), B6 (Watchlist), B8 (Trajni nalozi)
-                        // i B9 (Dividende) su trgovinski — njihovi skeleton paketi su premesteni
-                        // u `trading-service` (Faza 2e); rute /price-alerts, /watchlists,
-                        // /recurring-orders, /dividends konfigurisu se u TradingSecurityConfig.
-                        // ============================================================
                         // [B1] In-app notifications: svi autentifikovani korisnici (klijenti +
                         // zaposleni) mogu citati, oznacavati kao procitano i listati svoje
                         // notifikacije. Vlasnistvo se proverava na service sloju.

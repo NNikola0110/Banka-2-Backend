@@ -11,27 +11,6 @@ import lombok.Getter;
  * The {@code notification-service} consumer routes it through the branded generic
  * in-app email template. Once B4 adds type-based dispatch in {@code notification-service},
  * each type can render its own template.
- *
- * <p>Task ownership — which task wires {@code notify()} calls that produce each type:
- * <ul>
- *   <li>[B2 — Andjela Vilcek] {@code ACCOUNT_LOCKED} — fired from
- *       {@code AccountLockoutService} after 5 failed login attempts.</li>
- *   <li>[B4 — Petar Poznanovic] {@code PAYMENT}, {@code TRANSFER},
- *       {@code LIMIT_CHANGE}, {@code CARD_BLOCKED}, {@code CARD_UNBLOCKED},
- *       {@code LOAN_CREATED}, {@code LOAN_APPROVED}, {@code LOAN_REJECTED},
- *       {@code ORDER_PENDING}, {@code ORDER_APPROVED}, {@code ORDER_DECLINED},
- *       {@code ORDER_EXECUTED}, {@code ORDER_PARTIAL_FILL}, {@code ORDER_CANCELLED},
- *       {@code OTC_COUNTER_OFFER}, {@code OTC_ACCEPTED}, {@code OTC_DECLINED},
- *       {@code OTC_CONTRACT_EXPIRING} — wired into payment, transfers, card,
- *       loan, order and otc modules.</li>
- *   <li>[B5 — Aleksa Vucinic] TODO: add {@code PRICE_ALERT(false)} — fired by the
- *       price-check scheduler when a threshold is crossed. In-app only, no email.</li>
- *   <li>[B8 — Nikola Djurovic] TODO: add {@code RECURRING_ORDER_SKIPPED(false)} —
- *       fired by {@code RecurringOrderScheduler} when an order is skipped due to
- *       insufficient funds. In-app only, no email.</li>
- *   <li>[B1] {@code GENERAL} — fallback for ad-hoc notifications without a
- *       dedicated type.</li>
- * </ul>
  */
 @Getter
 public enum NotificationType {
@@ -63,7 +42,9 @@ public enum NotificationType {
     // [B2 — Andjela] Account security events
     ACCOUNT_LOCKED(true),
 
-    // [B5 — Aleksa] TODO: PRICE_ALERT(false)
+    // [B5 — Aleksa Vucinic] Price alert triggered by scheduler when threshold crossed.
+    PRICE_ALERT_TRIGGERED(true),
+
     // [B8 — Nikola Djurovic] Recurring order events
     RECURRING_ORDER_SKIPPED(false),
 

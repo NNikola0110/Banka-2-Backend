@@ -52,16 +52,6 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 
-// TODO [B4 - Okidaci notifikacija | Nosilac: Petar Poznanovic]
-// Nakon sto je placanje uspesno (status COMPLETED), pozvati notifikacioni servis
-// da posaljeIn-app i email notifikaciju posiljaocu i primaocu.
-// Primer tacaka integracije:
-//   - createPayment() -> posle konacnog payment.setStatus(COMPLETED) i save:
-//       notifikacioniServis.posaljiUspesnoPlacanjeNotifikaciju(payment);
-//   - recordAbortedPayment() -> posle save:
-//       notifikacioniServis.posaljiOdbijenuTransakcijuNotifikaciju(payment);
-//   - Ako se u buducnosti doda promena limita (dailyLimit / monthlyLimit), takodje
-//     obavestiti korisnika: notifikacioniServis.posaljiPromenuLimitaNotifikaciju(account);
 @lombok.extern.slf4j.Slf4j
 @Service
 public class PaymentServiceImpl implements PaymentService {

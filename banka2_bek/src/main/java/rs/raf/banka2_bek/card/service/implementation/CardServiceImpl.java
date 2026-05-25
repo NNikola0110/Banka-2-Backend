@@ -30,14 +30,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
-// TODO [B4 - Okidaci notifikacija | Nosilac: Petar Poznanovic]
-// Pri promeni statusa kartice, pozvati notifikacioni servis da obavesti korisnika.
-// Primer tacaka integracije:
-//   - blockCard() -> posle card.setStatus(BLOCKED) i save:
-//       mailNotificationService.sendCardBlockedEmail(card.getOwner().getEmail(), card.getCardNumber());
-//   - unblockCard() -> posle card.setStatus(ACTIVE) i save:
-//       mailNotificationService.sendCardUnblockedEmail(card.getOwner().getEmail(), card.getCardNumber());
-// Razmotriti i In-app notifikaciju (push ili WebSocket) pored email-a.
 @Slf4j
 @Service
 @RequiredArgsConstructor

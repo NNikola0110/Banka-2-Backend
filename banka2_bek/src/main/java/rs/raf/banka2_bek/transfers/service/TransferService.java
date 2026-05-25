@@ -28,14 +28,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
-// TODO [B4 - Okidaci notifikacija | Nosilac: Petar Poznanovic]
-// Nakon sto je transfer uspesno izvrsen, pozvati notifikacioni servis
-// da posaljeIn-app i email notifikaciju korisniku.
-// Primer tacaka integracije:
-//   - executeInternalTransfer() -> posle konacnog transfer.setStatus(COMPLETED) i save:
-//       notifikacioniServis.posaljiUspesanTransferNotifikaciju(transfer);
-//   - executeFxTransfer() -> analogno posle FX konverzije i save.
-// Notifikacioni servis treba da bude injektovan kao zavisnost (@Autowired ili konstruktor).
 @Slf4j
 @Service
 public class TransferService {

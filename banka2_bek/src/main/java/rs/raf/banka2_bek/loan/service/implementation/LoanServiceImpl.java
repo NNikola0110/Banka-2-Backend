@@ -30,17 +30,6 @@ import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
-// TODO [B4 - Okidaci notifikacija | Nosilac: Petar Poznanovic]
-// Nakon kreiranja kreditnog zahteva i nakon odobravanja/odbijanja kredita,
-// pozvati notifikacioni servis da obavesti klijenta.
-// Primer tacaka integracije:
-//   - createLoanRequest() -> posle save novog LoanRequest:
-//       mailNotificationService.sendLoanRequestReceivedEmail(client.getEmail(), loanRequest.getId());
-//   - approveLoan() -> posle loan.setStatus(ACTIVE) i save:
-//       mailNotificationService.sendLoanApprovedEmail(client.getEmail(), loan.getLoanAmount(), loan.getCurrency());
-//   - rejectLoan() -> posle loanRequest.setStatus(REJECTED) i save:
-//       mailNotificationService.sendLoanRejectedEmail(client.getEmail(), loanRequest.getId());
-// Notifikacioni servis (mailNotificationService) je vec injektovan u ovoj klasi.
 @Slf4j
 @Service
 public class LoanServiceImpl implements LoanService {

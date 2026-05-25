@@ -29,21 +29,6 @@ import java.util.UUID;
  * Implementation of {@link EmployeeService}.
  * Authors: Aleksa Vucinic (avucinic6020rn@raf.rs), Petar Poznanovic (ppoznanovic4917rn@raf.rs)
  */
-/*
- * TODO [B7 - Audit log | Nosilac: Stasa Draskovic]
- *
- * Pri izmeni permisija zaposlenom (updateEmployee kada se menjaju polja
- * permissions / role / isActive) evidentirati akciju u audit servis:
- *   - ko je pokrenuo izmenu (email admina iz SecurityContext-a)
- *   - kada se desilo (LocalDateTime.now())
- *   - stare permisije / uloga pre izmene
- *   - nove permisije / uloga posle izmene
- *   - ID i email zaposlenog kome su izmenjene permisije
- *
- * Primer poziva (pseudokod):
- *   auditService.log(AuditEvent.EMPLOYEE_PERMISSIONS_CHANGED, employee.getId(),
- *       oldPermissions, newPermissions, initiatorEmail);
- */
 @Service
 @RequiredArgsConstructor
 public class EmployeeServiceImpl implements EmployeeService {
