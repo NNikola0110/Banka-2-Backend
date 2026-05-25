@@ -22,7 +22,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * B12 — Statistika investicionih fondova (TODO_final C4 #15).
+ * B12 — Statistika investicionih fondova (spec Celina 4).
  *
  * <p>Iz dnevnih snapshot-ova fonda ({@link FundValueSnapshot}) racuna 4
  * standardne metrike performansi:</p>

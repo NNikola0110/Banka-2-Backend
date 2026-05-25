@@ -19,8 +19,8 @@ import java.math.BigDecimal;
  * i klijent treba da prikaze "premalo podataka" poruku.</p>
  *
  * <p>Sve procentualne vrednosti su izrazene kao "celi procenat" (npr. {@code 12.5}
- * znaci 12.5%) zaokruzeno na 4 decimale (HALF_UP). Spec: TODO_final C4 #15,
- * Zadaci_Backend.pdf B12.</p>
+ * znaci 12.5%) zaokruzeno na 4 decimale (HALF_UP). Spec: Celina 4 —
+ * statistika fondova; Zadaci_Backend.pdf B12.</p>
  */
 @Getter
 @Setter

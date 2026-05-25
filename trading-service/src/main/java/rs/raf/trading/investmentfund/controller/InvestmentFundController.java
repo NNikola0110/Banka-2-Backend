@@ -69,7 +69,7 @@ public class InvestmentFundController {
     }
 
     /**
-     * B12 — Statistika fondova (TODO_final C4 #15). Bez {@code @PreAuthorize}:
+     * B12 — Statistika fondova (spec Celina 4). Bez {@code @PreAuthorize}:
      * statistike su javne (svi authenticated korisnici), paritet sa Funds Discovery.
      */
     @GetMapping("/{id}/statistics")
@@ -78,7 +78,7 @@ public class InvestmentFundController {
     }
 
     /**
-     * B11 — Istorija dividendi koje je primio fond (TODO_final C4 #14).
+     * B11 — Istorija dividendi koje je primio fond (spec Celina 4).
      * Bez {@code @PreAuthorize}: pristup za sve authenticated korisnike, paritet sa
      * Funds Discovery i {@link #statistics(Long)}.
      */

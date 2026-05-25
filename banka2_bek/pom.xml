@@ -337,7 +337,7 @@
                                             <!--
                                                 Prag 0.77. Trenutno coverage = 0.7949
                                                 (5242/6595 LINE) — sa marginom ~2.5%.
-                                                Posle TODO_final implementacije + cleanup runde
+                                                Posle implementacije razvojnog ciklusa + cleanup runde
                                                 25.05.2026, uklonjeni svi skeleton excludes
                                                 (audit/**, otp/*) — paketi su sad puno implementirani
                                                 sa testovima. Sledeci ciljevi: 0.80 → 0.84.

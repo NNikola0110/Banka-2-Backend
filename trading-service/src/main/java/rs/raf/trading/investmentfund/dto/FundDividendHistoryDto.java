@@ -17,7 +17,7 @@ import java.time.LocalDateTime;
  * sumu primljenih dividendi po listingu, eventualno reinvestiranih iznosa
  * i raspodelu klijentima. Iznos je u RSD (banka-core fund racun je uvek RSD).</p>
  *
- * <p>Spec: TODO_final C4 #14, Zadaci_Backend.pdf B11.</p>
+ * <p>Spec: Celina 4 — raspodela dividendi u fondovima; Zadaci_Backend.pdf B11.</p>
  */
 @Getter
 @Setter

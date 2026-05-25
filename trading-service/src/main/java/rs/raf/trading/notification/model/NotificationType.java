@@ -23,7 +23,7 @@ import lombok.Getter;
 @Getter
 public enum NotificationType {
 
-    // Order lifecycle events — TODO_final C3 #5 trazi email obavestenja
+    // Order lifecycle events — spec Celina 3 trazi email obavestenja
     ORDER_PENDING(true, true),
     ORDER_APPROVED(true, true),
     ORDER_DECLINED(true, true),
@@ -31,7 +31,7 @@ public enum NotificationType {
     ORDER_PARTIAL_FILL(true, true),
     ORDER_CANCELLED(true, true),
 
-    // OTC events — TODO_final C4 #12 trazi email obavestenja
+    // OTC events — spec Celina 4 trazi email obavestenja
     OTC_COUNTER_OFFER(true, true),
     OTC_ACCEPTED(true, true),
     OTC_DECLINED(true, true),
@@ -40,7 +40,7 @@ public enum NotificationType {
     // [B8 — Nikola Djurovic] Recurring order events
     RECURRING_ORDER_SKIPPED(true, true),
 
-    // [B5 — Aleksa Vucinic] Price Alert okidan — TODO_final C3 #6 trazi email obavestenje
+    // [B5 — Aleksa Vucinic] Price Alert okidan — spec Celina 3 trazi email obavestenje
     PRICE_ALERT_TRIGGERED(true, true),
 
     // Fallback — interni, ne salje email niti in-app (debug/sysadmin)

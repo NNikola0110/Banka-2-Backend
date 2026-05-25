@@ -8,7 +8,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Unit testovi za {@link NotificationType#isSendsEmail()} flag-ove.
  *
- * <p>TODO_final C3 #5 (order lifecycle) i C4 #12 (OTC) eksplicitno trazi da
+ * <p>Spec Celina 3 (order lifecycle) i Celina 4 (OTC) eksplicitno trazi da
  * korisnik dobija email obavestenja. Posto trading-service nema lokalni
  * in-app store (publishuje na RabbitMQ kao IN_APP_GENERIC), {@code sendsEmail}
  * mora biti {@code true} za trgovinske evente da email notifikacije ne bi
@@ -18,7 +18,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class NotificationTypeFlagsTest {
 
     @Test
-    @DisplayName("ORDER_* lifecycle events salju email (TODO_final C3 #5)")
+    @DisplayName("ORDER_* lifecycle events salju email (Celina 3)")
     void orderLifecycleEvents_sendEmail() {
         assertThat(NotificationType.ORDER_PENDING.isSendsEmail()).isTrue();
         assertThat(NotificationType.ORDER_APPROVED.isSendsEmail()).isTrue();
@@ -29,7 +29,7 @@ class NotificationTypeFlagsTest {
     }
 
     @Test
-    @DisplayName("OTC_* events salju email (TODO_final C4 #12)")
+    @DisplayName("OTC_* events salju email (Celina 4)")
     void otcEvents_sendEmail() {
         assertThat(NotificationType.OTC_COUNTER_OFFER.isSendsEmail()).isTrue();
         assertThat(NotificationType.OTC_ACCEPTED.isSendsEmail()).isTrue();
