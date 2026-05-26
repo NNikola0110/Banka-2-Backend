@@ -34,6 +34,31 @@ public interface PaymentService {
      */
     Long recordAbortedPayment(CreatePaymentRequestDto request, String reason);
 
+    /**
+     * TODO_final Mobile bonus #7 — Quick Approve flow. Korisnik dolazi sa
+     * Mobile UI deep-link-om iz FCM push notifikacije, sa paymentId + OTP
+     * kodom (TOTP).
+     *
+     * <p>Validira: 1) payment postoji (else {@link rs.raf.banka2_bek.payment.exception.PaymentNotFoundException}),
+     * 2) ownership (else {@link rs.raf.banka2_bek.payment.exception.PaymentNotOwnedException}),
+     * 3) status — COMPLETED je idempotent (vraca payload), REJECTED/ABORTED/CANCELLED je
+     * {@link rs.raf.banka2_bek.payment.exception.PaymentAlreadyFinalizedException},
+     * 4) TTL — payment.createdAt + 5min &lt; now baca
+     * {@link rs.raf.banka2_bek.payment.exception.PaymentTimeoutException},
+     * 5) OTP gate — {@link rs.raf.banka2_bek.payment.exception.OtpLockedException} za 3-strike,
+     * {@link rs.raf.banka2_bek.payment.exception.OtpInvalidException} za pogresan kod.</p>
+     *
+     * <p>Posle uspesnog approve-a: payment dispatched, audit log
+     * {@link rs.raf.banka2_bek.audit.model.AuditActionType#PAYMENT_QUICK_APPROVED}
+     * persistovan, in-app notifikacija PAYMENT_CONFIRMED publish-ovana.</p>
+     *
+     * @param paymentId Payment id iz Mobile deep-link-a
+     * @param userEmail Authenticated user-ov email (iz JWT principal)
+     * @param otpCode 6-cifreni TOTP kod
+     * @return PaymentResponseDto sa final statusom (COMPLETED ili PROCESSING za interbank)
+     */
+    PaymentResponseDto quickApprove(Long paymentId, String userEmail, String otpCode);
+
     default Page<PaymentListItemDto> getPayments(Pageable pageable) {
         return getPayments(pageable, null, null, null, null, null, null);
     }

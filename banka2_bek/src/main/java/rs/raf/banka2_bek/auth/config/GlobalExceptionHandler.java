@@ -10,6 +10,12 @@ import rs.raf.banka2_bek.auth.dto.MessageResponseDto;
 import rs.raf.banka2_bek.auth.exception.AuthenticationFailedException;
 import rs.raf.banka2_bek.auth.service.AccountLockoutService;
 import rs.raf.banka2_bek.interbank.exception.InterbankExceptions;
+import rs.raf.banka2_bek.payment.exception.OtpInvalidException;
+import rs.raf.banka2_bek.payment.exception.OtpLockedException;
+import rs.raf.banka2_bek.payment.exception.PaymentAlreadyFinalizedException;
+import rs.raf.banka2_bek.payment.exception.PaymentNotFoundException;
+import rs.raf.banka2_bek.payment.exception.PaymentNotOwnedException;
+import rs.raf.banka2_bek.payment.exception.PaymentTimeoutException;
 import org.springframework.security.access.AccessDeniedException;
 
 @RestControllerAdvice
@@ -188,6 +194,58 @@ public class GlobalExceptionHandler {
             InterbankExceptions.InterbankAuthException ex) {
         return ResponseEntity
                 .status(HttpStatus.BAD_GATEWAY)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    // ===== TODO_final Mobile bonus #7 — Quick Approve exception mappinzi =====
+    // Mora biti pre handleRuntimeException jer sve nase Quick Approve exception-e
+    // extend-uju RuntimeException — Spring bira najspecifičniji handler.
+
+    /** Quick Approve — payment id ne postoji u DB. */
+    @ExceptionHandler(PaymentNotFoundException.class)
+    public ResponseEntity<MessageResponseDto> handlePaymentNotFound(PaymentNotFoundException ex) {
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /** Quick Approve — payment.fromAccount ne pripada current user-u. */
+    @ExceptionHandler(PaymentNotOwnedException.class)
+    public ResponseEntity<MessageResponseDto> handlePaymentNotOwned(PaymentNotOwnedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.FORBIDDEN)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /** Quick Approve — payment status u finalized failure stanju (REJECTED/ABORTED/CANCELLED). */
+    @ExceptionHandler(PaymentAlreadyFinalizedException.class)
+    public ResponseEntity<MessageResponseDto> handlePaymentAlreadyFinalized(PaymentAlreadyFinalizedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /** Quick Approve — deep-link istekao (payment.createdAt + 5min &lt; now). */
+    @ExceptionHandler(PaymentTimeoutException.class)
+    public ResponseEntity<MessageResponseDto> handlePaymentTimeout(PaymentTimeoutException ex) {
+        return ResponseEntity
+                .status(HttpStatus.GONE)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /** Quick Approve — OTP code nije validan (ali jos uvek ima pokusaja). */
+    @ExceptionHandler(OtpInvalidException.class)
+    public ResponseEntity<MessageResponseDto> handleOtpInvalid(OtpInvalidException ex) {
+        return ResponseEntity
+                .status(HttpStatus.UNAUTHORIZED)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /** Quick Approve — OTP zakljucan zbog 3 uzastopna fail-a (Caffeine 5min window). */
+    @ExceptionHandler(OtpLockedException.class)
+    public ResponseEntity<MessageResponseDto> handleOtpLocked(OtpLockedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.LOCKED)
                 .body(new MessageResponseDto(ex.getMessage()));
     }
 

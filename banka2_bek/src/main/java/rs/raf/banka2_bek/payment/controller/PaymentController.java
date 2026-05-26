@@ -20,6 +20,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import rs.raf.banka2_bek.otp.service.OtpService;
+import rs.raf.banka2_bek.payment.dto.ApprovePaymentRequest;
 import rs.raf.banka2_bek.payment.dto.CreatePaymentRequestDto;
 import rs.raf.banka2_bek.payment.dto.PaymentListItemDto;
 import rs.raf.banka2_bek.payment.dto.PaymentResponseDto;
@@ -232,5 +233,43 @@ public class PaymentController {
         }
         String code = String.valueOf(request.getOrDefault("code", ""));
         return ResponseEntity.ok(otpService.verify(email, code));
+    }
+
+    /**
+     * TODO_final Mobile bonus #7 — Quick Approve flow. Korisnik dolazi sa
+     * Mobile UI deep-link-om iz FCM push notifikacije (notifikacija sadrzi
+     * paymentId + 5-min countdown timestamp), unosi TOTP kod u in-app modal
+     * i POST-uje ovde.
+     *
+     * <p>Service ({@link PaymentService#quickApprove}) baca specifične
+     * exception-e koje GlobalExceptionHandler mapira u HTTP statuse:
+     * 404 (not found), 403 (not owner), 409 (already finalized — REJECTED/ABORTED),
+     * 410 (TTL > 5min), 401 (wrong OTP), 423 (OTP locked 3-strike).
+     * COMPLETED status je idempotent (200 OK + payload, bez novog dispatch-a).</p>
+     */
+    @Operation(summary = "Quick Approve payment",
+            description = "Mobile Quick Approve flow — odobrava PENDING payment preko deep-link-a iz FCM notifikacije. Sa OTP-om validnim 5 minuta od kreiranja payment-a. Idempotent za retry posle network failure.")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Payment approved (or idempotent retry na COMPLETED)",
+                    content = @Content(schema = @Schema(implementation = PaymentResponseDto.class))),
+            @ApiResponse(responseCode = "400", description = "Invalid OTP format (must be 6 digits)"),
+            @ApiResponse(responseCode = "401", description = "Unauthorized (no auth) or wrong OTP"),
+            @ApiResponse(responseCode = "403", description = "Payment ne pripada korisniku"),
+            @ApiResponse(responseCode = "404", description = "Payment id ne postoji"),
+            @ApiResponse(responseCode = "409", description = "Payment je vec u finalized failure stanju (REJECTED/ABORTED/CANCELLED)"),
+            @ApiResponse(responseCode = "410", description = "Quick Approve deep-link expired (>5min od kreiranja payment-a)"),
+            @ApiResponse(responseCode = "423", description = "OTP zakljucan zbog 3 uzastopna fail-a (5min window)")
+    })
+    @PostMapping("/{id}/approve")
+    public ResponseEntity<PaymentResponseDto> approveQuick(
+            @Parameter(description = "Payment ID iz deep-link-a") @PathVariable Long id,
+            @Valid @RequestBody ApprovePaymentRequest request,
+            org.springframework.security.core.Authentication auth) {
+        String email = auth != null ? auth.getName() : null;
+        if (email == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+        PaymentResponseDto response = paymentService.quickApprove(id, email, request.getOtpCode());
+        return ResponseEntity.ok(response);
     }
 }

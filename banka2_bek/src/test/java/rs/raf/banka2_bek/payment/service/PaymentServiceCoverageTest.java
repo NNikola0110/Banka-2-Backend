@@ -55,6 +55,7 @@ class PaymentServiceCoverageTest {
             @Override public byte[] getPaymentReceipt(Long paymentId) { return new byte[0]; }
             @Override public void validatePayment(CreatePaymentRequestDto request) { /* no-op for coverage */ }
             @Override public Long recordAbortedPayment(CreatePaymentRequestDto request, String reason) { return null; }
+            @Override public PaymentResponseDto quickApprove(Long paymentId, String userEmail, String otpCode) { return null; }
             @Override public Page<TransactionListItemDto> getPaymentHistory(Pageable pageable,
                                                                             LocalDateTime fromDate,
                                                                             LocalDateTime toDate,
@@ -88,6 +89,7 @@ class PaymentServiceCoverageTest {
             @Override public byte[] getPaymentReceipt(Long paymentId) { return new byte[0]; }
             @Override public void validatePayment(CreatePaymentRequestDto request) { /* no-op for coverage */ }
             @Override public Long recordAbortedPayment(CreatePaymentRequestDto request, String reason) { return null; }
+            @Override public PaymentResponseDto quickApprove(Long paymentId, String userEmail, String otpCode) { return null; }
             @Override public Page<TransactionListItemDto> getPaymentHistory(Pageable pageable,
                                                                             LocalDateTime fromDate,
                                                                             LocalDateTime toDate,

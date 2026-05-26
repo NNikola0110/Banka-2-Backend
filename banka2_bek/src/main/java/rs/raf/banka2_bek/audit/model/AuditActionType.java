@@ -18,6 +18,7 @@ public enum AuditActionType {
     // Payments
     PAYMENT_CREATED,
     PAYMENT_ABORTED,    // posle 3 neuspela OTP pokusaja
+    PAYMENT_QUICK_APPROVED,   // TODO_final Mobile bonus #7 — Quick Approve flow uspesan
 
     // Transfers
     TRANSFER_INTERNAL,
