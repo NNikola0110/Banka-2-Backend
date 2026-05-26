@@ -179,10 +179,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Dockerfile multi-stage build (banka2_bek/Dockerfile) referencira
+      # banka2-contracts/pom.xml + root pom.xml — sibling module-i moraju biti
+      # dostupni u kontekstu. Zato context = '.' (root reactor-a), ne './banka2_bek'.
       - name: Build Docker image (no push)
         uses: docker/build-push-action@v6
         with:
-          context: ./banka2_bek
+          context: .
           file: ./banka2_bek/Dockerfile
           push: false
           tags: banka2-bek:ci-test

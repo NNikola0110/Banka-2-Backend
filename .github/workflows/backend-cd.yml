@@ -47,10 +47,13 @@ jobs:
         id: string
         run: echo "lowercase=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
+      # Dockerfile multi-stage build (banka2_bek/Dockerfile) referencira
+      # banka2-contracts/pom.xml + root pom.xml — sibling module-i moraju biti
+      # dostupni u kontekstu. Zato context = '.' (root reactor-a), ne './banka2_bek'.
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./banka2_bek
+          context: .
           file: ./banka2_bek/Dockerfile
           push: true
           tags: |
