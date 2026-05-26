@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-router
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: alert-router
+    app.kubernetes.io/component: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alert-router
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alert-router
+        app.kubernetes.io/component: monitoring
+    spec:
+      containers:
+        - name: alert-router
+          image: ghcr.io/raf-si-2025/banka-2-alert-router:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8093
+              name: http
+          env:
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: discord-webhook
+                  key: DISCORD_WEBHOOK_URL
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8093
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8093
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

@@ -1,0 +1,17 @@
+# =========================================================================
+# Discord webhook URL za alert-router-service (Prometheus -> AlertManager
+# -> alert-router HTTP -> Discord webhook chain).
+# Dobija se iz Discord server settings → Integrations → Webhooks.
+# Kreiraj sa:
+#   kubectl create secret generic discord-webhook \
+#     --from-literal=DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/XXX/YYY" \
+#     -n banka2-tim2
+# =========================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: discord-webhook
+  namespace: banka2-tim2
+type: Opaque
+stringData:
+  DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/REPLACE_ME"

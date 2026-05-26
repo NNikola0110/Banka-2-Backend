@@ -1,0 +1,131 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-primary
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: postgres-primary
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgres-primary-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres-primary
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres-primary
+        app.kubernetes.io/component: database
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_DB
+              value: banka2
+            - name: POSTGRES_USER
+              value: banka2user
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_REPLICATION_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          args:
+            - "postgres"
+            - "-c"
+            - "wal_level=replica"
+            - "-c"
+            - "max_wal_senders=5"
+            - "-c"
+            - "max_replication_slots=5"
+            - "-c"
+            - "hot_standby=on"
+            # pg_hba.conf - dozvoli replicator usera iz cluster CIDR-a.
+            - "-c"
+            - "listen_addresses=*"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: replication-init
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - banka2user
+                - -d
+                - banka2
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - banka2user
+                - -d
+                - banka2
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+      volumes:
+        - name: replication-init
+          configMap:
+            name: postgres-replication-init
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 20Gi
+---
+# Init script za primary - kreira replication user-a + slot, dodaje pg_hba pravilo
+# za replikaciju iz cluster CIDR-a (10.0.0.0/8 pokriva vecinu K8s overlay mreza).
+# Mount-uje se kao /docker-entrypoint-initdb.d/01-replication-setup.sh i pokrece se
+# samo pri PRVOM boot-u (kada je data dir prazan).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-replication-init
+  namespace: banka2-tim2
+data:
+  01-replication-setup.sh: |
+    #!/bin/bash
+    set -e
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+      CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD '${POSTGRES_REPLICATION_PASSWORD}';
+      SELECT pg_create_physical_replication_slot('banka2_replica_slot');
+    EOSQL
+
+    # pg_hba.conf - dozvoli replikaciju iz K8s cluster CIDR-a (10.0.0.0/8 i 192.168.0.0/16).
+    cat >> "$PGDATA/pg_hba.conf" <<-EOF
+    host replication replicator 10.0.0.0/8 md5
+    host replication replicator 192.168.0.0/16 md5
+    host replication replicator 172.16.0.0/12 md5
+    EOF
+
+    echo "Replication user + slot + pg_hba.conf updated."

@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/component: ui
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frontend
+        app.kubernetes.io/component: ui
+    spec:
+      containers:
+        - name: frontend
+          image: ghcr.io/raf-si-2025/banka-2-frontend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+              name: http
+          envFrom:
+            # W1-T1: docker-entrypoint.sh radi `envsubst` u config.template.js
+            # i generise /usr/share/nginx/html/config.js iz ovih env vars.
+            # window._env_ se setuje u browseru pre main bundle-a.
+            - configMapRef:
+                name: frontend-config
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

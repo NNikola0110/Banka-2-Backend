@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend-pdb
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/component: disruption-budget
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend

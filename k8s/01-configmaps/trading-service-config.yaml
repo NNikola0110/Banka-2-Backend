@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trading-service-config
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: trading-service
+    app.kubernetes.io/component: configmap
+data:
+  # ── Datasource (trading_db) ────────────────────────────────────────────────
+  TRADING_DB_URL: "jdbc:postgresql://trading-db-svc:5432/trading"
+  TRADING_DB_USER: "tradinguser"
+
+  # ── Banka-core upstream (inter-service /internal calls) ───────────────────
+  BANKACORE_BASE_URL: "http://banka-core-svc:8080"
+
+  # ── RabbitMQ (margin events publishing) ───────────────────────────────────
+  SPRING_RABBITMQ_HOST: "rabbitmq-svc"
+  SPRING_RABBITMQ_PORT: "5672"
+  SPRING_RABBITMQ_USERNAME: "guest"
+
+  # ── InfluxDB (OHLCV time-series; W1-T6 enabled) ───────────────────────────
+  BANKA2_INFLUX_URL: "http://influxdb-svc:8086"
+  BANKA2_INFLUX_ORG: "banka2"
+  BANKA2_INFLUX_BUCKET: "tick-listings"
+  BANKA2_INFLUX_ENABLED: "true"
+
+  # ── Stock API (Alpha Vantage) — base URL non-sensitive, keys u Secret-u ──
+  STOCK_API_URL: "https://www.alphavantage.co"
+
+  # ── Spring Boot Actuator probes ──────────────────────────────────────────
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+  MANAGEMENT_HEALTH_LIVENESSSTATE_ENABLED: "true"
+  MANAGEMENT_HEALTH_READINESSSTATE_ENABLED: "true"
+  MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: "health,info,prometheus,metrics"

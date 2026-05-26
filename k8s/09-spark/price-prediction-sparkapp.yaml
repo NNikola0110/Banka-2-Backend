@@ -1,0 +1,97 @@
+# =========================================================================
+# Price Prediction Spark Job - RandomForestRegressor MLlib trening po simbolu
+# nad 90 dana InfluxDB OHLCV podataka. Output: trading_db.price_predictions
+# (sutrasnji close + confidence interval ±2σ residuals).
+#
+# Cron: 02:00 svaki dan UTC (03:00/04:00 CEST).
+# Driver: 1 instance × 2 CPU / 2Gi RAM (drzi VectorAssembler + model state).
+# Executor: 3 instance × 2 CPU / 4Gi RAM (ML training paralelno po simbolu).
+# =========================================================================
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: ScheduledSparkApplication
+metadata:
+  name: price-prediction
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: price-prediction
+    app.kubernetes.io/component: spark-job
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulRunHistoryLimit: 5
+  failedRunHistoryLimit: 5
+  template:
+    type: Python
+    pythonVersion: "3"
+    mode: cluster
+    image: ghcr.io/raf-si-2025/banka-2-spark-jobs:latest
+    imagePullPolicy: Always
+    mainApplicationFile: local:///opt/spark/jobs/price_prediction.py
+    sparkVersion: "3.5.0"
+    restartPolicy:
+      type: OnFailure
+      onFailureRetries: 2
+      onFailureRetryInterval: 60
+      onSubmissionFailureRetries: 3
+      onSubmissionFailureRetryInterval: 30
+    sparkConf:
+      "spark.kubernetes.allocation.batch.size": "5"
+      "spark.sql.session.timeZone": "UTC"
+      # Spark MLlib koristi BLAS - dozvoli native lib loading
+      "spark.driver.extraJavaOptions": "-Dcom.github.fommil.netlib.BLAS=com.github.fommil.netlib.NativeRefBLAS"
+    driver:
+      cores: 2
+      memory: "2g"
+      labels:
+        version: "3.5.0"
+        app.kubernetes.io/name: price-prediction
+      serviceAccount: spark
+      env:
+        - name: TRADING_DB_JDBC_URL
+          value: "jdbc:postgresql://trading-db-svc:5432/trading"
+        - name: ANALYTICS_READER_USER
+          value: "analytics_reader"
+        - name: ANALYTICS_READER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: ANALYTICS_READER_PASSWORD
+        - name: INFLUX_URL
+          value: "http://influxdb-svc:8086"
+        - name: INFLUX_ORG
+          value: "banka2"
+        - name: INFLUX_BUCKET
+          value: "tick-listings"
+        - name: INFLUX_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: influxdb-credentials
+              key: INFLUX_TOKEN
+    executor:
+      cores: 2
+      instances: 3
+      memory: "4g"
+      labels:
+        version: "3.5.0"
+        app.kubernetes.io/name: price-prediction
+      env:
+        - name: TRADING_DB_JDBC_URL
+          value: "jdbc:postgresql://trading-db-svc:5432/trading"
+        - name: ANALYTICS_READER_USER
+          value: "analytics_reader"
+        - name: ANALYTICS_READER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: ANALYTICS_READER_PASSWORD
+        - name: INFLUX_URL
+          value: "http://influxdb-svc:8086"
+        - name: INFLUX_ORG
+          value: "banka2"
+        - name: INFLUX_BUCKET
+          value: "tick-listings"
+        - name: INFLUX_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: influxdb-credentials
+              key: INFLUX_TOKEN

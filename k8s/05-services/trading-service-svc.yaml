@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-service-svc
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: trading-service
+    app.kubernetes.io/component: backend
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: trading-service
+  ports:
+    - port: 8082
+      targetPort: 8082
+      name: http

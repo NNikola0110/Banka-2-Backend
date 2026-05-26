@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: banka-core-config
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: banka-core
+    app.kubernetes.io/component: configmap
+data:
+  # ── Datasource (read-write primary) ────────────────────────────────────────
+  SPRING_DATASOURCE_URL: "jdbc:postgresql://postgres-primary-svc:5432/banka2"
+  SPRING_DATASOURCE_USERNAME: "banka2user"
+  SPRING_DATASOURCE_DRIVER_CLASS_NAME: "org.postgresql.Driver"
+
+  # ── Datasource (read-only replica) ─────────────────────────────────────────
+  # @Transactional(readOnly=true) ide ovde preko RoutingDataSource-a.
+  BANKA2_DATASOURCE_REPLICA_URL: "jdbc:postgresql://postgres-replica-svc:5432/banka2"
+  BANKA2_DATASOURCE_REPLICA_USERNAME: "banka2user"
+  BANKA2_DATASOURCE_REPLICA_ENABLED: "true"
+
+  # ── JPA / Hibernate ───────────────────────────────────────────────────────
+  SPRING_JPA_HIBERNATE_DDL_AUTO: "update"
+  SPRING_JPA_SHOW_SQL: "false"
+  SPRING_JPA_PROPERTIES_HIBERNATE_DIALECT: "org.hibernate.dialect.PostgreSQLDialect"
+  SPRING_JPA_PROPERTIES_HIBERNATE_TYPE_PREFERRED_BOOLEAN_JDBC_TYPE: "INTEGER"
+
+  # ── Inter-service URL-ovi ─────────────────────────────────────────────────
+  TRADINGSERVICE_BASE_URL: "http://trading-service-svc:8082"
+
+  # ── Inter-bank (Partner Tim 1) ────────────────────────────────────────────
+  # Mudrinic ce dodeliti pravi host. Default placeholder za K8s deploy.
+  PARTNER1_BASE_URL: "http://tim1-banka.example.com"
+  PARTNER1_USER_PATH: "/interbank/user/{rn}/{id}"
+  PARTNER1_ROUTING: "111"
+
+  # ── Rate limiting (Bucket4j) ──────────────────────────────────────────────
+  # Production: 10 req/min/IP. Capacity moze biti override-ovan u env block.
+  AUTH_RATE_LIMIT_ENABLED: "true"
+  AUTH_RATE_LIMIT_CAPACITY: "10"
+
+  # ── RabbitMQ ──────────────────────────────────────────────────────────────
+  SPRING_RABBITMQ_HOST: "rabbitmq-svc"
+  SPRING_RABBITMQ_PORT: "5672"
+  SPRING_RABBITMQ_USERNAME: "guest"
+
+  # ── Partitioning ──────────────────────────────────────────────────────────
+  BANKA2_PARTITIONS_ENABLED: "true"
+
+  # ── Arbitro (AI asistent) — opciono, gracefully degrades ako sidecari down ─
+  # NOTE: Arbitro stack je opcioni demo deo (Celina 6); production deploy moze
+  # ostaviti default placeholder URLs koje fail-uju connection-refused → BE
+  # vraca llmReachable=false bez krasovanja.
+  ARBITRO_BASE_URL: "http://ollama-svc:11434/v1"
+  ARBITRO_MODEL: "gemma4:e2b-gpu"
+  ARBITRO_API_KEY: "ollama"
+  ARBITRO_MAX_TOKENS: "8192"
+  ARBITRO_TEMPERATURE: "1.0"
+  ARBITRO_WIKI_URL: "http://wikipedia-service-svc:8090"
+  ARBITRO_RAG_URL: "http://rag-service-svc:8091"
+  ARBITRO_KOKORO_URL: "http://kokoro-tts-svc:8092"
+  ARBITRO_WHISPER_URL: "http://whisper-stt-svc:8093"
+  ARBITRO_WHISPER_ENABLED: "true"
+  ARBITRO_WHISPER_TIMEOUT_MS: "30000"
+
+  # ── Spring Boot Actuator probes (Spring Boot 2.3+) ─────────────────────────
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+  MANAGEMENT_HEALTH_LIVENESSSTATE_ENABLED: "true"
+  MANAGEMENT_HEALTH_READINESSSTATE_ENABLED: "true"
+  MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: "health,info,prometheus,metrics"

@@ -1,0 +1,73 @@
+# =========================================================================
+# Analytics Daily Spark Job - top movers + order volume agregirane metrike.
+# Cita iz trading_db.listing_daily_prices + trading_db.orders, agregira po
+# danima, upisuje u trading_db.analytics_daily (read-back za FE AnalyticsPage).
+#
+# Cron: 23:00 svaki dan UTC (00:00 CEST/01:00 CEST u zavisnosti od DST).
+# Driver: 1 instance × 1 CPU / 1Gi RAM.
+# Executor: 2 instance × 1 CPU / 2Gi RAM (light workload, sve u memoriji).
+# =========================================================================
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: ScheduledSparkApplication
+metadata:
+  name: analytics-daily
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: analytics-daily
+    app.kubernetes.io/component: spark-job
+spec:
+  schedule: "0 23 * * *"
+  concurrencyPolicy: Forbid
+  successfulRunHistoryLimit: 5
+  failedRunHistoryLimit: 5
+  template:
+    type: Python
+    pythonVersion: "3"
+    mode: cluster
+    image: ghcr.io/raf-si-2025/banka-2-spark-jobs:latest
+    imagePullPolicy: Always
+    mainApplicationFile: local:///opt/spark/jobs/analytics_daily.py
+    sparkVersion: "3.5.0"
+    restartPolicy:
+      type: OnFailure
+      onFailureRetries: 2
+      onFailureRetryInterval: 60
+      onSubmissionFailureRetries: 3
+      onSubmissionFailureRetryInterval: 30
+    sparkConf:
+      "spark.kubernetes.allocation.batch.size": "5"
+      "spark.sql.session.timeZone": "UTC"
+    driver:
+      cores: 1
+      memory: "1g"
+      labels:
+        version: "3.5.0"
+        app.kubernetes.io/name: analytics-daily
+      serviceAccount: spark
+      env:
+        - name: TRADING_DB_JDBC_URL
+          value: "jdbc:postgresql://trading-db-svc:5432/trading"
+        - name: ANALYTICS_READER_USER
+          value: "analytics_reader"
+        - name: ANALYTICS_READER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: ANALYTICS_READER_PASSWORD
+    executor:
+      cores: 1
+      instances: 2
+      memory: "2g"
+      labels:
+        version: "3.5.0"
+        app.kubernetes.io/name: analytics-daily
+      env:
+        - name: TRADING_DB_JDBC_URL
+          value: "jdbc:postgresql://trading-db-svc:5432/trading"
+        - name: ANALYTICS_READER_USER
+          value: "analytics_reader"
+        - name: ANALYTICS_READER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: ANALYTICS_READER_PASSWORD

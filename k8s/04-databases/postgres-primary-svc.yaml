@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-primary-svc
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: postgres-primary
+    app.kubernetes.io/component: database
+spec:
+  # Headless service - dozvoljava DNS lookup `<pod>.postgres-primary-svc` za StatefulSet.
+  # banka-core i replika koriste plain `postgres-primary-svc:5432` (load balance na
+  # jedan single replica).
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres-primary
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres

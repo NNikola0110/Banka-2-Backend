@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notification-service-config
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: notification-service
+    app.kubernetes.io/component: configmap
+data:
+  # ── RabbitMQ (consumer) ───────────────────────────────────────────────────
+  SPRING_RABBITMQ_HOST: "rabbitmq-svc"
+  SPRING_RABBITMQ_PORT: "5672"
+  SPRING_RABBITMQ_USERNAME: "guest"
+
+  # ── Email (Gmail SMTP) ───────────────────────────────────────────────────
+  # MAIL_USERNAME je non-sensitive (banka2.notifications@gmail.com),
+  # MAIL_PASSWORD ide u Secret (Gmail app password).
+  MAIL_USERNAME: "banka2.notifications@gmail.com"
+
+  # ── Notification URL base (deep-link u FE iz email-a) ────────────────────
+  # Mudrinic dodeli pravi domain; default placeholder za K8s deploy.
+  NOTIFICATION_ACTIVATION_URL_BASE: "https://banka2.tim2.raf-si-2025.example.com"
+  NOTIFICATION_PASSWORD_RESET_URL_BASE: "https://banka2.tim2.raf-si-2025.example.com"
+
+  # ── Spring Boot Actuator probes ──────────────────────────────────────────
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+  MANAGEMENT_HEALTH_LIVENESSSTATE_ENABLED: "true"
+  MANAGEMENT_HEALTH_READINESSSTATE_ENABLED: "true"
+  MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: "health,info,prometheus,metrics"

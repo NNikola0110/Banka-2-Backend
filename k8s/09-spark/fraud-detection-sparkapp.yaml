@@ -1,0 +1,80 @@
+# =========================================================================
+# Fraud Detection Spark Job - KMeans clustering nad 60 dana transakcija iz
+# banka_core db (read-replika). Distance-to-centroid = risk_score (0..1).
+# Output: banka_core.transaction_anomalies (rows sa risk_score > 0.8).
+# Alert-router upozorenja na Discord se trigger-uju iz BE-a koji posmatra
+# inserts u ovu tabelu (preko CDC-a ili periodicnog polling-a).
+#
+# Cron: 03:00 svaki dan UTC (04:00/05:00 CEST, posle price-prediction-a).
+# Driver: 1 instance × 2 CPU / 2Gi RAM.
+# Executor: 3 instance × 2 CPU / 4Gi RAM (KMeans iteracije + UDF za distance).
+# =========================================================================
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: ScheduledSparkApplication
+metadata:
+  name: fraud-detection
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: fraud-detection
+    app.kubernetes.io/component: spark-job
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulRunHistoryLimit: 5
+  failedRunHistoryLimit: 5
+  template:
+    type: Python
+    pythonVersion: "3"
+    mode: cluster
+    image: ghcr.io/raf-si-2025/banka-2-spark-jobs:latest
+    imagePullPolicy: Always
+    mainApplicationFile: local:///opt/spark/jobs/fraud_detection.py
+    sparkVersion: "3.5.0"
+    restartPolicy:
+      type: OnFailure
+      onFailureRetries: 2
+      onFailureRetryInterval: 60
+      onSubmissionFailureRetries: 3
+      onSubmissionFailureRetryInterval: 30
+    sparkConf:
+      "spark.kubernetes.allocation.batch.size": "5"
+      "spark.sql.session.timeZone": "UTC"
+      "spark.driver.extraJavaOptions": "-Dcom.github.fommil.netlib.BLAS=com.github.fommil.netlib.NativeRefBLAS"
+    driver:
+      cores: 2
+      memory: "2g"
+      labels:
+        version: "3.5.0"
+        app.kubernetes.io/name: fraud-detection
+      serviceAccount: spark
+      env:
+        # Fraud cita iz banka_core.transactions (read-replica) - zato koristi
+        # postgres-replica-svc (read-only) za scan i postgres-primary-svc samo
+        # za write u transaction_anomalies. Ali pojednostavljujemo na primary
+        # (read-write konekcija) za sad - read-replica routing je optimizacija.
+        - name: BANKA_CORE_DB_JDBC_URL
+          value: "jdbc:postgresql://postgres-primary-svc:5432/banka2"
+        - name: BANKA_CORE_READER_USER
+          value: "banka2user"
+        - name: BANKA_CORE_READER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRES_PASSWORD
+    executor:
+      cores: 2
+      instances: 3
+      memory: "4g"
+      labels:
+        version: "3.5.0"
+        app.kubernetes.io/name: fraud-detection
+      env:
+        - name: BANKA_CORE_DB_JDBC_URL
+          value: "jdbc:postgresql://postgres-primary-svc:5432/banka2"
+        - name: BANKA_CORE_READER_USER
+          value: "banka2user"
+        - name: BANKA_CORE_READER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRES_PASSWORD

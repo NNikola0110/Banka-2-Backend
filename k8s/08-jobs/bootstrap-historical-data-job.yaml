@@ -1,0 +1,82 @@
+# =========================================================================
+# Bootstrap historical data Job - pokrece tools/seed-historical-data.py
+# Python script koji ubacuje 90 dana sintetisckog OHLCV u InfluxDB
+# + 30 dana sintetisckih transactions u banka-core db + 60 dana ordera
+# u trading-db. Pokrece se JEDNOM posle inicijalnog deploy-a, pre prvog
+# Spark analytics run-a (analytics-daily, price-prediction, fraud-detection).
+#
+# Image `banka-2-spark-jobs:latest` vec ima Python + script u /opt/spark/tools/.
+# =========================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bootstrap-historical-data
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: bootstrap-historical-data
+    app.kubernetes.io/component: job
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bootstrap-historical-data
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-for-influxdb
+          image: curlimages/curl:8.10.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "Cekam da InfluxDB bude ready..."
+              until curl -sf http://influxdb-svc:8086/health > /dev/null; do
+                echo "InfluxDB jos nije ready, sleep 5s..."
+                sleep 5
+              done
+              echo "InfluxDB ready, nastavljam."
+      containers:
+        - name: bootstrap
+          image: ghcr.io/raf-si-2025/banka-2-spark-jobs:latest
+          imagePullPolicy: Always
+          command:
+            - python3
+            - /opt/spark/tools/seed-historical-data.py
+          env:
+            - name: INFLUX_URL
+              value: http://influxdb-svc:8086
+            - name: INFLUX_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: influxdb-credentials
+                  key: INFLUX_TOKEN
+            - name: INFLUX_ORG
+              value: banka2
+            - name: INFLUX_BUCKET
+              value: tick-listings
+            - name: TRADING_DB_URL
+              value: jdbc:postgresql://trading-db-svc:5432/trading
+            - name: TRADING_DB_USER
+              value: tradinguser
+            - name: TRADING_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_TRADING_PASSWORD
+            - name: BANKA_CORE_DB_URL
+              value: jdbc:postgresql://postgres-primary-svc:5432/banka2
+            - name: BANKA_CORE_DB_USER
+              value: banka2user
+            - name: BANKA_CORE_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi

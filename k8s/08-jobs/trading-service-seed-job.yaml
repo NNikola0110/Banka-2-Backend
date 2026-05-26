@@ -1,0 +1,64 @@
+# =========================================================================
+# Trading-service seed Job - ubacuje trading-seed.sql u trading-db nakon sto
+# trading-service kreira tabele (Hibernate ddl-auto=update).
+#
+# PRE pokretanja ovog Job-a, DevOps mora kreirati ConfigMap iz trading-seed.sql:
+#
+#   kubectl create configmap trading-service-seed-sql \
+#     --from-file=trading-seed.sql=Banka-2-Backend/trading-seed.sql \
+#     -n banka2-tim2
+#
+# Velicina trading-seed.sql je ~117KB - ispod 1MB etcd limita.
+# =========================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: trading-service-seed
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: trading-service-seed
+    app.kubernetes.io/component: job
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: trading-service-seed
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-for-trading-service
+          image: curlimages/curl:8.10.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "Cekam da trading-service bude readiness..."
+              until curl -sf http://trading-service-svc:8082/actuator/health/readiness > /dev/null; do
+                echo "Trading-service jos nije readiness, sleep 5s..."
+                sleep 5
+              done
+              echo "Trading-service readiness OK, nastavljam sa seed-om."
+      containers:
+        - name: seed
+          image: postgres:16-alpine
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_TRADING_PASSWORD
+          command:
+            - sh
+            - -c
+            - |
+              echo "Ubacujem trading-seed.sql u trading-db..."
+              psql -h trading-db-svc -U tradinguser -d trading -v ON_ERROR_STOP=1 -f /seed/trading-seed.sql
+              echo "Trading seed uspesno ubasen!"
+          volumeMounts:
+            - name: seed-volume
+              mountPath: /seed
+      volumes:
+        - name: seed-volume
+          configMap:
+            name: trading-service-seed-sql

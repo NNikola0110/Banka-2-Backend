@@ -1,0 +1,169 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-replica
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: postgres-replica
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgres-replica-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres-replica
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres-replica
+        app.kubernetes.io/component: database
+    spec:
+      containers:
+        - name: postgres-replica
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: PGUSER
+              value: banka2user
+            - name: PRIMARY_HOST
+              value: postgres-primary-svc
+            - name: PRIMARY_PORT
+              value: "5432"
+            - name: PRIMARY_DB
+              value: banka2
+            - name: PRIMARY_USER
+              value: banka2user
+            - name: PRIMARY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+            - name: REPLICATION_USER
+              value: replicator
+            - name: REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_REPLICATION_PASSWORD
+            - name: REPLICATION_SLOT
+              value: banka2_replica_slot
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          # Custom entrypoint - radi pg_basebackup od primary-ja pri prvom boot-u,
+          # potom pokrece postgres u hot_standby mode-u. Skript je 1:1 kopija
+          # Banka-2-Backend/db-replica-init/bootstrap-replica.sh.
+          command:
+            - /usr/local/bin/bootstrap-replica.sh
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: bootstrap
+              mountPath: /usr/local/bin/bootstrap-replica.sh
+              subPath: bootstrap-replica.sh
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "pg_isready -U banka2user -d banka2 && psql -U banka2user -d banka2 -tAc 'SELECT pg_is_in_recovery()' | grep -q 't'"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - banka2user
+                - -d
+                - banka2
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: postgres-replica-bootstrap
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 20Gi
+---
+# bootstrap-replica.sh - 1:1 kopija iz Banka-2-Backend/db-replica-init/bootstrap-replica.sh.
+# Mount-uje se kao /usr/local/bin/bootstrap-replica.sh kroz ConfigMap subPath.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-replica-bootstrap
+  namespace: banka2-tim2
+data:
+  bootstrap-replica.sh: |
+    #!/bin/bash
+    # Bootstrap script za read replica kontejner.
+    # Pri prvom boot-u, prazan data direktorijum, koristi pg_basebackup da
+    # inicijalno klonira primary-jevu bazu, pa startuje postgres u standby mode-u.
+
+    set -e
+
+    DATA_DIR="${PGDATA:-/var/lib/postgresql/data/pgdata}"
+
+    ensure_replication_setup() {
+        echo "[replica-init] Provera replication user-a i slot-a na primary-ju..."
+
+        until PGPASSWORD="$PRIMARY_PASSWORD" pg_isready -h "$PRIMARY_HOST" -p "$PRIMARY_PORT" -U "$PRIMARY_USER" -d "$PRIMARY_DB"; do
+            echo "[replica-init] Cekam primary admin konekciju..."
+            sleep 2
+        done
+
+        PGPASSWORD="$PRIMARY_PASSWORD" psql -h "$PRIMARY_HOST" -p "$PRIMARY_PORT" -U "$PRIMARY_USER" -d "$PRIMARY_DB" -v ON_ERROR_STOP=1 <<-EOSQL
+            DO \$\$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$REPLICATION_USER') THEN
+                    CREATE USER $REPLICATION_USER WITH REPLICATION ENCRYPTED PASSWORD '$REPLICATION_PASSWORD';
+                END IF;
+            END
+            \$\$;
+
+            SELECT pg_create_physical_replication_slot('$REPLICATION_SLOT')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM pg_replication_slots WHERE slot_name = '$REPLICATION_SLOT'
+            );
+    EOSQL
+
+        echo "[replica-init] Replication user + slot OK."
+    }
+
+    if [ ! -s "$DATA_DIR/PG_VERSION" ]; then
+        echo "[replica-init] Prazan data dir — pg_basebackup iz $PRIMARY_HOST:$PRIMARY_PORT..."
+        ensure_replication_setup
+
+        PGPASSWORD="$REPLICATION_PASSWORD" pg_basebackup \
+            -h "$PRIMARY_HOST" \
+            -p "$PRIMARY_PORT" \
+            -U "$REPLICATION_USER" \
+            -D "$DATA_DIR" \
+            -P -R -X stream \
+            -S "$REPLICATION_SLOT"
+
+        chown -R postgres:postgres "$DATA_DIR"
+        chmod 0700 "$DATA_DIR"
+
+        echo "[replica-init] Bazni backup zavrsen. Startujem postgres u standby mode-u."
+    fi
+
+    exec docker-entrypoint.sh postgres

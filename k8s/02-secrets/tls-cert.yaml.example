@@ -1,0 +1,21 @@
+# =========================================================================
+# TLS sertifikat za HTTPS Ingress termination.
+# CERT-MANAGER GENERISE OVO AUTOMATSKI iz ClusterIssuer (letsencrypt-prod
+# ili letsencrypt-staging). Ne treba ga manuelno kreirati - Ingress resource
+# samo navedi `secretName: banka2-tls-cert` i cert-manager ce ga popuniti.
+#
+# Manualni fallback (samo ako cert-manager nije postavljen):
+#   kubectl create secret tls banka2-tls-cert \
+#     --cert=path/to/fullchain.pem \
+#     --key=path/to/privkey.pem \
+#     -n banka2-tim2
+# =========================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: banka2-tls-cert
+  namespace: banka2-tim2
+type: kubernetes.io/tls
+stringData:
+  tls.crt: "REPLACE_ME_OR_LET_CERT_MANAGER_GENERATE"
+  tls.key: "REPLACE_ME_OR_LET_CERT_MANAGER_GENERATE"

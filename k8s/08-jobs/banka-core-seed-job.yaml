@@ -1,0 +1,66 @@
+# =========================================================================
+# Banka-core seed Job - ubacuje seed.sql u postgres-primary nakon sto je
+# banka-core kreirao tabele (Hibernate ddl-auto=update).
+#
+# PRE pokretanja ovog Job-a, DevOps mora kreirati ConfigMap iz seed.sql:
+#
+#   kubectl create configmap banka-core-seed-sql \
+#     --from-file=seed.sql=Banka-2-Backend/seed.sql \
+#     -n banka2-tim2
+#
+# Veličina seed.sql je ~50KB - daleko ispod 1MB etcd limita.
+# =========================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: banka-core-seed
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: banka-core-seed
+    app.kubernetes.io/component: job
+spec:
+  # Job retry limit - ako seed padne 3 puta, pre-existing data verovatno postoji.
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: banka-core-seed
+    spec:
+      restartPolicy: OnFailure
+      # InitContainer ceka da banka-core kreira tabele (probe-uje /actuator/health/readiness).
+      initContainers:
+        - name: wait-for-banka-core
+          image: curlimages/curl:8.10.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "Cekam da banka-core bude readiness..."
+              until curl -sf http://banka-core-svc:8080/actuator/health/readiness > /dev/null; do
+                echo "Banka-core jos nije readiness, sleep 5s..."
+                sleep 5
+              done
+              echo "Banka-core readiness OK, nastavljam sa seed-om."
+      containers:
+        - name: seed
+          image: postgres:16-alpine
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+          command:
+            - sh
+            - -c
+            - |
+              echo "Ubacujem seed.sql u postgres-primary..."
+              psql -h postgres-primary-svc -U banka2user -d banka2 -v ON_ERROR_STOP=1 -f /seed/seed.sql
+              echo "Seed uspesno ubasen!"
+          volumeMounts:
+            - name: seed-volume
+              mountPath: /seed
+      volumes:
+        - name: seed-volume
+          configMap:
+            name: banka-core-seed-sql

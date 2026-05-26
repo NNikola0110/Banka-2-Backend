@@ -1,0 +1,78 @@
+# =========================================================================
+# Database restrict NetworkPolicy - PostgreSQL i InfluxDB pod-ovi su sensitive,
+# zato eksplicitno ogranicavamo ko sme da im pristupa:
+#   - postgres-primary-svc (5432): banka-core + trading-service + Spark fraud + seed jobs
+#   - postgres-replica-svc (5432): banka-core (read-only routing) + Spark fraud
+#   - trading-db-svc (5432): trading-service + Spark analytics + Spark prediction
+#   - influxdb-svc (8086): trading-service (OHLCV recorder) + Spark prediction + bootstrap
+#   - rabbitmq-svc (5672/15672): banka-core + trading-service + notification-service
+#
+# Ostali pod-ovi (npr. frontend, api-gateway, monitoring stack) nemaju potrebe
+# za direktnim DB pristupom - blokiramo ih.
+#
+# Ovaj NetPol je AND sa internal-mesh-netpol - oba moraju dozvoljavati saobracaj
+# da bi paket prosao. Pod-selector ovde targetuje samo DB pod-ove.
+# =========================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-restrict-allow-app-only
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: db-restrict-allow-app-only
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - postgres-primary
+          - postgres-replica
+          - trading-db
+          - influxdb
+          - rabbitmq
+  policyTypes:
+    - Ingress
+  ingress:
+    # Dozvoli BE servisima (preko `app.kubernetes.io/name` label-a).
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - banka-core
+                  - trading-service
+                  - notification-service
+                  - analytics-daily       # Spark driver/executor labels
+                  - price-prediction
+                  - fraud-detection
+                  - banka-core-seed       # K8s Jobs
+                  - trading-service-seed
+                  - bootstrap-historical-data
+      ports:
+        - protocol: TCP
+          port: 5432    # PostgreSQL
+        - protocol: TCP
+          port: 8086    # InfluxDB
+        - protocol: TCP
+          port: 5672    # RabbitMQ AMQP
+        - protocol: TCP
+          port: 15672   # RabbitMQ Management UI (sa adminer/operator-a)
+    # Dozvoli postgres-replica streaming replication iz postgres-primary.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: postgres-primary
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Adminer (opciono - ako se deployuje za DBA pristup).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: adminer
+      ports:
+        - protocol: TCP
+          port: 5432

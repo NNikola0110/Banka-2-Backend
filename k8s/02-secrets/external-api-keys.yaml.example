@@ -1,0 +1,25 @@
+# =========================================================================
+# Spoljnji API kljucevi: Fixer.io (exchange rates) + Alpha Vantage (4 keys round-robin).
+# EXCHANGE_API_KEY se dobija registracijom na https://fixer.io.
+# STOCK_API_KEYS_1..4 - kreirati 4 free Alpha Vantage naloga (5 req/min limit po keyju).
+# Kreiraj sa:
+#   kubectl create secret generic external-api-keys \
+#     --from-literal=EXCHANGE_API_KEY="<fixer-key>" \
+#     --from-literal=STOCK_API_KEYS_1="<av-key-1>" \
+#     --from-literal=STOCK_API_KEYS_2="<av-key-2>" \
+#     --from-literal=STOCK_API_KEYS_3="<av-key-3>" \
+#     --from-literal=STOCK_API_KEYS_4="<av-key-4>" \
+#     -n banka2-tim2
+# =========================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: external-api-keys
+  namespace: banka2-tim2
+type: Opaque
+stringData:
+  EXCHANGE_API_KEY: "REPLACE_ME_FIXER_IO_KEY"
+  STOCK_API_KEYS_1: "REPLACE_ME_ALPHA_VANTAGE_KEY_1"
+  STOCK_API_KEYS_2: "REPLACE_ME_ALPHA_VANTAGE_KEY_2"
+  STOCK_API_KEYS_3: "REPLACE_ME_ALPHA_VANTAGE_KEY_3"
+  STOCK_API_KEYS_4: "REPLACE_ME_ALPHA_VANTAGE_KEY_4"

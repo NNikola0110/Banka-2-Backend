@@ -1,0 +1,85 @@
+# =========================================================================
+# Internal mesh NetworkPolicy - dozvoljava svim pod-ovima u namespace
+# `banka2-tim2` da medjusobno komuniciraju. Ovo ukljucuje:
+#   - frontend -> api-gateway
+#   - api-gateway -> banka-core / trading-service / notification-service
+#   - banka-core -> trading-service (internal /interbank, /internal/*)
+#   - sve servisi -> postgres-primary-svc / postgres-replica-svc / trading-db-svc
+#   - notification-service -> rabbitmq-svc
+#   - prometheus -> svi /actuator/prometheus endpoints
+#   - Spark driver -> trading-db-svc / postgres-primary-svc / influxdb-svc
+#   - alert-router -> alertmanager
+#
+# Bez NetworkPolicy-ja, K8s default = sve dozvoljeno svuda. Dodavanjem NetPol-a
+# u namespace `banka2-tim2`, K8s aktivira deny-by-default mode i samo eksplicitne
+# rules su dozvoljene.
+#
+# Ovaj NetPol je permissive unutar namespace + eksplicitno blokira cross-namespace
+# (osim kube-system za DNS) iz security razloga - npr. pod iz tudje namespace
+# ne moze direktno udariti banka-core ili postgres na cluster-internal mrezi.
+# =========================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: internal-mesh-allow
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: internal-mesh-allow
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector: {}  # primenjuje se na SVE pod-ove u namespace-u
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Dozvoli sav saobracaj iz pod-ova u istoj namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: banka2-tim2
+    # Dozvoli ingress-controller (nginx) iz ingress-nginx namespace - za /api i / iz Ingress-a.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+    # Dozvoli monitoring (prometheus) iz monitoring namespace - cross-namespace scrape.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+    # Dozvoli Spark operator iz spark-operator namespace - driver pod kreiranje.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: spark-operator
+  egress:
+    # Dozvoli sav saobracaj ka pod-ovima u istoj namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: banka2-tim2
+    # Dozvoli DNS resolving (CoreDNS u kube-system).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Dozvoli HTTPS van klastera (npr. Alpha Vantage stock API, Discord webhook,
+    # Let's Encrypt ACME challenge, GHCR pull-ovi). Bez ovoga BE ne moze fetch-ovati
+    # eksterne podatke.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8       # K8s pod CIDR (interno)
+              - 172.16.0.0/12    # K8s pod CIDR alt
+              - 192.168.0.0/16   # K8s pod CIDR alt
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80

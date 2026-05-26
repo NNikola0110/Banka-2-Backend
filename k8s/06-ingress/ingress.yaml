@@ -1,0 +1,65 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: banka2-ingress
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: banka2-ingress
+    app.kubernetes.io/component: ingress
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+    # SSE bez buffering-a za Arbitro chat stream.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - banka2.tim2.raf-si-2025.example.com
+      secretName: banka2-tls-cert
+  rules:
+    - host: banka2.tim2.raf-si-2025.example.com
+      http:
+        paths:
+          # /api/* - default putanja iz FE-a (FE saljete `/api/orders`, `/api/auth/login`...).
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway-svc
+                port:
+                  number: 80
+          # /banka-core/* - Mudrinic alias format (api-gateway strip prefix-a).
+          - path: /banka-core
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway-svc
+                port:
+                  number: 80
+          # /trading-service/* - Mudrinic alias.
+          - path: /trading-service
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway-svc
+                port:
+                  number: 80
+          # /notification-service/* - Mudrinic alias.
+          - path: /notification-service
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway-svc
+                port:
+                  number: 80
+          # / - sve drugo ide u SPA (React frontend).
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-svc
+                port:
+                  number: 80

@@ -1,0 +1,163 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-gateway-config
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: api-gateway
+    app.kubernetes.io/component: configmap
+data:
+  # nginx.conf za api-gateway. Sve upstream hostname-ovi su K8s service names
+  # (banka-core-svc, trading-service-svc, notification-service-svc) umesto
+  # docker-compose imena (backend, trading-service, notification-service).
+  # CoreDNS resolver je `kube-dns.kube-system.svc.cluster.local` na .10 ClusterIP.
+  nginx.conf: |
+    worker_processes auto;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        # K8s CoreDNS resolver — `kube-dns.kube-system.svc.cluster.local` na .10
+        # ClusterIP. Default DNS plugin u K8s je `coredns`; ClusterIP je 10.96.0.10
+        # ili .10.0.0.10 zavisno od CIDR. Koristim service name (radi nezavisno od CIDR-a).
+        resolver kube-dns.kube-system.svc.cluster.local valid=10s;
+
+        server {
+            listen 80;
+            server_name _;
+
+            client_max_body_size 20m;
+
+            # ── Zajednicki proxy header-i ────────────────────────────────────
+            proxy_http_version 1.1;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # ────────────────────────────────────────────────────────────────
+            # POD-FAZA 2f CUTOVER — path-based routing.
+            # Trgovinski domen ide u trading-service-svc:8082.
+            # Sve ostalo ide u banka-core-svc:8080 (catch-all).
+            # ────────────────────────────────────────────────────────────────
+
+            location /orders {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /portfolio {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /tax {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /funds {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /actuaries {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /listings {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /exchanges {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /options {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /margin-accounts {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /otc {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /profit-bank {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /price-alerts {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /watchlists {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /recurring-orders {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /dividends {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            location /admin/dividends {
+                set $trading_upstream "trading-service-svc:8082";
+                proxy_pass http://$trading_upstream;
+            }
+
+            # ────────────────────────────────────────────────────────────────
+            # MUDRINIC FORMAT ALIASES — /naziv-servisa/* path prefix.
+            # ────────────────────────────────────────────────────────────────
+
+            location ^~ /banka-core/ {
+                set $banka_core_upstream "banka-core-svc:8080";
+                rewrite ^/banka-core/(.*)$ /$1 break;
+                proxy_pass http://$banka_core_upstream$uri$is_args$args;
+            }
+
+            location ^~ /trading-service/ {
+                set $trading_alias_upstream "trading-service-svc:8082";
+                rewrite ^/trading-service/(.*)$ /$1 break;
+                proxy_pass http://$trading_alias_upstream$uri$is_args$args;
+            }
+
+            location ^~ /notification-service/ {
+                set $notification_upstream "notification-service-svc:8083";
+                rewrite ^/notification-service/(.*)$ /$1 break;
+                proxy_pass http://$notification_upstream$uri$is_args$args;
+            }
+
+            # ── Health endpoint za K8s liveness/readiness probes ─────────────
+            location = /healthz {
+                return 200 'ok';
+                add_header Content-Type text/plain;
+            }
+
+            # ── Catch-all: banka-core monolit ─────────────────────────────────
+            location / {
+                set $banka_core "banka-core-svc:8080";
+                proxy_pass http://$banka_core;
+                # SSE (Arbitro /assistant/chat) - bez buffering-a, dug timeout.
+                proxy_buffering off;
+                proxy_read_timeout 300s;
+            }
+        }
+    }
