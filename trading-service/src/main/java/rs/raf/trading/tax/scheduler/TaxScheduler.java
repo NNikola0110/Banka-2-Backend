@@ -41,10 +41,13 @@ public class TaxScheduler {
      * Cron format: sekunda minut sat dan-u-mesecu mesec dan-u-nedelji
      * "0 0 0 1 * *" = 00:00:00 prvog dana svakog meseca
      * <p>
-     * BE-ORD-08: hvata {@link TaxCalculationException} (najcesce FX rate unavailable)
-     * i salje notifikaciju supervizoru sa konkretnim {@code userId/userType} koji
-     * je preskocen. Ostali korisnici u istom run-u su uspesno obracunati pre nego
-     * sto je exception izbacen po-korisniku.
+     * BE-ORD-08 + BE-PAY-04: hvata agregatni {@link TaxCalculationException}
+     * (najcesce FX rate unavailable za bar jednog korisnika) i salje notifikaciju
+     * supervizoru sa {@code userId/userType} prvog preskocenog korisnika. Ostali
+     * korisnici u istom batch-u su uspesno obracunati i persistovani — paritet sa
+     * BE-PAY-02 (InstallmentProcessor REQUIRES_NEW) i BE-PAY-03 (VariableRateProcessor
+     * REQUIRES_NEW); {@code TaxCalculatorProcessor.processOne} sad ima
+     * {@code @Transactional(REQUIRES_NEW)} pa pad jednog ne rollback-uje druge.
      */
     @Scheduled(cron = "0 0 0 1 * *")
     public void calculateMonthlyTax() {

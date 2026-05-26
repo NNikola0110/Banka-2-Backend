@@ -1,9 +1,9 @@
 package rs.raf.trading.tax.service;
 
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import rs.raf.banka2.contracts.internal.InternalUserDto;
 import rs.raf.banka2.contracts.internal.TaxCollectRequest;
 import rs.raf.banka2.contracts.internal.TaxCollectResponse;
@@ -11,7 +11,6 @@ import rs.raf.trading.client.BankaCoreClient;
 import rs.raf.trading.client.BankaCoreClientException;
 import rs.raf.trading.common.UserRole;
 import rs.raf.trading.order.model.Order;
-import rs.raf.trading.order.model.OrderDirection;
 import rs.raf.trading.order.repository.OrderRepository;
 import rs.raf.trading.order.service.CurrencyConversionService;
 import rs.raf.trading.otc.model.OtcContract;
@@ -22,13 +21,11 @@ import rs.raf.trading.stock.util.ListingCurrencyResolver;
 import rs.raf.trading.tax.dto.TaxBreakdownItemDto;
 import rs.raf.trading.tax.dto.TaxRecordDto;
 import rs.raf.trading.tax.model.TaxRecord;
-import rs.raf.trading.tax.model.TaxRecordBreakdown;
+import rs.raf.trading.tax.processor.TaxCalculatorProcessor;
 import rs.raf.trading.tax.repository.TaxRecordBreakdownRepository;
 import rs.raf.trading.tax.repository.TaxRecordRepository;
-import rs.raf.trading.tax.util.TaxConstants;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.time.YearMonth;
 import java.util.EnumSet;
@@ -57,7 +54,6 @@ import java.util.stream.Collectors;
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class TaxService {
 
 
@@ -70,6 +66,37 @@ public class TaxService {
     private final CurrencyConversionService currencyConversionService;
     private final OtcContractRepository otcContractRepository;
     private final BankaCoreClient bankaCoreClient;
+
+    /**
+     * BE-PAY-04 (paritet sa BE-PAY-02/03): per-user processor sa
+     * {@code @Transactional(REQUIRES_NEW)} izolacijom. Field injection sa
+     * {@link Lazy} jer postojeci unit testovi (TaxServiceTest/CoverageTest)
+     * koriste {@code @InjectMocks} koji ne moze da injektuje processor —
+     * u tim slucajevima orkestrator fall-back-uje na inline kalkulaciju koja
+     * je ekvivalentna processor-ovoj (samo bez REQUIRES_NEW Tx izolacije).
+     */
+    @Autowired(required = false)
+    @Lazy
+    private TaxCalculatorProcessor calculatorProcessor;
+
+    public TaxService(TaxRecordRepository taxRecordRepository,
+                      TaxRecordBreakdownRepository taxRecordBreakdownRepository,
+                      OrderRepository orderRepository,
+                      CurrencyConversionService currencyConversionService,
+                      OtcContractRepository otcContractRepository,
+                      BankaCoreClient bankaCoreClient) {
+        this.taxRecordRepository = taxRecordRepository;
+        this.taxRecordBreakdownRepository = taxRecordBreakdownRepository;
+        this.orderRepository = orderRepository;
+        this.currencyConversionService = currencyConversionService;
+        this.otcContractRepository = otcContractRepository;
+        this.bankaCoreClient = bankaCoreClient;
+    }
+
+    /** Test seam — koristi se u TaxCalculatorProcessorTest da injektuje pravi processor. */
+    void setCalculatorProcessor(TaxCalculatorProcessor processor) {
+        this.calculatorProcessor = processor;
+    }
 
     /**
      * Vraca filtrirane tax recorde za admin/employee portal.
@@ -125,8 +152,17 @@ public class TaxService {
      *
      * FUND orderi (Celina 4 - Nova): orderi sa fundId != null se preskacu jer
      * fondovi ne ulaze u licnu kapitalnu dobit supervizora.
+     *
+     * <p>BE-PAY-04 (paritet sa BE-PAY-02/03): orkestrator vise NEMA outer
+     * {@code @Transactional}. Per-user obracun delegira na
+     * {@link TaxCalculatorProcessor#processOne} koji ima
+     * {@code @Transactional(REQUIRES_NEW)} → svaki korisnik dobija svoju
+     * nezavisnu transakciju. Pad jednog korisnika (npr. FX rate nedostupan)
+     * NE rollback-uje vec persistovane {@code TaxRecord}-e drugih korisnika
+     * iz istog batch-a. Greske se agregiraju u {@code perUserFailures} i
+     * scheduler dobija agregatni {@link TaxCalculationException} za supervisor
+     * notifikaciju, ali svi uspeli korisnici su persistovani.
      */
-    @Transactional
     public void calculateTaxForAllUsers() {
         LocalDateTime now = LocalDateTime.now();
         // BE-ORD-06: spec Celina 3 Sc 58 — bank actuaries (zaposleni) trguju sa
@@ -193,9 +229,13 @@ public class TaxService {
         Set<String> allKeys = new HashSet<>(grouped.keySet());
         allKeys.addAll(otcUserKeys);
 
-        // BE-ORD-08: TaxCalculationException uhvacen po-korisniku — re-baca se sa
-        // userId/userType popunjenim da TaxScheduler moze da identifikuje koji je
-        // korisnik preskocen + posalje notifikaciju supervizoru.
+        // BE-ORD-08 + BE-PAY-04: TaxCalculationException uhvacen po-korisniku —
+        // re-baca se sa userId/userType popunjenim da TaxScheduler moze da identifikuje
+        // koji je korisnik preskocen + posalje notifikaciju supervizoru.
+        //
+        // BE-PAY-04: per-user obracun se delegira na TaxCalculatorProcessor.processOne
+        // koji ima @Transactional(REQUIRES_NEW) → pad jednog korisnika NE rollback-uje
+        // vec persistovane TaxRecord-e drugih korisnika.
         java.util.List<TaxCalculationException> perUserFailures = new java.util.ArrayList<>();
         for (String key : allKeys) {
             String[] parts = key.split(":");
@@ -203,134 +243,11 @@ public class TaxService {
             String userRole = parts[1];
             String userType = UserRole.isEmployee(userRole) ? UserRole.EMPLOYEE : UserRole.CLIENT;
             List<Order> userOrders = grouped.getOrDefault(key, List.of());
+            Map<Long, BigDecimal> userOtcSell = otcSellByUser.getOrDefault(key, Map.of());
+            Map<Long, BigDecimal> userOtcBuy = otcBuyByUser.getOrDefault(key, Map.of());
             try {
-
-            // Racunamo profit per-asset: za svaki listing posebno racunamo sell - buy
-            // pa sabiramo samo pozitivne profite (kapitalna dobit).
-            // S80: Svi iznosi se konvertuju u RSD pre agregacije, jer orderi mogu
-            // biti u razlicitim valutama (USD, EUR, RSD...).
-            Map<Long, BigDecimal> buyByListing = new HashMap<>();
-            Map<Long, BigDecimal> sellByListing = new HashMap<>();
-            Map<Long, String> currencyByListing = new HashMap<>();
-
-            for (Order order : userOrders) {
-                Long listingId = order.getListing().getId();
-                BigDecimal orderValue = order.getPricePerUnit()
-                        .multiply(BigDecimal.valueOf(order.getQuantity()))
-                        .multiply(BigDecimal.valueOf(order.getContractSize()));
-
-                currencyByListing.putIfAbsent(listingId, resolveOrderCurrency(order));
-
-                if (order.getDirection() == OrderDirection.SELL) {
-                    sellByListing.merge(listingId, orderValue, BigDecimal::add);
-                } else {
-                    buyByListing.merge(listingId, orderValue, BigDecimal::add);
-                }
-            }
-
-            // OTC EXERCISED kontribucije za ovog korisnika.
-            otcSellByUser.getOrDefault(key, Map.of())
-                    .forEach((listingId, value) -> {
-                        sellByListing.merge(listingId, value, BigDecimal::add);
-                        currencyByListing.putIfAbsent(listingId,
-                                otcListingCurrency.getOrDefault(listingId, "RSD"));
-                    });
-            otcBuyByUser.getOrDefault(key, Map.of())
-                    .forEach((listingId, value) -> {
-                        buyByListing.merge(listingId, value, BigDecimal::add);
-                        currencyByListing.putIfAbsent(listingId,
-                                otcListingCurrency.getOrDefault(listingId, "RSD"));
-                    });
-
-            // Za svaki listing: profit = sell - buy, konvertuj u RSD, akumuliraj.
-            // NET dobit/gubitak se racuna preko svih listinga; porez je 0 ako je total <= 0.
-            // P2.4 — biljezimo per-listing breakdown za prikaz/audit.
-            //
-            // Spec §517 + bug prijavljen 12.05.2026 (tim screenshot tax_record_breakdowns):
-            // pre fix-a, listings sa SAMO buy (bez sell) su davali profit = 0 - buy = -buy
-            // sto je laznja indikacija "gubitka" — porez se po spec-u racuna SAMO na
-            // REALIZOVANU dobit (kad je prodaja izvrsena). Skupljac SVIH bought listings
-            // u breakdown-u je davao haosno "sve negativno" stanje. Sad ukljucujemo
-            // samo listings sa sell > 0 (realizovani trgovni dogadjaj). Sva nepotrosenih
-            // pozicija ostaju u portfolio-u kao unrealized — bez tax efekta.
-            BigDecimal totalProfit = BigDecimal.ZERO;
-            Set<Long> realizedListings = new HashSet<>(sellByListing.keySet());
-            // Akumuliraj per-listing breakdown stavke pre nego sto saznamo TaxRecord ID-jeve
-            java.util.List<PerListingProfit> perListingProfits = new java.util.ArrayList<>();
-            for (Long listingId : realizedListings) {
-                BigDecimal sell = sellByListing.getOrDefault(listingId, BigDecimal.ZERO);
-                BigDecimal buy = buyByListing.getOrDefault(listingId, BigDecimal.ZERO);
-                BigDecimal assetProfit = sell.subtract(buy);
-                String listingCurrency = currencyByListing.getOrDefault(listingId, "RSD");
-                BigDecimal profitInRsd = convertToRsd(assetProfit, listingCurrency);
-                totalProfit = totalProfit.add(profitInRsd);
-                perListingProfits.add(new PerListingProfit(
-                        listingId, listingCurrency, assetProfit, profitInRsd));
-            }
-            BigDecimal taxOwed = totalProfit.compareTo(BigDecimal.ZERO) > 0
-                    ? totalProfit.multiply(TaxConstants.TAX_RATE).setScale(4, RoundingMode.HALF_UP)
-                    : BigDecimal.ZERO;
-
-            String userName = resolveUserName(userId, userRole);
-            // BE-ORD-08: userType je vec deklarisan na vrhu petlje (try grana).
-
-            TaxRecord record = taxRecordRepository.findByUserIdAndUserType(userId, userType)
-                    .orElse(TaxRecord.builder()
-                            .userId(userId)
-                            .userType(userType)
-                            .currency("RSD")
-                            .taxPaid(BigDecimal.ZERO)
-                            .build());
-
-            record.setUserName(userName);
-            record.setTotalProfit(totalProfit);
-            record.setTaxOwed(taxOwed);
-            record.setCalculatedAt(now);
-
-            // Naplati neplaceni porez sa korisnikovog racuna
-            BigDecimal previouslyPaid = record.getTaxPaid() != null ? record.getTaxPaid() : BigDecimal.ZERO;
-            BigDecimal unpaidTax = taxOwed.subtract(previouslyPaid);
-
-            if (unpaidTax.compareTo(BigDecimal.ZERO) > 0) {
-                boolean collected = collectTaxFromUser(userId, userType, unpaidTax, now);
-                if (collected) {
-                    record.setTaxPaid(taxOwed);
-                    log.info("Tax collected from user {} ({}): {} RSD", userName, userType, unpaidTax);
-                } else {
-                    log.warn("Could not collect tax from user {} ({}): no RSD account or insufficient funds",
-                            userName, userType);
-                }
-            }
-
-            taxRecordRepository.save(record);
-
-            // P2.4 — perzistiraj per-listing breakdown stavke. Brisemo
-            // postojeci breakdown pa ga regenerisemo iz svezih agregata.
-            // record.getId() moze biti null ako mock save() ne vraca generated
-            // ID — u tom slucaju preskacemo breakdown (regression-safe).
-            if (record.getId() != null) {
-                taxRecordBreakdownRepository.deleteByTaxRecordId(record.getId());
-                for (PerListingProfit p : perListingProfits) {
-                    if (p.listingId() == null) continue;
-                    BigDecimal listingTaxOwed = p.profitRsd().compareTo(BigDecimal.ZERO) > 0
-                            ? p.profitRsd().multiply(TaxConstants.TAX_RATE)
-                                    .setScale(4, RoundingMode.HALF_UP)
-                            : BigDecimal.ZERO;
-                    String ticker = listingTickerCache.computeIfAbsent(p.listingId(),
-                            id -> resolveTicker(p.listingId()));
-                    TaxRecordBreakdown breakdown = TaxRecordBreakdown.builder()
-                            .taxRecord(record)
-                            .listingId(p.listingId())
-                            .ticker(ticker != null ? ticker : "?" + p.listingId())
-                            .listingCurrency(p.listingCurrency() != null ? p.listingCurrency() : "RSD")
-                            .profitNative(p.profitNative())
-                            .profitRsd(p.profitRsd())
-                            .taxOwed(listingTaxOwed)
-                            .calculatedAt(now)
-                            .build();
-                    taxRecordBreakdownRepository.save(breakdown);
-                }
-            }
+                processOneUserInternal(userId, userType, userRole, userOrders,
+                        userOtcSell, userOtcBuy, otcListingCurrency, now);
             } catch (TaxCalculationException txEx) {
                 // BE-ORD-08: re-baca exception sa userId/userType da TaxScheduler moze
                 // da posalje notifikaciju supervizoru sa konkretnim korisnikom.
@@ -338,6 +255,15 @@ public class TaxService {
                         userId, userType, txEx.getMessage(), txEx.getCause());
                 log.error("Tax calculation skipped for user {} ({}): {}", userId, userType, txEx.getMessage());
                 perUserFailures.add(enriched);
+            } catch (RuntimeException ex) {
+                // BE-PAY-04: bilo koja druga greska (DB constraint, optimistic lock,
+                // banka-core 5xx) je takodje per-user izolovana — ne rollback-uje
+                // ostatak batch-a. Belezimo kao failure ali ne propagiramo specijalan
+                // tip (TaxCalculationException je rezervisan za FX/conversion).
+                log.error("Unexpected error during tax calculation for user {} ({}): {}",
+                        userId, userType, ex.getMessage(), ex);
+                perUserFailures.add(new TaxCalculationException(userId, userType,
+                        "Unexpected: " + ex.getMessage(), ex));
             }
         }
         // BE-ORD-08: ako je makar jedan korisnik preskocen, propagiraj agregatni
@@ -350,6 +276,163 @@ public class TaxService {
                     : "Tax calculation failed for " + perUserFailures.size() + " users (first: "
                             + first.getMessage() + ")";
             throw new TaxCalculationException(first.getUserId(), first.getUserType(), summary, first.getCause());
+        }
+    }
+
+    /**
+     * BE-PAY-04: per-user delegate. U produkciji {@link #calculatorProcessor}
+     * je auto-wired i izvrsava obracun u {@code REQUIRES_NEW} Tx — pad ne
+     * rollback-uje vec persistovane TaxRecord-e iz batch-a. Legacy unit testovi
+     * ({@code TaxServiceTest}, {@code TaxServiceCoverageTest}) koji koriste
+     * {@code @InjectMocks} bez Spring kontexta nemaju processor — fall-back-uje
+     * na inline kalkulaciju koja je <b>byte-identicna</b> processor-ovoj samo
+     * bez Tx izolacije (testovi i dalje rade jer su sve mockane).
+     *
+     * @param userRole originalni userRole iz key-a (ne userType — moze razlikovati
+     *                 ako spec doda nove role; trenutno {@code resolveUserName}
+     *                 ga koristi za employee/client granu).
+     */
+    private void processOneUserInternal(Long userId,
+                                        String userType,
+                                        String userRole,
+                                        List<Order> userOrders,
+                                        Map<Long, BigDecimal> otcSellByListing,
+                                        Map<Long, BigDecimal> otcBuyByListing,
+                                        Map<Long, String> otcListingCurrency,
+                                        LocalDateTime now) {
+        if (calculatorProcessor != null) {
+            calculatorProcessor.processOne(userId, userType, userOrders,
+                    otcSellByListing, otcBuyByListing, otcListingCurrency, now);
+            return;
+        }
+        // Legacy inline path — koristi se SAMO u unit testovima sa @InjectMocks
+        // koji ne aktiviraju Spring kontekst. U produkciji se ne dosegne.
+        processOneUserInline(userId, userType, userRole, userOrders,
+                otcSellByListing, otcBuyByListing, otcListingCurrency, now);
+    }
+
+    /**
+     * Legacy inline implementacija per-user obracuna. Ista logika kao
+     * {@link TaxCalculatorProcessor#processOne}, samo bez {@code @Transactional}
+     * Tx izolacije. Postoji za kompatibilnost sa postojecim Mockito unit
+     * testovima koji koriste {@code @InjectMocks TaxService} (Spring kontekst
+     * nije bootstrap-ovan pa processor ne moze biti injektovan).
+     */
+    private void processOneUserInline(Long userId,
+                                      String userType,
+                                      String userRole,
+                                      List<Order> userOrders,
+                                      Map<Long, BigDecimal> otcSellByListing,
+                                      Map<Long, BigDecimal> otcBuyByListing,
+                                      Map<Long, String> otcListingCurrency,
+                                      LocalDateTime now) {
+        // Racunamo profit per-asset: za svaki listing posebno racunamo sell - buy
+        // pa sabiramo samo pozitivne profite (kapitalna dobit).
+        Map<Long, BigDecimal> buyByListing = new HashMap<>();
+        Map<Long, BigDecimal> sellByListing = new HashMap<>();
+        Map<Long, String> currencyByListing = new HashMap<>();
+
+        for (Order order : userOrders) {
+            Long listingId = order.getListing().getId();
+            BigDecimal orderValue = order.getPricePerUnit()
+                    .multiply(BigDecimal.valueOf(order.getQuantity()))
+                    .multiply(BigDecimal.valueOf(order.getContractSize()));
+
+            currencyByListing.putIfAbsent(listingId, resolveOrderCurrency(order));
+
+            if (order.getDirection() == rs.raf.trading.order.model.OrderDirection.SELL) {
+                sellByListing.merge(listingId, orderValue, BigDecimal::add);
+            } else {
+                buyByListing.merge(listingId, orderValue, BigDecimal::add);
+            }
+        }
+
+        // OTC EXERCISED kontribucije za ovog korisnika.
+        otcSellByListing.forEach((listingId, value) -> {
+            sellByListing.merge(listingId, value, BigDecimal::add);
+            currencyByListing.putIfAbsent(listingId,
+                    otcListingCurrency.getOrDefault(listingId, "RSD"));
+        });
+        otcBuyByListing.forEach((listingId, value) -> {
+            buyByListing.merge(listingId, value, BigDecimal::add);
+            currencyByListing.putIfAbsent(listingId,
+                    otcListingCurrency.getOrDefault(listingId, "RSD"));
+        });
+
+        BigDecimal totalProfit = BigDecimal.ZERO;
+        Set<Long> realizedListings = new HashSet<>(sellByListing.keySet());
+        java.util.List<PerListingProfit> perListingProfits = new java.util.ArrayList<>();
+        for (Long listingId : realizedListings) {
+            BigDecimal sell = sellByListing.getOrDefault(listingId, BigDecimal.ZERO);
+            BigDecimal buy = buyByListing.getOrDefault(listingId, BigDecimal.ZERO);
+            BigDecimal assetProfit = sell.subtract(buy);
+            String listingCurrency = currencyByListing.getOrDefault(listingId, "RSD");
+            BigDecimal profitInRsd = convertToRsd(assetProfit, listingCurrency);
+            totalProfit = totalProfit.add(profitInRsd);
+            perListingProfits.add(new PerListingProfit(
+                    listingId, listingCurrency, assetProfit, profitInRsd));
+        }
+        BigDecimal taxOwed = totalProfit.compareTo(BigDecimal.ZERO) > 0
+                ? totalProfit.multiply(rs.raf.trading.tax.util.TaxConstants.TAX_RATE)
+                        .setScale(4, java.math.RoundingMode.HALF_UP)
+                : BigDecimal.ZERO;
+
+        String userName = resolveUserName(userId, userRole);
+
+        TaxRecord record = taxRecordRepository.findByUserIdAndUserType(userId, userType)
+                .orElse(TaxRecord.builder()
+                        .userId(userId)
+                        .userType(userType)
+                        .currency("RSD")
+                        .taxPaid(BigDecimal.ZERO)
+                        .build());
+
+        record.setUserName(userName);
+        record.setTotalProfit(totalProfit);
+        record.setTaxOwed(taxOwed);
+        record.setCalculatedAt(now);
+
+        BigDecimal previouslyPaid = record.getTaxPaid() != null ? record.getTaxPaid() : BigDecimal.ZERO;
+        BigDecimal unpaidTax = taxOwed.subtract(previouslyPaid);
+
+        if (unpaidTax.compareTo(BigDecimal.ZERO) > 0) {
+            boolean collected = collectTaxFromUser(userId, userType, unpaidTax, now);
+            if (collected) {
+                record.setTaxPaid(taxOwed);
+                log.info("Tax collected from user {} ({}): {} RSD", userName, userType, unpaidTax);
+            } else {
+                log.warn("Could not collect tax from user {} ({}): no RSD account or insufficient funds",
+                        userName, userType);
+            }
+        }
+
+        taxRecordRepository.save(record);
+
+        if (record.getId() != null) {
+            taxRecordBreakdownRepository.deleteByTaxRecordId(record.getId());
+            for (PerListingProfit p : perListingProfits) {
+                if (p.listingId() == null) {
+                    continue;
+                }
+                BigDecimal listingTaxOwed = p.profitRsd().compareTo(BigDecimal.ZERO) > 0
+                        ? p.profitRsd().multiply(rs.raf.trading.tax.util.TaxConstants.TAX_RATE)
+                                .setScale(4, java.math.RoundingMode.HALF_UP)
+                        : BigDecimal.ZERO;
+                String ticker = listingTickerCache.computeIfAbsent(p.listingId(),
+                        id -> resolveTicker(p.listingId()));
+                rs.raf.trading.tax.model.TaxRecordBreakdown breakdown =
+                        rs.raf.trading.tax.model.TaxRecordBreakdown.builder()
+                                .taxRecord(record)
+                                .listingId(p.listingId())
+                                .ticker(ticker != null ? ticker : "?" + p.listingId())
+                                .listingCurrency(p.listingCurrency() != null ? p.listingCurrency() : "RSD")
+                                .profitNative(p.profitNative())
+                                .profitRsd(p.profitRsd())
+                                .taxOwed(listingTaxOwed)
+                                .calculatedAt(now)
+                                .build();
+                taxRecordBreakdownRepository.save(breakdown);
+            }
         }
     }
 
