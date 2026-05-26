@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kokoro-tts-svc
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: kokoro-tts
+    app.kubernetes.io/component: arbitro
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kokoro-tts
+  ports:
+    - port: 8092
+      targetPort: 8092
+      name: http

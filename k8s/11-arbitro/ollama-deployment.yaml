@@ -1,0 +1,116 @@
+# =========================================================================
+# Ollama LLM sa pre-baked Gemma 4 E2B model-om (image ~5GB).
+#
+# GPU OBAVEZAN — Gemma 4 E2B u CPU rezimu daje ~105s/odgovor (sporo za chat).
+# Na RTX 4070 sa flash-attn + Q8 KV cache: ~5s/odgovor (20x brze).
+#
+# DevOps tim mora obezbediti:
+#   1) NVIDIA GPU node u klasteru sa device plugin instaliranim
+#      (https://github.com/NVIDIA/k8s-device-plugin)
+#   2) Label na GPU node-u: `kubectl label node <gpu-node> nvidia.com/gpu.present=true`
+#   3) RuntimeClass `nvidia` (opciono — neki klasteri zahtevaju, drugi automatski rute na nvidia runtime)
+#
+# Bez GPU node-a, deploy ostaje `Pending` (Insufficient nvidia.com/gpu) — vidi README.md
+# Opciju A (skip cele 11-arbitro/) ili B (samo CPU sidecari).
+# =========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: ollama
+    app.kubernetes.io/component: arbitro
+spec:
+  replicas: 1
+  strategy:
+    # Ollama drzi model u VRAM-u — rolling update zahteva 2x VRAM tokom rollover-a.
+    # Recreate strategija: stari pod se ugasi pa novi pokrene (kratki downtime, ali
+    # ne zahteva 2x VRAM).
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ollama
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ollama
+        app.kubernetes.io/component: arbitro
+    spec:
+      # GPU node selector. DevOps tim labels GPU node-ove sa
+      # `nvidia.com/gpu.present=true` (ili koristi standard `nvidia.com/gpu` resource).
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      # Tolerirati taint na dedicated GPU node-ovima ako postoje.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: ollama
+          image: ghcr.io/raf-si-2025/banka-2-ollama:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 11434
+              name: http
+          env:
+            # FORCE 100% GPU offload (svi layeri u VRAM-u). Identicni env vars kao u
+            # Banka-2-Tools/docker-compose.yml — sve opcije za uciniti Gemma 4 E2B
+            # responsive na GPU.
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:11434"
+            - name: OLLAMA_KEEP_ALIVE
+              value: "24h"
+            - name: OLLAMA_FLASH_ATTENTION
+              value: "1"
+            - name: OLLAMA_KV_CACHE_TYPE
+              value: q8_0
+            - name: OLLAMA_GPU_OVERHEAD
+              value: "0"
+            - name: OLLAMA_NUM_GPU
+              value: "999"
+            - name: OLLAMA_SCHED_SPREAD
+              value: "false"
+            - name: OLLAMA_NUM_PARALLEL
+              value: "1"
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: "1"
+            - name: OLLAMA_CONTEXT_LENGTH
+              value: "4096"
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 4Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: 4000m
+              memory: 12Gi
+              nvidia.com/gpu: 1
+          # Model je vec pre-baked u image-u (no volume mount). Healthcheck proverava
+          # da je model registrovan + da API odgovara.
+          startupProbe:
+            # 10min grace za prvi boot (model load u VRAM moze trajati 30-60s na cold start).
+            exec:
+              command:
+                - sh
+                - -c
+                - "ollama list 2>/dev/null | grep -q gemma && curl -fsS http://localhost:11434/api/tags >/dev/null"
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5

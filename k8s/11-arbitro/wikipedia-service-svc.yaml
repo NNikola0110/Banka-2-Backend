@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: wikipedia-service-svc
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: wikipedia-service
+    app.kubernetes.io/component: arbitro
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: wikipedia-service
+  ports:
+    - port: 8090
+      targetPort: 8090
+      name: http

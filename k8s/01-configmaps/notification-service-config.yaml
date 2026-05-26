@@ -8,9 +8,9 @@ metadata:
     app.kubernetes.io/component: configmap
 data:
   # ── RabbitMQ (consumer) ───────────────────────────────────────────────────
+  # USERNAME/PASSWORD iz Secret-a `rabbitmq-credentials` u Deployment env block-u.
   SPRING_RABBITMQ_HOST: "rabbitmq-svc"
   SPRING_RABBITMQ_PORT: "5672"
-  SPRING_RABBITMQ_USERNAME: "guest"
 
   # ── Email (Gmail SMTP) ───────────────────────────────────────────────────
   # MAIL_USERNAME je non-sensitive (banka2.notifications@gmail.com),

@@ -89,7 +89,7 @@ services:
   # Implementiran u Banka-2-Tools/alert-router-service/.
   alert-router:
     build: ../Banka-2-Tools/alert-router-service
-    image: ghcr.io/raf-si-2025/banka2-alert-router:latest
+    image: ghcr.io/raf-si-2025/banka-2-alert-router:latest
     container_name: banka2_alert_router
     restart: unless-stopped
     environment:

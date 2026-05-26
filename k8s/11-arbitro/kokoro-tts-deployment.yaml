@@ -1,0 +1,75 @@
+# =========================================================================
+# Kokoro-82M Text-to-Speech sidecar (Apache 2.0).
+# Real-time factor 0.05x na GPU, 0.3x na CPU. Default voice `af_bella`.
+# Persistent HF cache za model file (~330MB FP32) preko PVC.
+# =========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kokoro-tts
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: kokoro-tts
+    app.kubernetes.io/component: arbitro
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kokoro-tts
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kokoro-tts
+        app.kubernetes.io/component: arbitro
+    spec:
+      containers:
+        - name: kokoro-tts
+          image: ghcr.io/raf-si-2025/banka-2-kokoro-tts:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8092
+              name: http
+          env:
+            - name: KOKORO_DEFAULT_VOICE
+              value: af_bella
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /app/hf_cache
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8092
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8092
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1500m
+              memory: 1Gi
+      volumes:
+        - name: hf-cache
+          persistentVolumeClaim:
+            claimName: kokoro-hf-cache
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kokoro-hf-cache
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: kokoro-tts
+    app.kubernetes.io/component: arbitro
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

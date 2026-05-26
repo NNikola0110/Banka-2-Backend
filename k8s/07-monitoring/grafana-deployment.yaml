@@ -23,12 +23,15 @@ spec:
           ports:
             - containerPort: 3000
               name: http
+          envFrom:
+            # Grafana admin kredencijali iz Secret-a (vidi
+            # k8s/02-secrets/grafana-credentials.yaml.example). GF_SECURITY_ADMIN_USER
+            # i GF_SECURITY_ADMIN_PASSWORD se mapuju automatski (Grafana koristi GF_*
+            # env var prefix). DevOps tim mora kreirati Secret PRE deploy-a:
+            # `kubectl create secret generic grafana-credentials -n banka2-tim2 ...`
+            - secretRef:
+                name: grafana-credentials
           env:
-            - name: GF_SECURITY_ADMIN_USER
-              value: admin
-            - name: GF_SECURITY_ADMIN_PASSWORD
-              # NOTE: production deploy mora zameniti sa Secret-om (admin password).
-              value: admin
             - name: GF_USERS_ALLOW_SIGN_UP
               value: "false"
           volumeMounts:

@@ -89,5 +89,24 @@ spec:
           configMap:
             name: prometheus-config
         - name: data
-          # NOTE: production deploy zameni emptyDir sa PVC (10-20Gi za 30d retention)
-          emptyDir: {}
+          # PVC za 30d retention (TSDB blocks rastu ~500MB/dan za default scrape
+          # interval-e). 15Gi je sweet spot — pokriva 30d sa 2x buffer-om.
+          # ReclaimPolicy: Retain preporuceno na production-u da metrike prezive
+          # accidental pod delete (default StorageClass moze biti Delete).
+          persistentVolumeClaim:
+            claimName: prometheus-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 15Gi

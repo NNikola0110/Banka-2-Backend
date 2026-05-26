@@ -1,0 +1,53 @@
+# =========================================================================
+# faster-whisper tiny Speech-to-Text sidecar (MIT).
+# CPU inference 2-5s na 10s audio (int8 quantization). Multilingual (32 jezika).
+# Model pre-baked u image-u — no volume mount potreban.
+#
+# 3-tier anti-hallucination zastita ugradjena u app: pre-flight RMS check,
+# Silero VAD, hallucination pattern filter. Vidi docker-compose.yml komentar.
+# =========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whisper-stt
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: whisper-stt
+    app.kubernetes.io/component: arbitro
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: whisper-stt
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: whisper-stt
+        app.kubernetes.io/component: arbitro
+    spec:
+      containers:
+        - name: whisper-stt
+          image: ghcr.io/raf-si-2025/banka-2-whisper-stt:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8093
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8093
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8093
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi

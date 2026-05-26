@@ -8,7 +8,6 @@ metadata:
     app.kubernetes.io/component: messaging
 spec:
   serviceName: rabbitmq-svc
-  replicas: 1
   # NOTE: Single replica je dovoljno za demo + razvoj. Production HA cluster
   # zahteva 3-5 replica + RabbitMQ Cluster Operator (rabbitmq.com/rabbitmqclusters)
   # ili manuelni `rabbitmqctl join_cluster`. DevOps moze povecati replica count
@@ -31,11 +30,13 @@ spec:
               name: amqp
             - containerPort: 15672
               name: management
-          env:
-            - name: RABBITMQ_DEFAULT_USER
-              value: guest
-            - name: RABBITMQ_DEFAULT_PASS
-              value: guest
+          envFrom:
+            # RabbitMQ default user/password iz Secret-a (vidi
+            # k8s/02-secrets/rabbitmq-credentials.yaml.example). Isti Secret se
+            # mountuje u banka-core/trading-service/notification-service Deployments
+            # — sva 4 konzumenta/producera dele iste kredencijale.
+            - secretRef:
+                name: rabbitmq-credentials
           volumeMounts:
             - name: data
               mountPath: /var/lib/rabbitmq

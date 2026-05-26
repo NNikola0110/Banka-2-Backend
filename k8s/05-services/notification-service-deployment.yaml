@@ -32,8 +32,17 @@ spec:
             - configMapRef:
                 name: notification-service-config
           env:
+            # RabbitMQ Secret mapping (vidi banka-core-deployment.yaml za detalje).
+            - name: SPRING_RABBITMQ_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: RABBITMQ_DEFAULT_USER
             - name: SPRING_RABBITMQ_PASSWORD
-              value: guest
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: RABBITMQ_DEFAULT_PASS
             - name: MAIL_PASSWORD
               valueFrom:
                 secretKeyRef:

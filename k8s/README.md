@@ -10,7 +10,7 @@ samostalan i moze se apply-ovati sa `kubectl apply -f <folder>/`.
 k8s/
 ├── 00-namespace.yaml
 ├── 01-configmaps/        — ConfigMaps (8 fajla, ne-sensitive env)
-├── 02-secrets/           — Secret templates (9 .example fajla, NE commit-ovati prave)
+├── 02-secrets/           — Secret templates (11 .example fajla, NE commit-ovati prave)
 ├── 03-storage/           — README sa StorageClass napomenama
 ├── 04-databases/         — StatefulSets za postgres-primary, postgres-replica, trading-db, influxdb, rabbitmq
 ├── 05-services/          — Deployments + Services + HPA + PDB za 5 app servisa
@@ -19,6 +19,7 @@ k8s/
 ├── 08-jobs/              — banka-core seed + trading-service seed + bootstrap historical data
 ├── 09-spark/             — 3 ScheduledSparkApplication CRD + operator install guide
 ├── 10-networkpolicies/   — internal-mesh + db-restrict NetPol
+├── 11-arbitro/           — Arbitro AI sidecari (OPCIONO, GPU required za ollama)
 └── README.md             — ovaj fajl
 ```
 
@@ -85,6 +86,20 @@ kubectl create secret generic jwt-secret \
 # Internal API key (BE inter-service)
 kubectl create secret generic internal-api-key \
   --from-literal=BANKA2_INTERNAL_API_KEY=$(openssl rand -hex 32) \
+  -n banka2-tim2
+
+# Grafana admin password (premestaj sa hardkodiranog admin/admin)
+kubectl create secret generic grafana-credentials \
+  --from-literal=GF_SECURITY_ADMIN_USER=admin \
+  --from-literal=GF_SECURITY_ADMIN_PASSWORD=$(openssl rand -hex 16) \
+  -n banka2-tim2
+
+# RabbitMQ default user (premestaj sa hardkodiranog guest/guest).
+# Sva 4 servisa (rabbitmq StatefulSet + banka-core/trading-service/notification-service)
+# dele iste kredencijale iz ovog Secret-a.
+kubectl create secret generic rabbitmq-credentials \
+  --from-literal=RABBITMQ_DEFAULT_USER=banka2 \
+  --from-literal=RABBITMQ_DEFAULT_PASS=$(openssl rand -hex 16) \
   -n banka2-tim2
 
 # Pogledaj 02-secrets/*.example za ostatak (discord-webhook, partner-tokens,
@@ -194,7 +209,32 @@ kubectl get scheduledsparkapplications -n banka2-tim2
 kubectl describe scheduledsparkapplication analytics-daily -n banka2-tim2 | grep "Next Run"
 ```
 
-### Korak 9 — NetworkPolicies (security hardening)
+### Korak 9 — Arbitro AI sidecari (OPCIONO, GPU required za ollama)
+
+**Preskoci ako:** nema GPU node u klasteru ili Arbitro nije deo demo scope-a.
+Aplikacija graceful-fallback-uje (`/assistant/health` vraca `llmReachable=false`,
+Arbitro FAB prikazuje "Offline" badge). Celine 1-5 rade bez Arbitro-a.
+
+```bash
+# Pun deploy (GPU node mora postojati za ollama).
+# DevOps tim mora labelovati GPU node: kubectl label node <gpu-node> nvidia.com/gpu.present=true
+kubectl apply -f 11-arbitro/
+
+# ALTERNATIVA: deploy bez ollama (samo CPU sidecari rade — wikipedia/rag/kokoro/whisper).
+# Arbitro LLM nedostupan, ali ostali tools rade kroz /assistant/tools/* endpoint-e.
+kubectl apply -f 11-arbitro/wikipedia-service-deployment.yaml \
+              -f 11-arbitro/wikipedia-service-svc.yaml \
+              -f 11-arbitro/rag-service-deployment.yaml \
+              -f 11-arbitro/rag-service-svc.yaml \
+              -f 11-arbitro/kokoro-tts-deployment.yaml \
+              -f 11-arbitro/kokoro-tts-svc.yaml \
+              -f 11-arbitro/whisper-stt-deployment.yaml \
+              -f 11-arbitro/whisper-stt-svc.yaml
+```
+
+Vidi `11-arbitro/README.md` za detalje (GPU requirements, RAG spec docs indexing, itd.).
+
+### Korak 10 — NetworkPolicies (security hardening)
 
 **VAZNO:** NetPol-e apply-uj NA KRAJU, tek kada potvrdis da sve radi. Inace
 moze blokirati saobracaj i otezati debugging.

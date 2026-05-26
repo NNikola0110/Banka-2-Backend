@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-service-svc
+  namespace: banka2-tim2
+  labels:
+    app.kubernetes.io/name: rag-service
+    app.kubernetes.io/component: arbitro
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rag-service
+  ports:
+    - port: 8091
+      targetPort: 8091
+      name: http

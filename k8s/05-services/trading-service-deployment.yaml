@@ -43,8 +43,17 @@ spec:
                 secretKeyRef:
                   name: postgres-credentials
                   key: POSTGRES_TRADING_PASSWORD
+            # RabbitMQ Secret mapping (vidi banka-core-deployment.yaml za detalje).
+            - name: SPRING_RABBITMQ_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: RABBITMQ_DEFAULT_USER
             - name: SPRING_RABBITMQ_PASSWORD
-              value: guest
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: RABBITMQ_DEFAULT_PASS
             - name: BANKA2_INFLUX_TOKEN
               valueFrom:
                 secretKeyRef:

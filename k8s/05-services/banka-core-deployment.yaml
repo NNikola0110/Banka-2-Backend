@@ -54,9 +54,19 @@ spec:
                 secretKeyRef:
                   name: postgres-credentials
                   key: POSTGRES_PASSWORD
-            # SPRING_RABBITMQ_PASSWORD - jednostavan default `guest` (cluster-internal).
+            # RabbitMQ user/pass iz Secret-a (vidi k8s/02-secrets/rabbitmq-credentials.yaml.example).
+            # Spring koristi SPRING_RABBITMQ_USERNAME/PASSWORD env, RabbitMQ Secret ima
+            # RABBITMQ_DEFAULT_USER/PASS kljuceve (consumer i producer dele iste kredencijale).
+            - name: SPRING_RABBITMQ_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: RABBITMQ_DEFAULT_USER
             - name: SPRING_RABBITMQ_PASSWORD
-              value: guest
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: RABBITMQ_DEFAULT_PASS
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness

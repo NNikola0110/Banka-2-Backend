@@ -15,9 +15,9 @@ data:
   BANKACORE_BASE_URL: "http://banka-core-svc:8080"
 
   # ── RabbitMQ (margin events publishing) ───────────────────────────────────
+  # USERNAME/PASSWORD iz Secret-a `rabbitmq-credentials` u Deployment env block-u.
   SPRING_RABBITMQ_HOST: "rabbitmq-svc"
   SPRING_RABBITMQ_PORT: "5672"
-  SPRING_RABBITMQ_USERNAME: "guest"
 
   # ── InfluxDB (OHLCV time-series; W1-T6 enabled) ───────────────────────────
   BANKA2_INFLUX_URL: "http://influxdb-svc:8086"

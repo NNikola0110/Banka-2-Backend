@@ -22,13 +22,18 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # GHCR zahteva lowercase repository owner — `RAF-SI-2025` → `raf-si-2025`.
+      # Bez ovog: docker push moze odbijati ili kreirati duplikat path-ove.
+      - name: Convert repository owner to lowercase
+        id: string
+        run: echo "lowercase=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
       - name: Build & Push spark-jobs
         uses: docker/build-push-action@v6
         with:
           context: ./spark
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/banka-2-spark-jobs:latest
-            ghcr.io/${{ github.repository_owner }}/banka-2-spark-jobs:${{ github.sha }}
+            ghcr.io/${{ steps.string.outputs.lowercase }}/banka-2-spark-jobs:latest
+            ghcr.io/${{ steps.string.outputs.lowercase }}/banka-2-spark-jobs:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

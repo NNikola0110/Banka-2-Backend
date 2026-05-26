@@ -39,9 +39,10 @@ data:
   AUTH_RATE_LIMIT_CAPACITY: "10"
 
   # ── RabbitMQ ──────────────────────────────────────────────────────────────
+  # USERNAME/PASSWORD se postavljaju iz Secret-a `rabbitmq-credentials`
+  # u Deployment env block-u (valueFrom secretKeyRef).
   SPRING_RABBITMQ_HOST: "rabbitmq-svc"
   SPRING_RABBITMQ_PORT: "5672"
-  SPRING_RABBITMQ_USERNAME: "guest"
 
   # ── Partitioning ──────────────────────────────────────────────────────────
   BANKA2_PARTITIONS_ENABLED: "true"

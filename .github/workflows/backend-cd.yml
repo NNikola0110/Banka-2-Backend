@@ -24,7 +24,7 @@ jobs:
   # Glavni BE image (Spring Boot + Java 25)
   # ============================================================
   backend:
-    name: Build & Push banka2-backend
+    name: Build & Push banka-2-backend
     runs-on: ubuntu-latest
     # CI-02: pokrece se SAMO ako je upstream `backend-ci` workflow uspesan.
     # `workflow_run` event uvek fire-uje (success ili failure), pa job-ovi
@@ -57,8 +57,8 @@ jobs:
           file: ./banka2_bek/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ steps.string.outputs.lowercase }}/banka2-backend:latest
-            ghcr.io/${{ steps.string.outputs.lowercase }}/banka2-backend:${{ github.sha }}
+            ghcr.io/${{ steps.string.outputs.lowercase }}/banka-2-backend:latest
+            ghcr.io/${{ steps.string.outputs.lowercase }}/banka-2-backend:${{ github.sha }}
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
 
@@ -76,12 +76,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: banka2-rag-tool
+          - image: banka-2-rag-tool
             context: ./Banka-2-Tools/rag-service
-          - image: banka2-wikipedia-tool
+          - image: banka-2-wikipedia-tool
             context: ./Banka-2-Tools/wikipedia-service
-          - image: banka2-kokoro-tts
+          - image: banka-2-kokoro-tts
             context: ./Banka-2-Tools/kokoro-tts
+          - image: banka-2-whisper-stt
+            context: ./Banka-2-Tools/whisper-stt
     steps:
       - uses: actions/checkout@v4
 
@@ -117,7 +119,7 @@ jobs:
   # `docker compose pull && up -d` dobija odmah upotrebljiv LLM.
   # ============================================================
   ollama:
-    name: Build & Push banka2-ollama (pre-baked Gemma)
+    name: Build & Push banka-2-ollama (pre-baked Gemma)
     runs-on: ubuntu-latest
     # CI-02: gate na uspesan backend-ci.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
@@ -151,8 +153,8 @@ jobs:
           context: ./Banka-2-Tools/ollama
           push: true
           tags: |
-            ghcr.io/${{ steps.string.outputs.lowercase }}/banka2-ollama:latest
-            ghcr.io/${{ steps.string.outputs.lowercase }}/banka2-ollama:${{ github.sha }}
+            ghcr.io/${{ steps.string.outputs.lowercase }}/banka-2-ollama:latest
+            ghcr.io/${{ steps.string.outputs.lowercase }}/banka-2-ollama:${{ github.sha }}
           # Cache se NE koristi za ollama — model layer je 7GB i GHA cache
           # ima 10GB limit; brzo ga popunis i nemas mesta za druge layer-e.
           # Build je dugacak (~10-15min) ali ide jednom po push-u na main.
@@ -165,7 +167,7 @@ jobs:
   # `Banka-2-Tools/alert-router-service` (re-use sidecar layout iz Tools-a).
   # ============================================================
   monitoring:
-    name: Build & Push banka2-alert-router
+    name: Build & Push banka-2-alert-router
     runs-on: ubuntu-latest
     # CI-02: gate na uspesan backend-ci.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
@@ -192,7 +194,7 @@ jobs:
           context: ./Banka-2-Tools/alert-router-service
           push: true
           tags: |
-            ghcr.io/${{ steps.string.outputs.lowercase }}/banka2-alert-router:latest
-            ghcr.io/${{ steps.string.outputs.lowercase }}/banka2-alert-router:${{ github.sha }}
+            ghcr.io/${{ steps.string.outputs.lowercase }}/banka-2-alert-router:latest
+            ghcr.io/${{ steps.string.outputs.lowercase }}/banka-2-alert-router:${{ github.sha }}
           cache-from: type=gha,scope=alert-router
           cache-to: type=gha,mode=max,scope=alert-router

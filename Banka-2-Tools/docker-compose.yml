@@ -29,7 +29,7 @@ services:
   #   tokom build-a (~10-15min), commit-uje u image layer.
   ollama:
     build: ./ollama
-    image: ghcr.io/raf-si-2025/banka2-ollama:latest
+    image: ghcr.io/raf-si-2025/banka-2-ollama:latest
     container_name: banka2_ollama
     ports:
       - "11434:11434"
@@ -93,7 +93,7 @@ services:
   # Wikipedia sidecar (FastAPI + wikipedia 1.4 + cachetools TTL 1h)
   wikipedia-tool:
     build: ./wikipedia-service
-    image: ghcr.io/raf-si-2025/banka2-wikipedia-tool:latest
+    image: ghcr.io/raf-si-2025/banka-2-wikipedia-tool:latest
     container_name: banka2_wikipedia_tool
     ports:
       - "8090:8090"
@@ -104,7 +104,7 @@ services:
   # relativno ka Banka-2-Tools (../.. = projekat root, pa "Info o predmetu").
   rag-tool:
     build: ./rag-service
-    image: ghcr.io/raf-si-2025/banka2-rag-tool:latest
+    image: ghcr.io/raf-si-2025/banka-2-rag-tool:latest
     container_name: banka2_rag_tool
     ports:
       - "8091:8091"
@@ -131,7 +131,7 @@ services:
   # Phonemizer dep: espeak-ng instaliran u Dockerfile-u kao fallback.
   kokoro-tts:
     build: ./kokoro-tts
-    image: ghcr.io/raf-si-2025/banka2-kokoro-tts:latest
+    image: ghcr.io/raf-si-2025/banka-2-kokoro-tts:latest
     container_name: banka2_kokoro_tts
     ports:
       - "8092:8092"
@@ -163,7 +163,7 @@ services:
   # BE kontejner mora da koristi 8094 u env var-u (`ARBITRO_WHISPER_URL`).
   whisper-stt:
     build: ./whisper-stt
-    image: ghcr.io/raf-si-2025/banka2-whisper-stt:latest
+    image: ghcr.io/raf-si-2025/banka-2-whisper-stt:latest
     container_name: banka2_whisper_stt
     ports:
       - "8094:8093"
