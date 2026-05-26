@@ -17,10 +17,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - banka2.tim2.raf-si-2025.example.com
+        - banka-2.radenkovic.rs
       secretName: banka2-tls-cert
   rules:
-    - host: banka2.tim2.raf-si-2025.example.com
+    - host: banka-2.radenkovic.rs
       http:
         paths:
           # /api/* - default putanja iz FE-a (FE saljete `/api/orders`, `/api/auth/login`...).

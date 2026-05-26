@@ -19,8 +19,8 @@ data:
 
   # ── Notification URL base (deep-link u FE iz email-a) ────────────────────
   # Mudrinic dodeli pravi domain; default placeholder za K8s deploy.
-  NOTIFICATION_ACTIVATION_URL_BASE: "https://banka2.tim2.raf-si-2025.example.com"
-  NOTIFICATION_PASSWORD_RESET_URL_BASE: "https://banka2.tim2.raf-si-2025.example.com"
+  NOTIFICATION_ACTIVATION_URL_BASE: "https://banka-2.radenkovic.rs"
+  NOTIFICATION_PASSWORD_RESET_URL_BASE: "https://banka-2.radenkovic.rs"
 
   # ── Spring Boot Actuator probes ──────────────────────────────────────────
   MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
