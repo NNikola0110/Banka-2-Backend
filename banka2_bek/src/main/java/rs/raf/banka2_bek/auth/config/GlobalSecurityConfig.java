@@ -164,6 +164,12 @@ public class GlobalSecurityConfig  {
                         // authenticated() ali NE sme da vidi revizioni dnevnik).
                         // MORA biti deklarisan PRE anyRequest() matcher-a.
                         .requestMatchers("/audit/**").hasAnyAuthority("ROLE_ADMIN", "ADMIN", "SUPERVISOR")
+                        // W3-T2: Spark fraud detection alerti — istom obrazcu kao /audit/**:
+                        // ADMIN + SUPERVISOR only. CLIENT-i nikad ne smeju da vide ni risk
+                        // score ni feature vektore drugih korisnika. MORA biti deklarisan
+                        // PRE anyRequest() matcher-a.
+                        .requestMatchers("/admin/fraud-alerts/**").hasAnyAuthority(
+                                "ROLE_ADMIN", "ADMIN", "SUPERVISOR")
                         // Interni API (Faza 2 - SAGA seam ka trading-service).
                         // InternalAuthFilter validira X-Internal-Key i postavlja ROLE_INTERNAL.
                         // MORA biti deklarisan PRE anyRequest() matcher-a.

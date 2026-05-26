@@ -107,6 +107,12 @@ public class TradingSecurityConfig {
                 .requestMatchers("/admin/dividends/**").hasAnyAuthority(    // B9
                         "ROLE_ADMIN", "ADMIN", "SUPERVISOR")
                 .requestMatchers("/dividends/**").authenticated()          // B9
+                // ── W3-T2: Spark analytics (read-only) — ADMIN/SUPERVISOR ───
+                .requestMatchers("/admin/analytics/**").hasAnyAuthority(
+                        "ROLE_ADMIN", "ADMIN", "SUPERVISOR")
+                // ── W3-T2: ML predictions (read-only) — svaki authenticated ──
+                //   (paritet sa /listings/** koje je authenticated() default).
+                .requestMatchers("/listings/*/prediction").authenticated()
                 .anyRequest().authenticated())
             // CI-05: defense-in-depth security response headers (paritet sa
             // banka2_bek GlobalSecurityConfig). Gateway (nginx) takodje setuje
