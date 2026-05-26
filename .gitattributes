@@ -10,6 +10,7 @@
 *.sh text eol=lf
 db-init/* text eol=lf
 db-replica-init/* text eol=lf
+trading-db-init/* text eol=lf
 
 # Dockerfile-ovi (build stage RUN linije idu kroz /bin/sh u Linux base image-u)
 Dockerfile text eol=lf

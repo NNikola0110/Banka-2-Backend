@@ -87,10 +87,19 @@ services:
       # SEC-02: lozinka MORA biti postavljena kroz env (.env ili shell var).
       # Vidi `.env.example` za dev placeholder.
       POSTGRES_PASSWORD: ${POSTGRES_TRADING_PASSWORD:?POSTGRES_TRADING_PASSWORD required - cp .env.example .env then edit}
+      # W2-T3: analytics_reader read-only user (Spark analytics/ML jobs).
+      # 01-analytics-reader.sh kreira user-a; 02-analytics-tables.sql
+      # kreira analytics_daily i price_predictions tabele. Oba pokrecu se
+      # SAMO pri prvom boot-u (data dir mora biti prazan).
+      ANALYTICS_READER_PASSWORD: ${ANALYTICS_READER_PASSWORD:?ANALYTICS_READER_PASSWORD required - cp .env.example .env then edit}
     ports:
       - "6435:5432"
     volumes:
       - trading_db_data:/var/lib/postgresql/data
+      # Init scripts (W2-T3): analytics_reader user + analytics output tabele.
+      # Idu PRE seed-trading-a koji ima svoje insert-ove (trading-seed.sql
+      # cita ih kroz seed-trading servis posle trading-service kreira tabele).
+      - ./trading-db-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tradinguser -d trading"]
       interval: 10s
