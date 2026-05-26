@@ -87,14 +87,4 @@ public class ListingPriceQueryService {
     private static Long asLong(Object o) {
         return o instanceof Number n ? n.longValue() : null;
     }
-
-    /** OHLCV candle za jedan vremenski prozor. */
-    public record OhlcvCandle(
-            Instant timestamp,
-            Double open,
-            Double high,
-            Double low,
-            Double close,
-            Long volume
-    ) {}
 }

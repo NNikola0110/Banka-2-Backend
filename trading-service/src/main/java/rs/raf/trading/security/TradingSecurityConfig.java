@@ -53,7 +53,10 @@ public class TradingSecurityConfig {
             .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .authorizeHttpRequests(auth -> auth
                 // ── Javne rute ───────────────────────────────────────────────
-                .requestMatchers("/actuator/health", "/actuator/info", "/actuator/prometheus").permitAll()
+                // /actuator/health/** pokriva /actuator/health (aggregate) + /liveness
+                // + /readiness K8s probes. Wildcard ('/**') propusta sve sub-path-eve.
+                .requestMatchers("/actuator/health", "/actuator/health/**",
+                        "/actuator/info", "/actuator/prometheus").permitAll()
                 .requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                 // ── Interni API (X-Internal-Key) — banka-core interbank seam ──
                 .requestMatchers("/internal/**").hasAuthority("ROLE_INTERNAL")

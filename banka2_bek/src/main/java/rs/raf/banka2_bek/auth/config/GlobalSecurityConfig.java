@@ -87,7 +87,12 @@ public class GlobalSecurityConfig  {
                                 "/v3/api-docs",
                                 "/exchange-rates",
                                 "/exchange/calculate",
+                                // /actuator/health/** pokriva: /actuator/health (aggregate),
+                                // /actuator/health/liveness (K8s liveness probe) i
+                                // /actuator/health/readiness (K8s readiness probe). Wildcard
+                                // path matcher ('/**') propusta sve sub-path-eve bez auth.
                                 "/actuator/health",
+                                "/actuator/health/**",
                                 "/actuator/info",
                                 "/actuator/prometheus"
                         ).permitAll()

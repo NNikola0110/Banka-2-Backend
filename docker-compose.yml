@@ -362,14 +362,15 @@ services:
       SPRING_RABBITMQ_USERNAME: guest
       SPRING_RABBITMQ_PASSWORD: guest
       # InfluxDB — `timeseries` paket je presao u trading-service (pod-faza 2f).
-      # `banka2.influx.enabled=false` drzi InfluxConfig/Recorder bean-ove
-      # inertnim (ConditionalOnProperty) — kontejner je gore, write-ovi
-      # OHLCV tickova se ukljucuju u Fazi 3.
+      # W1-T6 (26.05.2026): `banka2.influx.enabled=true` aktivira
+      # InfluxConfig/Recorder/QueryService bean-ove (@ConditionalOnProperty),
+      # ListingPriceRecorder pise OHLCV tickove pri svakom price refresh-u,
+      # OhlcvController izlaze GET /listings/{symbol}/ohlcv za FE chartove.
       BANKA2_INFLUX_URL: http://influxdb:8086
       BANKA2_INFLUX_TOKEN: ${INFLUX_TOKEN:-dev-token-change-me-32-bytes-minimum}
       BANKA2_INFLUX_ORG: ${INFLUX_ORG:-banka2}
       BANKA2_INFLUX_BUCKET: ${INFLUX_BUCKET:-tick-listings}
-      BANKA2_INFLUX_ENABLED: "false"
+      BANKA2_INFLUX_ENABLED: "true"
     depends_on:
       trading_db:
         condition: service_healthy
