@@ -88,6 +88,16 @@ COPY --from=layers /app/spring-boot-loader/ ./
 COPY --from=layers /app/snapshot-dependencies/ ./
 COPY --from=layers /app/application/ ./
 
+# Non-root user (uid 1001) za K8s PodSecurityStandard "restricted" compliance.
+# Dual-toolchain fallback: groupadd/useradd (Debian/Ubuntu — eclipse-temurin
+# base) ili addgroup/adduser (Alpine — busybox utils). 2>/dev/null suppress-uje
+# stderr ako prvi alat nije prisutan, `||` prebacuje na drugi. chown -R /app
+# obezbedjuje da non-root user moze da cita layered jar bez "Permission denied".
+RUN groupadd -g 1001 -r spring 2>/dev/null || addgroup -g 1001 spring \
+ && useradd -u 1001 -g 1001 -r -m -s /bin/sh spring 2>/dev/null || adduser -u 1001 -G spring -D -s /bin/sh spring \
+ && chown -R 1001:1001 /app
+USER 1001
+
 EXPOSE 8080
 # `JarLauncher` je Spring Boot bootstrapper koji ucitava layered jar.
 ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]
