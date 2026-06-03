@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
+import rs.raf.trading.margin.model.CompanyMarginAccount;
 import rs.raf.trading.margin.model.MarginAccount;
 import rs.raf.trading.margin.model.MarginAccountStatus;
 
@@ -20,6 +21,16 @@ public interface MarginAccountRepository extends JpaRepository<MarginAccount, Lo
      * Pronalazi sve margin racune za datog korisnika (USER vlasnistvo).
      */
     List<MarginAccount> findByUserId(Long userId);
+
+    /**
+     * BE-STK-06: pronalazi marzni racun kompanije (COMPANY vlasnistvo) po
+     * {@code companyId}. {@code company_id} kolona je samo na
+     * {@link CompanyMarginAccount} potklasi, pa upit ide nad konkretnim tipom.
+     * Po Marzni_Racuni.txt §57: "kompanija moze imati samo jedan marzni racun" —
+     * vraca prvi nadjen (treba da bude najvise jedan zbog one-per-company pravila).
+     */
+    @Query("SELECT c FROM CompanyMarginAccount c WHERE c.companyId = :companyId")
+    Optional<CompanyMarginAccount> findByCompanyId(@Param("companyId") Long companyId);
 
     /**
      * BE-STK-05: pronalazi prvi ACTIVE margin racun za korisnika.
@@ -47,9 +58,22 @@ public interface MarginAccountRepository extends JpaRepository<MarginAccount, Lo
 
     /**
      * BE-STK-04 (2-step block, H2 test compat): pronalazi id-eve svih margin
-     * racuna sa {@code maintenance_margin > initial_margin} koji su jos uvek
-     * ACTIVE. Caller (servis) potom poziva {@link #bulkUpdateStatus} sa istom
-     * listom da ih atomicno flipne na BLOCKED.
+     * racuna ciji je RASPOLOZIVI initialMargin (IM − reservedMargin) ispod
+     * maintenanceMargin, a jos uvek su ACTIVE. Caller (servis) potom poziva
+     * {@link #bulkUpdateStatus} sa istom listom da ih atomicno flipne na BLOCKED.
+     *
+     * <p><b>P1-margin-1 (R2 1326 / R3 1548) — kasni margin call:</b> ranije je
+     * uslov bio {@code maintenance_margin > initial_margin} (SIROV IM, ignorisao
+     * {@code reservedMargin}). To je bilo nekonzistentno sa {@code withdraw}
+     * guard-om (P1-8) koji vec koristi {@code IM − reservedMargin < MM}: racun sa
+     * velikim {@code reservedMargin} (hold za in-flight margin BUY) mogao je da ima
+     * RASPOLOZIVU marzu ispod MM a da ga dnevni scheduler NE blokira (margin call
+     * kasni — banka izlozena). Sada oba puta (scheduler + post-fill
+     * {@code MarginOrderSettlementService.checkMarginCallAndBlock}) koriste isti
+     * raspolozivi prag {@code (IM − reservedMargin) < MM}.
+     *
+     * <p>{@code reservedMargin} je nullable u legacy redovima → {@code COALESCE}
+     * na 0 da uslov ne otpadne za stare zapise.
      *
      * <p>Was atomic UPDATE...RETURNING (PG-only). Now 2-step JPA for H2 test
      * compat. Race window: between SELECT and UPDATE, concurrent deposit moze
@@ -58,7 +82,9 @@ public interface MarginAccountRepository extends JpaRepository<MarginAccount, Lo
      * flipnut na BLOCKED, depozit puca; sa druge strane scheduler trci unutar
      * @Transactional pa svi nadjeni id-evi se UPDATE-uju u istoj Tx).
      */
-    @Query("SELECT m.id FROM MarginAccount m WHERE m.maintenanceMargin > m.initialMargin AND m.status = :activeStatus")
+    @Query("SELECT m.id FROM MarginAccount m "
+            + "WHERE (m.initialMargin - COALESCE(m.reservedMargin, 0)) < m.maintenanceMargin "
+            + "AND m.status = :activeStatus")
     List<Long> findEligibleForBlock(@Param("activeStatus") MarginAccountStatus activeStatus);
 
     /**

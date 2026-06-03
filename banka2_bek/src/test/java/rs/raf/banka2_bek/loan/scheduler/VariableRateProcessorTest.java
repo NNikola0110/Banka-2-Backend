@@ -226,6 +226,37 @@ class VariableRateProcessorTest {
     }
 
     @Test
+    @DisplayName("P1: last installment principalPortion clamped to amount-interest (R3-1596 consistency)")
+    void lastInstallmentPrincipalConsistentWithChargedAmount() {
+        // R3-1596 (consistency): ranije je poslednja rata forsirala principalPortion = CEO
+        // remainingPrincipal, raskidajuci vezu sa onim sto se naplacuje (amount). Sada se kapira
+        // na (amount - interest) → principalAmount <= amount za SVAKU ratu, pa InstallmentProcessor
+        // ne moze umanjiti dug za vise nego sto je naplaceno. Pojas-i-tregeri sa guard-om tamo.
+        Loan loan = buildVariableLoan(1L, "VAR-LAST", LoanType.CASH,
+                new BigDecimal("30.00"), new BigDecimal("31.75"),
+                new BigDecimal("2000.0000"), BigDecimal.valueOf(100000));
+        LoanInstallment u1 = buildInstallment(1L, loan, false, new BigDecimal("2000.0000"));
+        LoanInstallment u2 = buildInstallment(2L, loan, false, new BigDecimal("2000.0000"));
+        LoanInstallment u3 = buildInstallment(3L, loan, false, new BigDecimal("2000.0000"));
+
+        when(installmentRepository.findByLoanIdOrderByExpectedDueDateAsc(1L))
+                .thenReturn(List.of(u1, u2, u3));
+
+        processor.adjustOne(loan, new BigDecimal("0.00"));
+
+        ArgumentCaptor<LoanInstallment> captor = ArgumentCaptor.forClass(LoanInstallment.class);
+        verify(installmentRepository, times(3)).save(captor.capture());
+
+        // Svaka rata: principal koji umanjuje dug NE sme premasiti amount koji se naplacuje.
+        for (LoanInstallment saved : captor.getAllValues()) {
+            assertThat(saved.getPrincipalAmount())
+                    .as("principalAmount (%s) must not exceed charged amount (%s)",
+                            saved.getPrincipalAmount(), saved.getAmount())
+                    .isLessThanOrEqualTo(saved.getAmount());
+        }
+    }
+
+    @Test
     @DisplayName("updates all unpaid installments with new monthly payment + principal/interest breakdown")
     void updatesInstallments() {
         Loan loan = buildVariableLoan(1L, "VAR-INST", LoanType.CASH,

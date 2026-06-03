@@ -175,8 +175,18 @@ public class MailNotificationService {
         HtmlMailSender.sendHtmlMail(mailSender, fromAddress, toEmail, subject, html);
     }
 
+    /**
+     * <b>P2-notif-reliability-2 (R3 1591): default subject.</b> Subject je bio
+     * direktno {@code title}; prazan/null title → email BEZ subject-a (spam-flag,
+     * lose iskustvo). Kad je title prazan, koristi se generican subject
+     * ("Obaveštenje") za zaglavlje, dok telo (H1) i dalje koristi prosledjeni
+     * title (template ga sam tretira).
+     */
+    private static final String DEFAULT_IN_APP_SUBJECT = "Obaveštenje";
+
     public void sendInAppNotificationMail(String toEmail, String firstName, String title, String body) {
         String html = inAppGenericEmailTemplate.buildBody(firstName, title, body);
-        HtmlMailSender.sendHtmlMail(mailSender, fromAddress, toEmail, title, html);
+        String subject = (title == null || title.isBlank()) ? DEFAULT_IN_APP_SUBJECT : title;
+        HtmlMailSender.sendHtmlMail(mailSender, fromAddress, toEmail, subject, html);
     }
 }

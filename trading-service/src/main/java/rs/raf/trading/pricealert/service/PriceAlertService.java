@@ -37,6 +37,9 @@ import java.util.stream.Collectors;
 @Slf4j
 public class PriceAlertService {
 
+    /** [P2-input-validation-1 / R1 517] gornja granica aktivnih alarma po korisniku (DoS guard). */
+    public static final int MAX_ACTIVE_ALERTS_PER_USER = 50;
+
     private final PriceAlertRepository alertRepository;
     private final ListingRepository listingRepository;
     private final TradingUserResolver userResolver;
@@ -50,11 +53,22 @@ public class PriceAlertService {
         UserContext me = userResolver.resolveCurrent();
         String ownerType = resolveOwnerType(me);
 
+        // R1 810: HTTP put vec validira preko @Valid na CreatePriceAlertDto
+        // (@NotNull + @DecimalMin), pa je null-grana nedostizna kroz kontroler.
+        // Zadrzano kao defense-in-depth za direktne (non-@Valid) pozivaoce —
+        // pinovano direktnim service testovima (createAlert_thresholdZero/Negative).
         if (dto.getThreshold() == null || dto.getThreshold().compareTo(BigDecimal.ZERO) <= 0) {
             throw new IllegalArgumentException("threshold mora biti veci od 0");
         }
         if (dto.getCondition() == null) {
             throw new IllegalArgumentException("condition je obavezan (ABOVE ili BELOW)");
+        }
+
+        // [P2-input-validation-1 / R1 517] limit broja aktivnih alarma po korisniku (DoS guard).
+        if (alertRepository.countByOwnerIdAndOwnerTypeAndActiveTrue(me.userId(), ownerType)
+                >= MAX_ACTIVE_ALERTS_PER_USER) {
+            throw new IllegalArgumentException(
+                    "Dostigli ste maksimalan broj aktivnih alarma (" + MAX_ACTIVE_ALERTS_PER_USER + ").");
         }
 
         Listing listing = listingRepository.findById(dto.getListingId())
@@ -151,9 +165,37 @@ public class PriceAlertService {
         }
         Map<Long, Listing> byId = updatedListings.stream()
                 .collect(Collectors.toMap(Listing::getId, l -> l));
+        return evaluate(byId);
+    }
 
+    /**
+     * R2-1384 (stale-price) — varijanta za scheduler: prima {@code listingId}-eve i
+     * SAMA cita svezu cenu listinga UNUTAR ove ({@code @Transactional}) tx, umesto da
+     * radi nad detached {@code Listing} entitetima procitanim u zasebnoj scheduler tx
+     * (gde je cena vec mogla da zastari). Hook iz {@code ListingServiceImpl} i dalje
+     * koristi {@link #checkAlerts(List)} jer prosledjuje sveze-perzistovane listinge.
+     */
+    @Transactional
+    public int checkAlertsForListings(List<Long> listingIds) {
+        if (listingIds == null || listingIds.isEmpty()) {
+            return 0;
+        }
+        Map<Long, Listing> byId = listingRepository.findAllById(listingIds).stream()
+                .collect(Collectors.toMap(Listing::getId, l -> l));
+        if (byId.isEmpty()) {
+            return 0;
+        }
+        return evaluate(byId);
+    }
+
+    /**
+     * Zajednicka evaluacija aktivnih alarma za dati skup listinga (po id-u → entitet
+     * sa SVEZOM cenom). Atomicna deaktivacija ({@code deactivateAlertIfActive}) +
+     * R2-1382 re-aktivacija na publish-fail.
+     */
+    private int evaluate(Map<Long, Listing> byId) {
         List<PriceAlert> candidates = alertRepository.findByActiveTrueAndListingIdIn(
-                updatedListings.stream().map(Listing::getId).toList());
+                byId.keySet().stream().toList());
 
         int triggered = 0;
         for (PriceAlert alert : candidates) {
@@ -176,7 +218,19 @@ public class PriceAlertService {
                     // Lokalno reflektuj stanje za publishTriggerNotification consumer.
                     alert.setActive(false);
                     alert.setTriggeredAt(triggeredAt);
-                    publishTriggerNotification(alert, listing);
+                    boolean published = publishTriggerNotification(alert, listing);
+                    if (!published) {
+                        // R2-1382: deaktivacija uspela ali notifikacija nije isporucena
+                        // (npr. RabbitMQ down). RE-AKTIVIRAJ alarm da bi se ponovo okidao
+                        // sledeci ciklus — inace bi alarm bio tiho izgubljen (deaktiviran
+                        // bez ijedne notifikacije korisniku).
+                        alertRepository.reactivateAlert(alert.getId());
+                        alert.setActive(true);
+                        alert.setTriggeredAt(null);
+                        log.warn("PriceAlert id={} re-aktiviran — notifikacija nije isporucena, okida se ponovo",
+                                alert.getId());
+                        continue;
+                    }
                     triggered++;
                     log.info("PriceAlert triggered: id={}, ownerId={}, ticker={}, price={}, threshold={}, condition={}",
                             alert.getId(), alert.getOwnerId(), listing.getTicker(),
@@ -189,6 +243,12 @@ public class PriceAlertService {
         return triggered;
     }
 
+    /**
+     * R1 813 — granicna semantika (Sc26): okidanje je INKLUZIVNO. ABOVE okida kad
+     * je {@code price >= threshold} (dostigao ILI presao prag), BELOW kad je
+     * {@code price <= threshold}. Pinovano testovima
+     * {@code checkAlerts_priceEqualToThresholdAbove_triggers} (price == threshold → okida).
+     */
     private boolean shouldTrigger(PriceAlertCondition condition, BigDecimal price, BigDecimal threshold) {
         if (price == null || threshold == null) {
             return false;
@@ -199,7 +259,13 @@ public class PriceAlertService {
         };
     }
 
-    private void publishTriggerNotification(PriceAlert alert, Listing listing) {
+    /**
+     * Publish-uje {@code PRICE_ALERT_TRIGGERED} notifikaciju.
+     *
+     * @return {@code true} ako je notifikacija uspesno predata; {@code false} ako je
+     *         publish pukao (R2-1382: pozivalac tada re-aktivira alarm da se ne izgubi).
+     */
+    private boolean publishTriggerNotification(PriceAlert alert, Listing listing) {
         String ticker = listing.getTicker() != null ? listing.getTicker() : "?";
         String body = "Cena hartije " + ticker + " je "
                 + (alert.getCondition() == PriceAlertCondition.ABOVE ? "presla iznad" : "pala ispod")
@@ -214,8 +280,10 @@ public class PriceAlertService {
                     "PRICE_ALERT",
                     alert.getId()
             );
+            return true;
         } catch (RuntimeException ex) {
             log.warn("Slanje notifikacije za PriceAlert id={} pukla: {}", alert.getId(), ex.getMessage());
+            return false;
         }
     }
 

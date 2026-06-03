@@ -39,9 +39,11 @@ public class LoanRequestDto {
     private Integer employmentPeriod;
 
     /**
-     * BE-PAY-06: OTP verifikacioni kod za zahtev za kredit (povlacenje
-     * sredstava u korist klijenta). Paritet sa PaymentServiceImpl/Savings
-     * OTP gate-om. Mora biti unesen u istom request body-ju.
+     * ACCEPTED-DEVIATION (user-directed 03.06): zahtev za kredit vise NE zahteva OTP.
+     * Polje je zadrzano radi back-compat-a (FE/Mobile/postojeci pozivi sme da ga
+     * salju), ali se IGNORISE — OTP vazi iskljucivo za placanja i transfere.
+     * @deprecated OTP uklonjen iz loan flow-a; polje se ne cita.
      */
+    @Deprecated
     private String otpCode;
 }

@@ -73,4 +73,19 @@ public class RecurringOrder {
 
     @UpdateTimestamp
     private LocalDateTime updatedAt;
+
+    /**
+     * N3 FIX (concurrency): optimisticko zakljucavanje. Bez {@code @Version} dva
+     * konkurentna DCA scheduler tick-a (2 k8s replike bez ShedLock-a, ili overlap
+     * istog ciklusa) mogu istovremeno procitati isti dospeli trajni nalog, oba
+     * kreirati Market BUY (dupli DCA buy / double-charge) i lost-update istisnuti
+     * {@code nextRun} pomeranje. Sa {@code @Version}, drugi {@code save} nad istim
+     * redom baca {@code OptimisticLockException} — njegova {@code executeOne}
+     * REQUIRES_NEW tx se rollback-uje izolovano (order se ne kreira dvaput), a
+     * {@code nextRun} se pomera tacno jednom. Postojeca tabela: kolona default 0.
+     */
+    @Version
+    @ColumnDefault("0")
+    @Column(name = "version")
+    private Long version;
 }

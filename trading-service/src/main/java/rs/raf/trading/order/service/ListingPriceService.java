@@ -14,7 +14,15 @@ public class ListingPriceService {
 
     public BigDecimal getPricePerUnit(CreateOrderDto dto, Listing listing, OrderType orderType, OrderDirection direction) {
         return switch (orderType) {
-            case MARKET, STOP -> direction == OrderDirection.BUY ? listing.getAsk() : listing.getBid();
+            case MARKET -> direction == OrderDirection.BUY ? listing.getAsk() : listing.getBid();
+            // P1-dividends-order-1 (1544 / spec §387): Price Per Unit za STOP nalog je
+            // Stop Value (NE ask/bid). Pre fix-a se koristio ask/bid pa je approximatePrice
+            // bio potcenjen (stopValue je tipicno iznad ask-a za BUY) -> rezervacija premala
+            // -> commit moze premasiti rezervaciju. Fallback na ask/bid samo ako stopValue
+            // nije zadat (defanzivno, ne bi trebalo da se desi za STOP nalog).
+            case STOP -> dto.getStopValue() != null
+                    ? dto.getStopValue()
+                    : (direction == OrderDirection.BUY ? listing.getAsk() : listing.getBid());
             case LIMIT, STOP_LIMIT -> dto.getLimitValue();
         };
     }

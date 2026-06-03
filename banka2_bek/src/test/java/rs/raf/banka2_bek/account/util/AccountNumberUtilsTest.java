@@ -35,6 +35,17 @@ class AccountNumberUtilsTest {
     }
 
     @Test
+    @DisplayName("R2 1416 - bank code je derivat maticnog broja (jedinstven izvor)")
+    void bankCodeDerivedFromRegistrationNumber() {
+        // Routing/bank code = prve 3 cifre maticnog broja; ne sme se razilaziti.
+        assertEquals("222", AccountNumberUtils.BANK_CODE);
+        assertEquals(AccountNumberUtils.BANK_REGISTRATION_NUMBER.substring(0, 3),
+                AccountNumberUtils.BANK_CODE);
+        // Mora se poklapati sa interbank.my-routing-number=222 (application.properties).
+        assertTrue(AccountNumberUtils.BANK_REGISTRATION_NUMBER.startsWith("222"));
+    }
+
+    @Test
     @DisplayName("prolazi mod11 validaciju")
     void passesmod11() {
         for (int i = 0; i < 20; i++) {
@@ -128,6 +139,13 @@ class AccountNumberUtilsTest {
     @DisplayName("tekuci bez podtipa zavrsava na 10")
     void checkingNullSubtypeEndsWith10() {
         String number = AccountNumberUtils.generate(AccountType.CHECKING, null, false);
+        assertTrue(number.endsWith("10"), "Expected ending 10, got: " + number);
+    }
+
+    @Test
+    @DisplayName("R1-624: tekuci SALARY eksplicitno zavrsava na 10 (bez tihog default-a)")
+    void checkingSalaryEndsWith10() {
+        String number = AccountNumberUtils.generate(AccountType.CHECKING, AccountSubtype.SALARY, false);
         assertTrue(number.endsWith("10"), "Expected ending 10, got: " + number);
     }
 

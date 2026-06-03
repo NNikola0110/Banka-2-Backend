@@ -11,6 +11,8 @@ import rs.raf.banka2.contracts.internal.InternalUserDto;
 import rs.raf.banka2.contracts.internal.TransferFundsRequest;
 import rs.raf.trading.actuary.model.ActuaryType;
 import rs.raf.trading.actuary.repository.ActuaryInfoRepository;
+import rs.raf.trading.audit.model.AuditActionType;
+import rs.raf.trading.audit.service.AuditLogService;
 import rs.raf.trading.client.BankaCoreClient;
 import rs.raf.trading.client.BankaCoreClientException;
 import rs.raf.trading.common.UserRole;
@@ -56,7 +58,8 @@ import java.util.stream.Stream;
 public class InvestmentFundService {
 
     private static final String RSD = "RSD";
-    private static final BigDecimal FX_FEE_RATE = new BigDecimal("0.01");
+    // P2-profit-fx-fee-1 (R5 1877): jedinstven izvor istine za FX fee (1%, nepromenjeno).
+    private static final BigDecimal FX_FEE_RATE = rs.raf.trading.common.FxFeePolicy.FX_FEE_RATE;
     private static final int MONEY_SCALE = 4;
 
     private final FundValueSnapshotRepository fundValueSnapshotRepository;
@@ -72,6 +75,11 @@ public class InvestmentFundService {
     private final FundLiquidationService fundLiquidationService;
     private final CurrencyConversionService currencyConversionService;
     private final rs.raf.trading.investmentfund.scheduler.FundValueSnapshotScheduler fundValueSnapshotScheduler;
+    // P2-audit-coverage-1 (R5 1888): audit create/invest/withdraw (Celina 4 money/lifecycle).
+    private final AuditLogService auditLogService;
+    // C-notif-email (02.06): pravo obavestenje klijentu pri isplati/likvidaciji iz
+    // fonda (Sc36 — "klijent dobija obavestenje da ce isplatu dobiti u kratkom roku").
+    private final rs.raf.trading.notification.service.NotificationService notificationService;
 
     /**
      * T12 — fallback strategija za "Banka kao klijent fonda" (Celina 4 (Nova) §4406-4435).
@@ -125,6 +133,18 @@ public class InvestmentFundService {
 
         String managerName = resolveUserName(supervisorId, UserRole.EMPLOYEE);
         log.info("Fund '{}' created, account #{}", fund.getName(), fundAccount.id());
+
+        // R5 1888 (P2-audit-coverage-1): audit kreiranja fonda. afterCommit + best-effort —
+        // pise se SAMO ako createFund tx commit-uje (nema phantom audit na rollback fond-racuna)
+        // i pad audit-a NE obara kreiranje. Aktor = supervizor.
+        auditLogService.recordAfterCommit(
+                supervisorId, "EMPLOYEE",
+                AuditActionType.FUND_CREATED,
+                "Fund '" + fund.getName() + "' created (id=" + fund.getId()
+                        + ", account=" + fundAccount.id() + ", minContribution="
+                        + fund.getMinimumContribution() + ")",
+                "FUND", fund.getId());
+
         return InvestmentFundMapper.toDetailDto(fund, fundAccount, BigDecimal.ZERO, BigDecimal.ZERO,
                 Collections.emptyList(), Collections.emptyList(),
                 managerName != null ? managerName : "N/A");
@@ -139,7 +159,30 @@ public class InvestmentFundService {
                                                          BigDecimal minContribution, BigDecimal maxContribution,
                                                          BigDecimal minFundValue, BigDecimal maxFundValue,
                                                          BigDecimal minProfit, BigDecimal maxProfit) {
-        List<InvestmentFund> funds = investmentFundRepository.findByActiveTrueOrderByNameAsc();
+        return listDiscovery(searchQuery, sortField, sortDirection,
+                minContribution, maxContribution, minFundValue, maxFundValue,
+                minProfit, maxProfit, null);
+    }
+
+    /**
+     * P2-perf-nplus1-1 (R1 492): BE-side filter po {@code managerEmployeeId}.
+     * Ranije je FE dovlacio CELU listu fondova pa filtrirao po manageru
+     * klijentski (N+1 po manager-prikazu) — sad se filter primenjuje na BE-u
+     * (DB-side findByManagerEmployeeId kad je manager poznat, inace pun aktivni
+     * set sa ostalim filterima). Aditivno; postojeci pozivaoci ne menjaju se.
+     */
+    public List<InvestmentFundSummaryDto> listDiscovery(String searchQuery, String sortField, String sortDirection,
+                                                         BigDecimal minContribution, BigDecimal maxContribution,
+                                                         BigDecimal minFundValue, BigDecimal maxFundValue,
+                                                         BigDecimal minProfit, BigDecimal maxProfit,
+                                                         Long managerEmployeeId) {
+        List<InvestmentFund> funds = managerEmployeeId != null
+                ? investmentFundRepository.findByManagerEmployeeId(managerEmployeeId).stream()
+                        .filter(InvestmentFund::isActive)
+                        .sorted(Comparator.comparing(InvestmentFund::getName,
+                                Comparator.nullsLast(Comparator.naturalOrder())))
+                        .toList()
+                : investmentFundRepository.findByActiveTrueOrderByNameAsc();
 
         Stream<InvestmentFund> stream = funds.stream();
         if (searchQuery != null && !searchQuery.isBlank()) {
@@ -235,18 +278,17 @@ public class InvestmentFundService {
      * P11 — Spec Celina 4 (Nova) §3592-3629: "Performanse fonda: tabela ili
      * grafikon (mesecni, kvartalni ili godisnji prikaz)".
      *
-     * Implementacija (kad bude):
-     *  - FundValueSnapshot tabela vec snima dnevno (FundValueSnapshotScheduler 23:45)
-     *  - Ovde agregiramo po granularity parametru:
-     *      - DAY    -> sve tacke izmedju [from, to]
-     *      - WEEK   -> grupisi po ISO sedmici, uzmi poslednju vrednost
-     *      - MONTH  -> grupisi po YYYY-MM, uzmi poslednju vrednost
-     *      - QUARTER-> grupisi po (YYYY, ceil(month/3)), poslednja vrednost
-     *      - YEAR   -> grupisi po YYYY, poslednja vrednost
-     *  - Vrati listu FundPerformancePointDto sortiranu po datumu ASC.
+     * IMPLEMENTIRANO. FundValueSnapshot tabela snima dnevno
+     * (FundValueSnapshotScheduler 23:45); ovde agregiramo po granularity:
+     *  - DAY    -> sve tacke izmedju [from, to]
+     *  - WEEK   -> grupisi po ISO sedmici, uzmi poslednju vrednost
+     *  - MONTH  -> grupisi po YYYY-MM, uzmi poslednju vrednost
+     *  - QUARTER-> grupisi po (YYYY, ceil(month/3)), poslednja vrednost
+     *  - YEAR   -> grupisi po YYYY, poslednja vrednost
+     * Vraca listu FundPerformancePointDto sortiranu po datumu ASC.
      *
-     * FE FundDetailsPage ima toggle Day/Week/Month/Quarter/Year — ovde
-     * dodati granularity parametar kad bude.
+     * FE FundDetailsPage ima toggle Day/Week/Month/Quarter/Year koji se
+     * mapira na granularity parametar.
      */
     public List<FundPerformancePointDto> getPerformance(Long fundId, LocalDate from, LocalDate to, Granularity granularity) {
         List<FundValueSnapshot> snapshots = fundValueSnapshotRepository.findByFundIdAndSnapshotDateBetweenOrderBySnapshotDateAsc(fundId, from, to);
@@ -364,9 +406,21 @@ public class InvestmentFundService {
         // izvorni racun nema dovoljno sredstava. Idempotency kljuc je deterministicki
         // po ClientFundTransaction id-u (tx je perzistiran sa PENDING statusom PRE
         // novcane noge).
+        // P1-funds-1 (1553): STABILAN invest idempotency kljuc — izveden iz
+        // (investor, fund, source account, totalDebit, dan), NE iz IDENTITY
+        // tx.getId() koji NIJE postojan kroz rollback. Dual-write rizik: transfer
+        // commit-uje (novac source→fund) pa upsertPosition/save padne → JPA
+        // rollback → tx PENDING, pozicija NIJE kreditovana; manualni retry istog
+        // dana sa istim parametrima generisao bi nov txId → nov kljuc → drugi
+        // transfer prolazi → DUPLI debit. Stabilan kljuc cini banka-core dedup
+        // efektivnim: retry istog dana replay-uje umesto da dvaput naplati.
+        String investKey = "fund-invest-" + investor.userRole() + "-" + investor.userId()
+                + "-" + fund.getId() + "-" + sourceAccount.id()
+                + "-" + totalDebit.stripTrailingZeros().toPlainString()
+                + "-" + LocalDate.now();
         try {
             bankaCoreClient.transferFunds(
-                    "fund-invest-" + tx.getId(),
+                    investKey,
                     new TransferFundsRequest(
                             sourceAccount.id(), totalDebit,
                             fundAccount.id(), amounts.amountRsd(),
@@ -388,6 +442,16 @@ public class InvestmentFundService {
         ClientFundPosition position = upsertPosition(fund.getId(), investor, amounts.amountRsd());
         log.info("T8 invest completed: fund={}, investor={}#{}, amountRsd={}, sourceAccount={}",
                 fund.getId(), investor.userRole(), investor.userId(), amounts.amountRsd(), sourceAccount.id());
+
+        // R5 1888 (P2-audit-coverage-1): audit uplate u fond (money-moving). afterCommit +
+        // best-effort — pise se SAMO ako invest tx commit-uje (novac vec presao source→fund)
+        // i pad audit-a NE obara uplatu. Aktor = investor (klijent ili supervizor u ime banke).
+        auditLogService.recordAfterCommit(
+                investor.userId(), investor.userRole(),
+                AuditActionType.FUND_INVEST,
+                "Invested " + amounts.amountRsd() + " RSD into fund '" + fund.getName()
+                        + "' (id=" + fund.getId() + ", sourceAccount=" + sourceAccount.id() + ")",
+                "FUND", fund.getId());
 
         // Bag prijavljen 10.05.2026: FundDetailsPage performance graf prazan jer
         // fund_value_snapshots nema red za danas. Posle uspesne uplate, zovem
@@ -439,14 +503,58 @@ public class InvestmentFundService {
                 .findByFundIdAndUserIdAndUserRole(fund.getId(), investor.userId(), investor.userRole())
                 .orElseThrow(() -> new IllegalArgumentException("Nemate poziciju u fondu " + fund.getName() + "."));
 
+        // P1-funds-1 (221/1348): povlacenje se kapira na CURRENT VALUE (NAV udeo),
+        // NE na totalInvested (cost basis) — inace klijent ne moze da povuce
+        // profit (§259/335-337). currentValue = fundValue * (totalInvested /
+        // sumTotalInvested). Withdraw-all (amount==null) vraca currentValue, ne
+        // cost basis.
+        BigDecimal totalInvested = nullToZero(position.getTotalInvested());
+        BigDecimal currentValue = nullToZero(safeCompute(
+                () -> fundValueCalculator.computePositionValue(
+                        fund.getId(), investor.userId(), investor.userRole()),
+                totalInvested));
+        // Defensive: ako NAV racun padne / vrati 0 ili null (npr. banka-core
+        // nedostupan), ne dozvoljavamo da withdraw-all isplati 0; fallback na
+        // cost basis.
+        if (currentValue.signum() <= 0) {
+            currentValue = totalInvested;
+        }
+
         BigDecimal amountRsd = dto.getAmount() == null
-                ? nullToZero(position.getTotalInvested())
+                ? currentValue.setScale(MONEY_SCALE, RoundingMode.HALF_UP)
                 : dto.getAmount().setScale(MONEY_SCALE, RoundingMode.HALF_UP);
         if (amountRsd.signum() <= 0) {
             throw new IllegalArgumentException("Iznos isplate mora biti pozitivan.");
         }
-        if (nullToZero(position.getTotalInvested()).compareTo(amountRsd) < 0) {
-            throw new IllegalArgumentException("Trazeni iznos je veci od pozicije u fondu.");
+        if (currentValue.compareTo(amountRsd) < 0) {
+            throw new IllegalArgumentException(
+                    "Trazeni iznos je veci od pozicije (trenutne vrednosti) u fondu.");
+        }
+
+        // R1 791: parcijalno povlacenje ne sme ostaviti "dust" poziciju ispod
+        // minimuma fonda. Ako preostala vrednost (currentValue - amountRsd) padne
+        // ispod minimumContribution a NIJE potpuna isplata (remaining > 0), odbij —
+        // simetricno invest gate-u (amountRsd >= minimumContribution). Klijent mora
+        // ili da ostane na/iznad minimuma ili da povuce celu poziciju.
+        BigDecimal remainingValue = currentValue.subtract(amountRsd).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
+        BigDecimal minContribution = nullToZero(fund.getMinimumContribution());
+        if (remainingValue.signum() > 0 && remainingValue.compareTo(minContribution) < 0) {
+            throw new IllegalArgumentException(
+                    "Parcijalno povlacenje bi ostavilo poziciju (" + remainingValue
+                            + " RSD) ispod minimuma fonda (" + minContribution
+                            + " RSD). Povucite manji iznos ili celu poziciju.");
+        }
+
+        // P1-funds-1 (1343): cost-basis udeo koji se povlaci OVOM transakcijom,
+        // proporcionalno (amountRsd / currentValue). Pozicija se NE smanjuje
+        // ovde — tek pri stvarnoj isplati (immediate payout ili FIFO
+        // onFillCompleted), da klijent ne izgubi udeo ako likvidacija nikad
+        // ne uspe.
+        BigDecimal investedDelta = currentValue.signum() > 0
+                ? totalInvested.multiply(amountRsd).divide(currentValue, MONEY_SCALE, RoundingMode.HALF_UP)
+                : amountRsd;
+        if (investedDelta.compareTo(totalInvested) > 0) {
+            investedDelta = totalInvested;
         }
 
         ClientFundTransaction tx = new ClientFundTransaction();
@@ -456,24 +564,41 @@ public class InvestmentFundService {
         tx.setAmountRsd(amountRsd);
         tx.setSourceAccountId(destinationAccount.id());
         tx.setInflow(false);
+        tx.setInvestedDelta(investedDelta);
         tx.setStatus(ClientFundTransactionStatus.PENDING);
         tx.setCreatedAt(LocalDateTime.now());
         tx = clientFundTransactionRepository.save(tx);
-
-        decreasePosition(position, amountRsd);
 
         BigDecimal availableCash = nullToZero(fundAccount.availableBalance());
         if (availableCash.compareTo(amountRsd) >= 0) {
             executePayout(tx, fundAccount, destinationAccount, actorRole);
             tx = clientFundTransactionRepository.save(tx);
-            log.info("T8 withdraw completed immediately: fund={}, investor={}#{}, amountRsd={}",
-                    fund.getId(), investor.userRole(), investor.userId(), amountRsd);
+            // P1-funds-1 (1343): pozicija se umanjuje TEK POSLE uspesne isplate.
+            decreasePosition(position, investedDelta);
+            // C-notif-email blocker #1 (03.06): Sc35/49/50 — klijent koji povlaci iz
+            // LIKVIDNOG fonda (immediate payout) MORA dobiti obavestenje o uspesnoj
+            // isplati. Ranije je ovo obavestenje slao SAMO FIFO/likvidacioni put
+            // (FundLiquidationService.executeTransactionPayout); za uobicajen slucaj
+            // (fond ima dovoljno cash-a) klijent NIJE dobijao nista — "exactly once" je
+            // bio prekrsen u nuli (0 emisija). Salje se TACNO JEDNOM po izvrsenoj isplati,
+            // keyed po txId (blocker #3) → distinktan od "pokrenuta" eventa istog ili
+            // druge isplate.
+            notifyFundPayout(investor.userId(), investor.userRole(), tx.getId(), fund.getId(),
+                    "Isplata iz fonda uspešna",
+                    "Isplata iz fonda " + fund.getName() + " u iznosu od " + amountRsd
+                            + " RSD je uspešno procesuirana.");
+            log.info("T8 withdraw completed immediately: fund={}, investor={}#{}, amountRsd={}, investedDelta={}",
+                    fund.getId(), investor.userRole(), investor.userId(), amountRsd, investedDelta);
         } else {
             BigDecimal shortfall = amountRsd.subtract(availableCash).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
             tx.setFailureReason("Nedovoljno likvidnih sredstava; pokrenuta automatska likvidacija hartija.");
             tx = clientFundTransactionRepository.save(tx);
-            sendPushNotification(investor.userId(), "Isplata iz fonda " + fund.getName()
-                    + " je primljena i bice zavrsena nakon automatske likvidacije hartija.");
+            // Sc36 (TestoviCelina4): klijent dobija obavestenje da ce isplatu dobiti
+            // u kratkom roku (pokrenuta automatska likvidacija). Email + in-app.
+            notifyFundPayout(investor.userId(), investor.userRole(), tx.getId(), fund.getId(),
+                    "Isplata iz fonda pokrenuta",
+                    "Isplata iz fonda " + fund.getName() + " je primljena i biće završena "
+                            + "u kratkom roku, nakon automatske likvidacije hartija.");
             fundLiquidationService.liquidateFor(fund.getId(), shortfall);
             log.info("T8 withdraw pending: fund={}, investor={}#{}, amountRsd={}, shortfall={}",
                     fund.getId(), investor.userRole(), investor.userId(), amountRsd, shortfall);
@@ -481,6 +606,16 @@ public class InvestmentFundService {
 
         // Bag 10.05.2026 — vidi #invest hook iznad (snapshot za danas).
         fundValueSnapshotScheduler.snapshotFundIfMissing(fund);
+
+        // R5 1888 (P2-audit-coverage-1): audit isplate iz fonda (money-moving). afterCommit +
+        // best-effort — pad audit-a NE obara isplatu/likvidaciju. Status (immediate/pending) u opisu.
+        auditLogService.recordAfterCommit(
+                investor.userId(), investor.userRole(),
+                AuditActionType.FUND_WITHDRAW,
+                "Withdraw " + amountRsd + " RSD from fund '" + fund.getName() + "' (id=" + fund.getId()
+                        + ", destinationAccount=" + destinationAccount.id()
+                        + ", status=" + tx.getStatus() + ")",
+                "FUND", fund.getId());
 
         return toClientFundTransactionDto(tx, fund.getName());
     }
@@ -493,19 +628,48 @@ public class InvestmentFundService {
 
         if (isEmployeeActor(role)) {
             ensureSupervisor(requesterId);
+            Map<Long, String> accountNumbers = resolveAccountNumbers(transactions);
             return transactions.stream()
-                    .map(tx -> toClientFundTransactionDto(tx, fund.getName()))
+                    .map(tx -> toClientFundTransactionDto(tx, fund.getName(), accountNumbers))
                     .toList();
         }
 
         if (UserRole.isClient(role)) {
-            return transactions.stream()
+            List<ClientFundTransaction> mine = transactions.stream()
                     .filter(tx -> Objects.equals(tx.getUserId(), requesterId) && UserRole.CLIENT.equals(tx.getUserRole()))
-                    .map(tx -> toClientFundTransactionDto(tx, fund.getName()))
+                    .toList();
+            Map<Long, String> accountNumbers = resolveAccountNumbers(mine);
+            return mine.stream()
+                    .map(tx -> toClientFundTransactionDto(tx, fund.getName(), accountNumbers))
                     .toList();
         }
 
         throw new AccessDeniedException("Nemate pravo pregleda transakcija fonda.");
+    }
+
+    /**
+     * P2-perf-nplus1-1 (R5 1895): batch-resolve racuna za listu transakcija fonda.
+     * Razresava SAMO distinct (non-null) {@code sourceAccountId} → accountNumber
+     * (jedan {@code getAccount} po jedinstvenom racunu) umesto per-transaction
+     * lookup-a u petlji (N+1 preko mreze, ne-keshovano). Vise transakcija sa istog
+     * racuna deli jedan poziv. Greska na pojedinacnom racunu ostaje izolovana
+     * (taj racun se izostavi iz mape → accountNumber null, kao ranije).
+     */
+    private Map<Long, String> resolveAccountNumbers(List<ClientFundTransaction> transactions) {
+        Map<Long, String> accountNumbers = new HashMap<>();
+        transactions.stream()
+                .map(ClientFundTransaction::getSourceAccountId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .forEach(accountId -> {
+                    try {
+                        accountNumbers.put(accountId, bankaCoreClient.getAccount(accountId).accountNumber());
+                    } catch (BankaCoreClientException ex) {
+                        log.warn("Racun #{} za transakciju fonda nije razresiv ({}).",
+                                accountId, ex.getMessage());
+                    }
+                });
+        return accountNumbers;
     }
 
     /**
@@ -680,7 +844,9 @@ public class InvestmentFundService {
         InvestmentFund fund = investmentFundRepository.findById(fundId)
                 .orElseThrow(() -> new EntityNotFoundException("Fund #" + fundId + " not found."));
         if (!fund.isActive()) {
-            throw new IllegalStateException("Fond " + fund.getName() + " nije aktivan.");
+            // R1 485: neaktivan fond je state-conflict (409), ne authz-denial (403).
+            throw new rs.raf.trading.investmentfund.exception.FundInactiveException(
+                    "Fond " + fund.getName() + " nije aktivan.");
         }
         return fund;
     }
@@ -718,6 +884,16 @@ public class InvestmentFundService {
                 + sourceCurrency + ").");
     }
 
+    /**
+     * R1 789 — NAMERNO odvojeno od {@code FundLiquidationService.executeTransactionPayout}.
+     * Iako oba puta isplacuju RSD->valuta racuna kroz isti banka-core transfer sa
+     * istim idempotency kljucem ("fund-payout-"+id), FX-provizioni gate i side-effekti
+     * se razlikuju: ovde immediate payout (destinationAccount + actorRole prosledjeni,
+     * gate = {@code UserRole.isClient(actorRole)}); tamo FIFO payout (destinationAccount
+     * fetchovan iz tx.sourceAccountId, gate = {@code ownerClientId != null && CLIENT},
+     * plus decreaseClientPosition + push-notif). Konsolidacija bi spregla money-gate
+     * logiku dva servisa — zadrzano razdvojeno (low-risk P3).
+     */
     private void executePayout(ClientFundTransaction tx, InternalAccountDto fundAccount,
                                InternalAccountDto destinationAccount, String actorRole) {
         BigDecimal amountRsd = tx.getAmountRsd().setScale(MONEY_SCALE, RoundingMode.HALF_UP);
@@ -885,6 +1061,23 @@ public class InvestmentFundService {
                         tx.getSourceAccountId(), tx.getId(), ex.getMessage());
             }
         }
+        return buildDto(tx, fundName, accountNumber);
+    }
+
+    /**
+     * P2-perf-nplus1-1 (R5 1895): batch-aware varijanta — accountNumber je vec
+     * razresen (iz {@link #resolveAccountNumbers} mape), bez per-transaction
+     * mreznog lookup-a.
+     */
+    private ClientFundTransactionDto toClientFundTransactionDto(ClientFundTransaction tx, String fundName,
+                                                               Map<Long, String> accountNumbers) {
+        String accountNumber = tx.getSourceAccountId() != null
+                ? accountNumbers.get(tx.getSourceAccountId())
+                : null;
+        return buildDto(tx, fundName, accountNumber);
+    }
+
+    private ClientFundTransactionDto buildDto(ClientFundTransaction tx, String fundName, String accountNumber) {
         return new ClientFundTransactionDto(
                 tx.getId(),
                 tx.getFundId(),
@@ -909,8 +1102,37 @@ public class InvestmentFundService {
         return name != null ? name : "Zaposleni #" + userId;
     }
 
-    private void sendPushNotification(Long userId, String message) {
-        log.info("[PUSH NOTIFICATION] userId={}: {}", userId, message);
+    /**
+     * C-notif-email (02.06): salje pravo obavestenje klijentu/supervizoru o isplati
+     * iz fonda (email + in-app) preko {@link rs.raf.trading.notification.service.NotificationService},
+     * tip {@code FUND_PAYOUT}. Zamenjuje raniji log-only stub (R1 490). Best-effort:
+     * greska se loguje i NE obara withdraw transakciju. Spec TestoviCelina4 Sc35/36/49/50.
+     *
+     * <p><b>C-notif-email blocker #3 (03.06): kljuc po {@code ClientFundTransaction.id}.</b>
+     * Referenca je {@code ("FUND_TRANSACTION", txId)} — NE {@code ("FUND", fundId)}.
+     * banka-core in-app idempotency kljuc se izvodi iz
+     * {@code (recipient, type, referenceType, referenceId)} i ZANEMARUJE title/body
+     * kad je referenca non-null. Kad bi referenca bila fundId, dve razlicite isplate
+     * iz istog fonda istom klijentu — i "Isplata pokrenuta" (Sc36) + "Isplata uspesna"
+     * (Sc35) za ISTU isplatu — generisale bi IDENTICAN kljuc → banka-core bi
+     * SUPRESOVAO drugu in-app notifikaciju (bell promasuje legitiman event). Kljuc po
+     * {@code txId} daje svakom logickom payout eventu jedinstven kljuc, dok i dalje
+     * dedupuje pravi retry istog eventa (isti txId).
+     */
+    private void notifyFundPayout(Long userId, String userRole, Long txId, Long fundId, String title, String message) {
+        try {
+            notificationService.notify(
+                    userId,
+                    userRole,
+                    rs.raf.trading.notification.model.NotificationType.FUND_PAYOUT,
+                    title,
+                    message,
+                    "FUND_TRANSACTION",
+                    txId);
+        } catch (Exception ex) {
+            log.warn("Failed to send fund payout notification for user #{} (tx #{}, fund #{}): {}",
+                    userId, txId, fundId, ex.getMessage());
+        }
     }
 
     private record InvestorIdentity(Long userId, String userRole) {}

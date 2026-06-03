@@ -211,6 +211,55 @@ class InterbankTwoPhaseCommitIT {
     }
 
     // =========================================================================
+    // Test 4 — Cross-bank: remote returns NULL vote (202 backoff) → treated as NO → rollback
+    // TEST-interbank-1: postojeci testovi pokrivaju samo YES/NO; ova grana pokriva
+    // null-vote (sendPhase1Network markira 202 i tretira kao NO/abort → rollbackTxPhase).
+    // =========================================================================
+
+    @Test
+    @DisplayName("Cross-bank: remote returns NULL vote (202) → treated as NO, local balance restored, ROLLBACK sent")
+    void crossBank_remoteReturnsNullVote_treatedAsNo_rollback() {
+        Client owner = seedClient("it-null@test.com");
+        Employee emp = seedEmployee("emp-null@test.com", "emp-null");
+        Currency rsd = seedCurrency("RSD");
+
+        String localNum  = "222000000000007777";
+        String remoteNum = "999000000000008888";
+        seedAccount(localNum, owner, emp, rsd, new BigDecimal("500.00"));
+
+        Transaction tx = transactionExecutorService.formTransaction(List.of(
+                new Posting(new TxAccount.Account(remoteNum), BigDecimal.valueOf(100),
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD))),
+                new Posting(new TxAccount.Account(localNum),  BigDecimal.valueOf(-100),
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD)))
+        ), "IT cross-bank NULL vote", null, "289", "test");
+
+        // Remote vraca NULL (npr. 202 backoff / nema joscompletovan glas) → tretira se kao NO.
+        when(interbankClient.sendMessage(eq(REMOTE_RN), eq(MessageType.NEW_TX), any(), eq(TransactionVote.class)))
+                .thenReturn(null);
+        when(interbankClient.sendMessage(eq(REMOTE_RN), eq(MessageType.ROLLBACK_TX), any(), eq(Void.class)))
+                .thenReturn(null);
+
+        transactionExecutorService.execute(tx);
+
+        // Lokalna rezervacija mora biti vracena (null-vote = abort).
+        Account local = accountRepository.findByAccountNumber(localNum).orElseThrow();
+        assertThat(local.getBalance()).isEqualByComparingTo("500.00");
+        assertThat(local.getAvailableBalance()).isEqualByComparingTo("500.00");
+        assertThat(local.getReservedAmount()).isEqualByComparingTo("0.00");
+
+        InterbankTransaction ibTx = txRepo.findByTransactionRoutingNumberAndTransactionIdString(
+                tx.transactionId().routingNumber(), tx.transactionId().id()).orElseThrow();
+        assertThat(ibTx.getStatus()).isEqualTo(InterbankTransactionStatus.ROLLED_BACK);
+
+        // NEW_TX se markira kao 202 (SENT-ekvivalent posle null-a), ROLLBACK posalje,
+        // a COMMIT_TX se NIKAD ne salje.
+        verify(interbankClient).sendMessage(eq(REMOTE_RN), eq(MessageType.NEW_TX), any(), eq(TransactionVote.class));
+        verify(interbankClient).sendMessage(eq(REMOTE_RN), eq(MessageType.ROLLBACK_TX), any(), eq(Void.class));
+        verify(interbankClient, never()).sendMessage(any(Integer.class), eq(MessageType.COMMIT_TX), any(), any());
+    }
+
+    // =========================================================================
     // Helpers
     // =========================================================================
 

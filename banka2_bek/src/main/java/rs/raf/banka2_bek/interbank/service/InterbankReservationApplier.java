@@ -1,6 +1,6 @@
 package rs.raf.banka2_bek.interbank.service;
 
-import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import rs.raf.banka2.contracts.internal.CommitStockRequest;
@@ -30,12 +30,23 @@ import java.math.BigDecimal;
  * (banka-core {@code InterbankRetryScheduler}) ne primeni kretanje hartija dvaput.
  */
 @Service
-@RequiredArgsConstructor
 @Transactional
 public class InterbankReservationApplier {
 
     private final AccountRepository accountRepository;
     private final TradingServiceInternalClient tradingServiceClient;
+    private final InterbankFxService interbankFxService;
+    private final String bankRegistrationNumber;
+
+    public InterbankReservationApplier(AccountRepository accountRepository,
+                                       TradingServiceInternalClient tradingServiceClient,
+                                       InterbankFxService interbankFxService,
+                                       @Value("${bank.registration-number}") String bankRegistrationNumber) {
+        this.accountRepository = accountRepository;
+        this.tradingServiceClient = tradingServiceClient;
+        this.interbankFxService = interbankFxService;
+        this.bankRegistrationNumber = bankRegistrationNumber;
+    }
 
     public void reserveMonas(String accountNumber, BigDecimal amount){
         Account acct = accountRepository.findForUpdateByAccountNumber(accountNumber)
@@ -65,21 +76,120 @@ public class InterbankReservationApplier {
 
     }
 
-    public void commitMonas(String accountNumber, BigDecimal amount, boolean isDebit){
+    /**
+     * Commit sender (Banka A) novcane noge — trosi rezervaciju iz {@code reserveMonas}:
+     * skida {@code amount} sa {@code balance} i {@code reservedAmount}
+     * ({@code availableBalance} je vec umanjen pri rezervaciji).
+     *
+     * <p>R1-681: raniji {@code isDebit} parametar je uklonjen. Recipient (Banka B) credit
+     * noga vise NE ide kroz ovaj metod — od §Celina 5 §40-66 ona ide kroz FX-svesni
+     * {@link #commitRecipientCredit} (konverzija + provizija). U produkciji je
+     * {@code commitMonas} pozivan iskljucivo sa {@code isDebit=false} (sender debit),
+     * pa je {@code isDebit=true} grana bila mrtav kod.
+     */
+    public void commitMonas(String accountNumber, BigDecimal amount){
         Account acct = accountRepository.findForUpdateByAccountNumber(accountNumber)
                 .orElseThrow(
                         () -> new InterbankExceptions.InterbankProtocolException("NO_SUCH_ACCOUNT: " + accountNumber)
                 );
 
-        if (isDebit) {
-            acct.setBalance(acct.getBalance().add(amount));
-            acct.setAvailableBalance(acct.getAvailableBalance().add(amount));
-        }
-        else {
-            acct.setBalance(acct.getBalance().subtract(amount));
-            acct.setReservedAmount(acct.getReservedAmount().subtract(amount));
-        }
+        acct.setBalance(acct.getBalance().subtract(amount));
+        acct.setReservedAmount(acct.getReservedAmount().subtract(amount));
         accountRepository.save(acct);
+    }
+
+    /**
+     * §Celina 5 §40-66: commit recipient (Banka B) monetary credit sa FX konverzijom
+     * i Banka-B provizijom.
+     *
+     * <p>Wire posting nosi {@code amount} u valuti posiljaoca ({@code postingCurrency}).
+     * Ako se ta valuta poklapa sa valutom primaocevog racuna — ovo je byte-identicno
+     * obicnom kreditu primaoca (rate=1, fee=0). Inace Banka B
+     * konvertuje po mid-rate-u, naplacuje inter-bank proviziju, i:
+     * <ul>
+     *   <li>kreditira primaocu "Krajnju vrednost" = converted − fee, u target valuti;</li>
+     *   <li>skida {@code converted} sa bankinog pool racuna u target valuti
+     *       (banka isplacuje primaocu);</li>
+     *   <li>vraca {@code fee} na isti bankin racun (provizija ostaje banci) —
+     *       neto promena bankinog racuna = −(converted − fee) = −recipientCredit.</li>
+     * </ul>
+     * Tako je novac ocuvan: banka ukupno isplati {@code converted} (primalac +
+     * zadrzana provizija), za sta je primila {@code amount} u source valuti od
+     * Banke A kroz 2PC settlement — koja sada (N5) i KNJIZI: source-ccy pool Banke B
+     * dobija {@code +amount}, cime je inter-bank konzervacija na nasim knjigama 0
+     * (target-ccy isplata je pokrivena source-ccy prilivom).
+     *
+     * @param pinnedFxRate N5 — zakljucan mid-rate iz VOTE faze; ako je non-null,
+     *        commit koristi NJEGA umesto live rate-a (FX drift se eliminise). Null
+     *        → fallback na live mid-rate (regression-safe za stare pozive).
+     */
+    public void commitRecipientCredit(String accountNumber, BigDecimal amount,
+                                      String postingCurrency, BigDecimal pinnedFxRate) {
+        Account recipient = accountRepository.findForUpdateByAccountNumber(accountNumber)
+                .orElseThrow(
+                        () -> new InterbankExceptions.InterbankProtocolException("NO_SUCH_ACCOUNT: " + accountNumber)
+                );
+
+        String recipientCcy = recipient.getCurrency() != null
+                ? recipient.getCurrency().getCode() : postingCurrency;
+
+        // Same-currency: zadrzi staro ponasanje (rate=1, fee=0) — regression-safe.
+        if (postingCurrency.equalsIgnoreCase(recipientCcy)) {
+            recipient.setBalance(recipient.getBalance().add(amount));
+            recipient.setAvailableBalance(recipient.getAvailableBalance().add(amount));
+            accountRepository.save(recipient);
+            return;
+        }
+
+        // Cross-currency: Banka B konvertuje + naplacuje proviziju.
+        // N5: ako imamo pinned kurs iz vote-a, koristimo NJEGA (FX drift eliminisan);
+        // inace fallback na live mid-rate.
+        InterbankFxService.InterbankFxQuote quote = (pinnedFxRate != null)
+                ? interbankFxService.quoteInboundSettlementWithRate(
+                        amount, postingCurrency, recipientCcy, pinnedFxRate)
+                : interbankFxService.quoteInboundSettlement(amount, postingCurrency, recipientCcy);
+        BigDecimal recipientCredit = quote.targetAmount(); // "Krajnja vrednost"
+        BigDecimal fee = quote.commission();
+        BigDecimal payout = recipientCredit.add(fee);      // = converted (mid-rate)
+
+        // Bankin pool racun u target valuti — banka isplacuje primaocu, zadrzava proviziju.
+        Account bankAccount = accountRepository.findBankAccountForUpdateByCurrency(
+                        bankRegistrationNumber, recipientCcy)
+                .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
+                        "Banka nema racun za " + recipientCcy + " (cross-currency inter-bank settlement)"));
+
+        // N5 — balance check u commit-u (uz pinned kurs): banka MORA imati 'payout'
+        // (converted) na target pool racunu. Vote-faza je proverila isto pod pinned
+        // kursom; ova provera stiti od stanja koje se promenilo izmedju vote i commit
+        // (npr. drugi konkurentni settlement potrosio pool). Overdraft → throw (commit
+        // pada, 2PC ostaje konzistentan jer recipient jos nije kreditiran).
+        if (bankAccount.getAvailableBalance().compareTo(payout) < 0) {
+            throw new InterbankExceptions.InterbankProtocolException(
+                    "INSUFFICIENT_ASSET: bankin " + recipientCcy + " pool nema "
+                            + payout + " za cross-currency inbound settlement");
+        }
+
+        // N5 — source-ccy pool Banke B prima 'amount' (wire asset koji je stigao od
+        // Banke A). Bez ovog priliva, target-ccy isplata bi bila nepokrivena → leak.
+        // Isti pool racun za same source-ccy je idempotentno pronadjen po valuti.
+        Account sourcePool = accountRepository.findBankAccountForUpdateByCurrency(
+                        bankRegistrationNumber, postingCurrency.toUpperCase())
+                .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
+                        "Banka nema racun za " + postingCurrency
+                                + " (cross-currency inter-bank source settlement)"));
+        sourcePool.setBalance(sourcePool.getBalance().add(amount));
+        sourcePool.setAvailableBalance(sourcePool.getAvailableBalance().add(amount));
+        accountRepository.save(sourcePool);
+
+        // Primalac dobija "Krajnju vrednost".
+        recipient.setBalance(recipient.getBalance().add(recipientCredit));
+        recipient.setAvailableBalance(recipient.getAvailableBalance().add(recipientCredit));
+        accountRepository.save(recipient);
+
+        // Banka (target pool): −converted (isplata) +fee (provizija) = −recipientCredit neto.
+        bankAccount.setBalance(bankAccount.getBalance().subtract(payout).add(fee));
+        bankAccount.setAvailableBalance(bankAccount.getAvailableBalance().subtract(payout).add(fee));
+        accountRepository.save(bankAccount);
     }
 
     /**

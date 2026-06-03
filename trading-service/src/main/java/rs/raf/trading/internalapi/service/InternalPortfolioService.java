@@ -252,8 +252,11 @@ public class InternalPortfolioService {
      */
     @Transactional(readOnly = true)
     public List<InternalPublicStockSellerDto> findAllPublicStock() {
+        // P2-perf-nplus1-1 (R5 1900): DB-side filter (publicQuantity > 0) umesto
+        // findAll() + in-memory filter — izbegava pun-table-scan nad celom
+        // portfolios tabelom (samo javne pozicije se materijalizuju).
         List<InternalPublicStockSellerDto> result = new ArrayList<>();
-        for (Portfolio p : portfolioRepository.findAll()) {
+        for (Portfolio p : portfolioRepository.findAllWithPublicQuantity()) {
             int publicQty = p.getPublicQuantity() == null ? 0 : p.getPublicQuantity();
             if (publicQty <= 0) continue;
             result.add(new InternalPublicStockSellerDto(p.getUserId(), p.getUserRole(),

@@ -1,6 +1,8 @@
 package rs.raf.trading.portfolio.service;
 
+import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import rs.raf.trading.common.UserContext;
@@ -45,51 +47,75 @@ public class PortfolioService {
         UserContext owner = userResolver.resolveCurrent();
         List<Portfolio> portfolios = portfolioRepository.findByUserIdAndUserRole(owner.userId(), owner.userRole());
 
-        return portfolios.stream().map(p -> {
-            BigDecimal currentPrice = getCurrentPrice(p.getListingId());
-            BigDecimal avgPrice = p.getAverageBuyPrice();
-            BigDecimal qty = BigDecimal.valueOf(p.getQuantity());
+        return portfolios.stream().map(p -> buildItemDto(p, getCurrentPrice(p.getListingId()), true)).toList();
+    }
 
-            // profit = (currentPrice - avgPrice) * quantity
-            BigDecimal profit = currentPrice.subtract(avgPrice).multiply(qty);
+    /**
+     * R1-728: jedinstvena izgradnja {@link PortfolioItemDto} (profit / profitPercent /
+     * polja) iz {@link Portfolio} + trenutne cene — DRY izmedju {@link #getMyPortfolio}
+     * i {@link #setPublicQuantity} (pre konsolidacije identican blok kopiran dvaput).
+     *
+     * @param withSettlementItm kad je {@code true}, dodatno popunjava settlementDate +
+     *                          inTheMoney iz listinga (jedan {@code findById}); to radi
+     *                          samo lista-put ({@code getMyPortfolio}), ne single-update
+     *                          put koji istorijski nije vracao ITM.
+     */
+    private PortfolioItemDto buildItemDto(Portfolio p, BigDecimal currentPrice, boolean withSettlementItm) {
+        BigDecimal avgPrice = p.getAverageBuyPrice();
+        BigDecimal qty = BigDecimal.valueOf(p.getQuantity());
 
-            // profitPercent = ((currentPrice - avgPrice) / avgPrice) * 100
-            BigDecimal profitPercent = BigDecimal.ZERO;
-            if (avgPrice.compareTo(BigDecimal.ZERO) != 0) {
-                profitPercent = currentPrice.subtract(avgPrice)
-                        .divide(avgPrice, 6, RoundingMode.HALF_UP)
-                        .multiply(BigDecimal.valueOf(100))
-                        .setScale(2, RoundingMode.HALF_UP);
-            }
+        // profit = (currentPrice - avgPrice) * quantity
+        BigDecimal profit = currentPrice.subtract(avgPrice).multiply(qty);
 
-            PortfolioItemDto dto = new PortfolioItemDto();
-            dto.setId(p.getId());
-            dto.setListingId(p.getListingId());
-            dto.setListingTicker(p.getListingTicker());
-            dto.setListingName(p.getListingName());
-            dto.setListingType(p.getListingType());
-            dto.setQuantity(p.getQuantity());
-            dto.setAverageBuyPrice(avgPrice);
-            dto.setCurrentPrice(currentPrice);
-            dto.setProfit(profit);
-            dto.setProfitPercent(profitPercent);
-            dto.setPublicQuantity(p.getPublicQuantity());
-            dto.setLastModified(p.getLastModified());
+        // profitPercent = ((currentPrice - avgPrice) / avgPrice) * 100
+        BigDecimal profitPercent = BigDecimal.ZERO;
+        if (avgPrice.compareTo(BigDecimal.ZERO) != 0) {
+            profitPercent = currentPrice.subtract(avgPrice)
+                    .divide(avgPrice, 6, RoundingMode.HALF_UP)
+                    .multiply(BigDecimal.valueOf(100))
+                    .setScale(2, RoundingMode.HALF_UP);
+        }
 
-            // Settlement date i ITM iz listinga
+        PortfolioItemDto dto = new PortfolioItemDto();
+        dto.setId(p.getId());
+        dto.setListingId(p.getListingId());
+        dto.setListingTicker(p.getListingTicker());
+        dto.setListingName(p.getListingName());
+        dto.setListingType(p.getListingType());
+        dto.setQuantity(p.getQuantity());
+        dto.setAverageBuyPrice(avgPrice);
+        dto.setCurrentPrice(currentPrice);
+        dto.setProfit(profit);
+        dto.setProfitPercent(profitPercent);
+        dto.setPublicQuantity(p.getPublicQuantity());
+        dto.setLastModified(p.getLastModified());
+
+        // Settlement date i ITM iz listinga.
+        //
+        // R1-173 (CORRECTNESS): "In-the-money" je pojam vezan za instrumente sa
+        // istekom (settlementDate) — futures/opcioni-tip. Portfolio drzi ISKLJUCIVO
+        // LONG pozicije (kupljene hartije: STOCK/FUTURES/FOREX), pa je za pozicije sa
+        // istekom ITM == "pozicija trenutno vredi vise nego sto je placeno"
+        // (currentPrice > averageBuyPrice). Za obicne akcije BEZ settlementDate-a
+        // (vecina portfolija) "ITM" nema smisla — ostaje null (FE/Mobile ga onda
+        // ne prikazuju). Stara verzija je ITM postavljala na SVE tipove uz
+        // zavaravajuci PUT/CALL komentar (portfolio nikad ne drzi short ni opcioni
+        // ugovor — to su zasebni Option entiteti) — pa je obicna akcija "u profitu"
+        // pogresno dobijala ITM badge.
+        if (withSettlementItm) {
             Optional<Listing> listingOpt = listingRepository.findById(p.getListingId());
             if (listingOpt.isPresent()) {
                 Listing listing = listingOpt.get();
                 dto.setSettlementDate(listing.getSettlementDate());
-                // ITM: za opcije - averageBuyPrice (strike) vs currentPrice
-                // Put opcija: ITM ako currentPrice < strikePrice (averageBuyPrice)
-                // Call opcija: ITM ako currentPrice > strikePrice
-                // Za obicne hartije: currentPrice > averageBuyPrice
-                dto.setInTheMoney(currentPrice.compareTo(avgPrice) > 0);
+                if (listing.getSettlementDate() != null) {
+                    // Instrument sa istekom (futures/opcioni-tip) — ITM za long poziciju.
+                    dto.setInTheMoney(currentPrice.compareTo(avgPrice) > 0);
+                }
+                // Obicna akcija (settlementDate == null) → inTheMoney ostaje null.
             }
+        }
 
-            return dto;
-        }).toList();
+        return dto;
     }
 
     /**
@@ -109,9 +135,14 @@ public class PortfolioService {
             totalProfit = totalProfit.add(item.getProfit());
         }
 
-        // Porez na kapitalnu dobit: 15% na pozitivan profit (spec: Celina 3 - Porez)
+        // Porez na kapitalnu dobit: 15% na pozitivan profit (spec: Celina 3 - Porez).
+        // R1-737: koristi centralizovani TaxConstants.computeTax (kanonska politika
+        // zaokruzivanja na TAX_SCALE) umesto inline multiply+setScale, da bi prikazani
+        // neplaceni porez bio izveden iz iste politike kao porez koji se stvarno
+        // naplacuje. Display rounding na 2 decimale primenjuje se na DTO granici
+        // (kao i svi ostali novcani iznosi u PortfolioSummaryDto).
         BigDecimal unpaidTax = totalProfit.compareTo(BigDecimal.ZERO) > 0
-                ? totalProfit.multiply(TaxConstants.TAX_RATE).setScale(2, RoundingMode.HALF_UP)
+                ? TaxConstants.computeTax(totalProfit).setScale(2, RoundingMode.HALF_UP)
                 : BigDecimal.ZERO;
 
         // Dohvati placeni porez iz TaxRecord-a
@@ -145,12 +176,14 @@ public class PortfolioService {
     public PortfolioItemDto setPublicQuantity(Long portfolioId, int quantity) {
         UserContext owner = userResolver.resolveCurrent();
 
+        // R1 422: jasni HTTP statusi umesto bare RuntimeException→400 catch-all.
         Portfolio portfolio = portfolioRepository.findById(portfolioId)
-                .orElseThrow(() -> new RuntimeException("Portfolio stavka nije pronadjena: " + portfolioId));
+                .orElseThrow(() -> new EntityNotFoundException(
+                        "Portfolio stavka nije pronadjena: " + portfolioId)); // → 404
 
         if (!portfolio.getUserId().equals(owner.userId())
                 || (portfolio.getUserRole() != null && !portfolio.getUserRole().equals(owner.userRole()))) {
-            throw new RuntimeException("Nemate pristup ovoj portfolio stavci.");
+            throw new AccessDeniedException("Nemate pristup ovoj portfolio stavci."); // → 403
         }
 
         if (quantity < 0 || quantity > portfolio.getQuantity()) {
@@ -161,34 +194,10 @@ public class PortfolioService {
         portfolio.setPublicQuantity(quantity);
         portfolioRepository.save(portfolio);
 
-        // Vrati azuriranu stavku
-        BigDecimal currentPrice = getCurrentPrice(portfolio.getListingId());
-        BigDecimal avgPrice = portfolio.getAverageBuyPrice();
-        BigDecimal qty = BigDecimal.valueOf(portfolio.getQuantity());
-
-        BigDecimal profit = currentPrice.subtract(avgPrice).multiply(qty);
-        BigDecimal profitPercent = BigDecimal.ZERO;
-        if (avgPrice.compareTo(BigDecimal.ZERO) != 0) {
-            profitPercent = currentPrice.subtract(avgPrice)
-                    .divide(avgPrice, 6, RoundingMode.HALF_UP)
-                    .multiply(BigDecimal.valueOf(100))
-                    .setScale(2, RoundingMode.HALF_UP);
-        }
-
-        PortfolioItemDto dto = new PortfolioItemDto();
-        dto.setId(portfolio.getId());
-        dto.setListingId(portfolio.getListingId());
-        dto.setListingTicker(portfolio.getListingTicker());
-        dto.setListingName(portfolio.getListingName());
-        dto.setListingType(portfolio.getListingType());
-        dto.setQuantity(portfolio.getQuantity());
-        dto.setAverageBuyPrice(avgPrice);
-        dto.setCurrentPrice(currentPrice);
-        dto.setProfit(profit);
-        dto.setProfitPercent(profitPercent);
-        dto.setPublicQuantity(portfolio.getPublicQuantity());
-        dto.setLastModified(portfolio.getLastModified());
-        return dto;
+        // Vrati azuriranu stavku (R1-728: deljeni buildItemDto; ovaj put istorijski
+        // NE vraca settlementDate/inTheMoney → withSettlementItm=false, ponasanje
+        // ostaje byte-identicno + stedi se jedan listing findById).
+        return buildItemDto(portfolio, getCurrentPrice(portfolio.getListingId()), false);
     }
 
     /**

@@ -78,8 +78,19 @@ public class DividendPayout {
     @Column(name = "payment_date", nullable = false)
     private LocalDate paymentDate;
 
-    /** true za EMPLOYEE — oslobodjeni poreza na kapitalnu dobit. */
-    @ColumnDefault("false")
+    /**
+     * true za EMPLOYEE — oslobodjeni poreza na kapitalnu dobit.
+     *
+     * <p>Default je {@code "0"} (NE {@code "false"}) jer je ova Boolean kolona
+     * mapirana kao {@code INTEGER} ({@code hibernate.type.preferred_boolean_jdbc_type=INTEGER}).
+     * Na pravom PostgreSQL-u {@code @ColumnDefault("false")} emituje
+     * {@code tax_exempt integer not null default false} sto PG odbija
+     * (boolean default na integer koloni) → tabela {@code dividend_payouts}
+     * se NE kreira → svaki runtime save/find puca + idempotency-guard ostaje
+     * prazan → dupla dividenda na cron retry-u. H2 (MODE=PostgreSQL) ovo guta
+     * jer ima implicit boolean↔int cast, pa je bug nevidljiv pod H2 testovima.
+     */
+    @ColumnDefault("0")
     @Column(name = "tax_exempt", nullable = false)
     private Boolean taxExempt;
 

@@ -124,7 +124,9 @@ class OrderMapperTest {
     }
 
     @Test
-    void toDto_nullContractSize_defaultsToOne() {
+    void toDto_nullContractSize_noListing_defaultsToOne() {
+        // OT-1048: legacy order bez persistovanog contractSize-a i bez listing-a →
+        // tip se ne moze razresiti → neutralni default 1.
         Order order = new Order();
         order.setId(5L);
         order.setPricePerUnit(BigDecimal.valueOf(100));
@@ -135,6 +137,26 @@ class OrderMapperTest {
 
         // 1 * 100 * 5 = 500
         assertThat(dto.getApproximatePrice()).isEqualByComparingTo(BigDecimal.valueOf(500));
+    }
+
+    @Test
+    void toDto_nullContractSize_forexListing_defaultsTo1000_OT1048() {
+        // OT-1048 [FIXED 02.06]: legacy FOREX order bez persistovanog contractSize-a →
+        // default se razresava po tipu hartije (FOREX → 1000 per spec §162), NE 1.
+        // Uskladjeno sa OrderServiceImpl rezervacijom i ListingMapper display-em.
+        Listing forex = new Listing();
+        forex.setListingType(ListingType.FOREX);
+        Order order = new Order();
+        order.setId(55L);
+        order.setListing(forex);
+        order.setPricePerUnit(BigDecimal.valueOf(1.10));
+        order.setQuantity(2);
+        order.setContractSize(null);
+
+        OrderDto dto = OrderMapper.toDto(order);
+
+        // 1000 * 1.10 * 2 = 2200
+        assertThat(dto.getApproximatePrice()).isEqualByComparingTo(BigDecimal.valueOf(2200));
     }
 
     @Test
@@ -149,6 +171,24 @@ class OrderMapperTest {
 
         // 100 * 50 * 2 = 10000
         assertThat(dto.getApproximatePrice()).isEqualByComparingTo(BigDecimal.valueOf(10000));
+    }
+
+    @Test
+    void toDto_persistedApproximatePrice_returnedVerbatim_R1_720() {
+        // R1-720: kad je approximatePrice persistovana (vrednost koja je stvarno
+        // rezervisana u order-flow-u), DTO je vraca takvu kakva jeste — NE
+        // rekalkulise iz pricePerUnit×qty×cs (sto bi dalo 999, divergira od
+        // persistovane 4200 npr. ako je pricePerUnit naknadno azuriran fill-om).
+        Order order = new Order();
+        order.setId(7L);
+        order.setPricePerUnit(BigDecimal.valueOf(333));
+        order.setQuantity(3);
+        order.setContractSize(1);
+        order.setApproximatePrice(BigDecimal.valueOf(4200)); // != 333*3 = 999
+
+        OrderDto dto = OrderMapper.toDto(order);
+
+        assertThat(dto.getApproximatePrice()).isEqualByComparingTo(BigDecimal.valueOf(4200));
     }
 
     @Test

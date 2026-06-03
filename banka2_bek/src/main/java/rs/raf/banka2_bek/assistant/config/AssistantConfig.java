@@ -113,6 +113,14 @@ public class AssistantConfig {
         executor.setThreadNamePrefix("interbank-");
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(30);
+        // N4 — bez rejection handler-a, kad se queue (50) napuni ili pool gasi,
+        // submit() baca RejectedExecutionException i 2PC task se TIHO gubi → Payment
+        // ostaje PROCESSING zauvek bez ijednog InterbankTransaction reda. CallerRunsPolicy
+        // izvrsava odbijeni task na pozivajucoj (afterCommit) niti umesto da ga odbaci —
+        // settlement se i dalje desi (sinhrono u tom slucaju). Payment-level reconciler
+        // (InterbankPaymentReconciliationScheduler) hvata sve preostale rupe.
+        executor.setRejectedExecutionHandler(
+                new java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy());
         executor.initialize();
         return executor;
     }

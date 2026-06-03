@@ -15,6 +15,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
+import rs.raf.banka2_bek.monitoring.BusinessMetrics;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -54,8 +55,31 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private final int capacity;
     private static final Duration WINDOW = Duration.ofSeconds(60);
 
-    public AuthRateLimitFilter(@Value("${auth.rate-limit.capacity:10}") int capacity) {
+    /**
+     * P1-auth-2 (R2 1367): da li se veruje {@code X-Forwarded-For} header-u za
+     * razresavanje klijentskog IP-a. Kad je BE direktno izlozen (host port 8081,
+     * bez reverse proxy-ja), napadac moze da posalje proizvoljan XFF header i
+     * dobije svez bucket po zahtevu → rate-limit potpuno zaobidjen. Default je
+     * {@code false} (koristi {@code remoteAddr}, ne moze se spoof-ovati na TCP
+     * nivou). U deploy-u iza poznatog reverse proxy-ja (api-gateway nginx) se
+     * postavlja na {@code true} preko {@code auth.rate-limit.trust-xff=true} —
+     * tada XFF nosi pravi client IP koji proxy upisuje.
+     */
+    private final boolean trustForwardedFor;
+
+    /**
+     * R7 observability: inkrementira {@code banka2_rate_limit_hit_total} na svaki 429
+     * (input za {@code RateLimitFloodActive} Prometheus alert). Nullable da unit-testovi
+     * filtera mogu da ga konstruisu bez Micrometer registry-ja (increment je null-guarded).
+     */
+    private final BusinessMetrics businessMetrics;
+
+    public AuthRateLimitFilter(@Value("${auth.rate-limit.capacity:10}") int capacity,
+                               @Value("${auth.rate-limit.trust-xff:false}") boolean trustForwardedFor,
+                               BusinessMetrics businessMetrics) {
         this.capacity = capacity;
+        this.trustForwardedFor = trustForwardedFor;
+        this.businessMetrics = businessMetrics;
     }
 
     /**
@@ -88,7 +112,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             "/auth/login",
             "/auth/refresh",
             "/auth/password_reset/request",
+            // P1-auth-2 (R2 1366): confirm troši reset token — bez rate-limit-a je
+            // moguć brute-force UUID reset tokena. resend-activation šalje email —
+            // bez limita je email-bombing vektor. Oba sad u istom bucket-u (10/min/IP).
+            "/auth/password_reset/confirm",
             "/auth-employee/activate",
+            "/auth-employee/resend-activation",
             // SEC-09: rate-limit OTP verifikacije po IP-u — kombinovano sa per-email
             // counter-om u OtpService (3 fail -> blocked=true). Filter koristi isti
             // capacity (default 10/min), gadja oba glavna OTP entry-point-a:
@@ -108,7 +137,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        String clientIp = resolveClientIp(request);
+        String clientIp = resolveClientIp(request, trustForwardedFor);
         // BE-AUTH-08: Caffeine.get(key, fn) je atomic + thread-safe; null vrednost
         // se nikad ne kesira jer newBucket() uvek vraca non-null.
         Bucket bucket = buckets.get(clientIp, ip -> newBucket());
@@ -116,6 +145,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         if (bucket.tryConsume(1)) {
             chain.doFilter(request, response);
         } else {
+            // R7 observability: zabelezi rate-limit hit pre pisanja odgovora
+            // (feeds RateLimitFloodActive alert). Null-guard za unit-test konstrukciju.
+            if (businessMetrics != null) {
+                businessMetrics.recordRateLimitHit();
+            }
             // 429 Too Many Requests — RFC 6585. Retry-After hint = 60s window.
             response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
             response.setHeader(HttpHeaders.RETRY_AFTER, String.valueOf(WINDOW.getSeconds()));
@@ -134,14 +168,22 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * X-Forwarded-For prefer ako iza nginx/cloudflare proxy-ja.
-     * Spec za XFF: prvi IP u listi je client.
+     * Razresava client IP za rate-limit bucket.
+     *
+     * <p>P1-auth-2 (R2 1367): {@code X-Forwarded-For} je proizvoljan request
+     * header — bilo ko ga moze postaviti. Ako mu se bezuslovno veruje, napadac
+     * salje svez XFF po zahtevu i dobija fresh bucket svaki put → rate-limit je
+     * potpuno zaobidjen. Zato se XFF cita SAMO kad je {@code trustForwardedFor}
+     * (BE iza poznatog reverse proxy-ja koji header postavlja). Inace se koristi
+     * {@code remoteAddr} (TCP peer — ne moze se spoof-ovati na aplikativnom sloju).
      */
-    private static String resolveClientIp(HttpServletRequest request) {
-        String xff = request.getHeader("X-Forwarded-For");
-        if (xff != null && !xff.isBlank()) {
-            int comma = xff.indexOf(',');
-            return (comma > 0 ? xff.substring(0, comma) : xff).trim();
+    private static String resolveClientIp(HttpServletRequest request, boolean trustForwardedFor) {
+        if (trustForwardedFor) {
+            String xff = request.getHeader("X-Forwarded-For");
+            if (xff != null && !xff.isBlank()) {
+                int comma = xff.indexOf(',');
+                return (comma > 0 ? xff.substring(0, comma) : xff).trim();
+            }
         }
         return request.getRemoteAddr();
     }

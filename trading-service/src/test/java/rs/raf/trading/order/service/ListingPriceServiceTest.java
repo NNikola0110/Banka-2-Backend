@@ -35,6 +35,12 @@ class ListingPriceServiceTest {
         return dto;
     }
 
+    private CreateOrderDto dtoWithStop(BigDecimal stopValue) {
+        CreateOrderDto dto = new CreateOrderDto();
+        dto.setStopValue(stopValue);
+        return dto;
+    }
+
     @Nested
     @DisplayName("getPricePerUnit")
     class GetPricePerUnit {
@@ -64,19 +70,23 @@ class ListingPriceServiceTest {
         }
 
         @Test
-        @DisplayName("STOP BUY → listing.ask")
-        void stopBuyUsesAsk() {
+        @DisplayName("STOP BUY → stopValue (spec §387, NE ask)")
+        void stopBuyUsesStopValue() {
+            // P1-dividends-order-1 (1544): Price Per Unit za STOP = Stop Value (§387).
+            // Pre fix-a je vracao ask (101) -> approximatePrice potcenjen, rezervacija premala.
             Listing l = listing(new BigDecimal("100"), new BigDecimal("101"), new BigDecimal("99"));
-            BigDecimal result = service.getPricePerUnit(new CreateOrderDto(), l, OrderType.STOP, OrderDirection.BUY);
-            assertEquals(new BigDecimal("101"), result);
+            BigDecimal result = service.getPricePerUnit(dtoWithStop(new BigDecimal("120")), l,
+                    OrderType.STOP, OrderDirection.BUY);
+            assertEquals(new BigDecimal("120"), result);
         }
 
         @Test
-        @DisplayName("STOP SELL → listing.bid")
-        void stopSellUsesBid() {
+        @DisplayName("STOP SELL → stopValue (spec §387, NE bid)")
+        void stopSellUsesStopValue() {
             Listing l = listing(new BigDecimal("100"), new BigDecimal("101"), new BigDecimal("99"));
-            BigDecimal result = service.getPricePerUnit(new CreateOrderDto(), l, OrderType.STOP, OrderDirection.SELL);
-            assertEquals(new BigDecimal("99"), result);
+            BigDecimal result = service.getPricePerUnit(dtoWithStop(new BigDecimal("90")), l,
+                    OrderType.STOP, OrderDirection.SELL);
+            assertEquals(new BigDecimal("90"), result);
         }
 
         @Test

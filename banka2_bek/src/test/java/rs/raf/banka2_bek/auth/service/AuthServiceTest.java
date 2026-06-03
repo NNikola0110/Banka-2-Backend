@@ -16,6 +16,7 @@ import rs.raf.banka2_bek.auth.dto.PasswordResetRequestDto;
 import rs.raf.banka2_bek.auth.dto.RefreshTokenRequestDto;
 import rs.raf.banka2_bek.auth.dto.RefreshTokenResponseDto;
 import rs.raf.banka2_bek.auth.dto.RegisterRequestDto;
+import rs.raf.banka2_bek.auth.exception.AuthenticationFailedException;
 import rs.raf.banka2_bek.auth.model.PasswordResetToken;
 import rs.raf.banka2_bek.auth.model.User;
 import rs.raf.banka2_bek.notification.NotificationPublisher;
@@ -77,6 +78,12 @@ class AuthServiceTest {
     @Mock
     private AccountLockoutService accountLockoutService;
 
+    @Mock
+    private JwtBlacklistService jwtBlacklistService;
+
+    @Mock
+    private rs.raf.banka2_bek.monitoring.BusinessMetrics businessMetrics;
+
     @InjectMocks
     private AuthService authService;
 
@@ -113,7 +120,7 @@ class AuthServiceTest {
 
     @Test
     void loginUsesEmployeeWhenExists() {
-        when(employeeRepository.findByEmail(employee.getEmail())).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByEmailIgnoreCase(employee.getEmail())).thenReturn(Optional.of(employee));
         when(passwordEncoder.matches(eq("password" + employee.getSaltPassword()), eq(employee.getPassword())))
                 .thenReturn(true);
         when(jwtService.generateAccessToken(employee)).thenReturn("access");
@@ -127,8 +134,8 @@ class AuthServiceTest {
 
     @Test
     void loginFallsBackToUser() {
-        when(employeeRepository.findByEmail(user.getEmail())).thenReturn(Optional.empty());
-        when(userRepository.findByEmail(user.getEmail())).thenReturn(Optional.of(user));
+        when(employeeRepository.findByEmailIgnoreCase(user.getEmail())).thenReturn(Optional.empty());
+        when(userRepository.findByEmailIgnoreCase(user.getEmail())).thenReturn(Optional.of(user));
         when(passwordEncoder.matches(eq("password"), eq(user.getPassword()))).thenReturn(true);
         when(jwtService.generateAccessToken(user)).thenReturn("access");
         when(jwtService.generateRefreshToken(user)).thenReturn("refresh");
@@ -137,6 +144,9 @@ class AuthServiceTest {
 
         assertThat(response.getAccessToken()).isEqualTo("access");
         assertThat(response.getRefreshToken()).isEqualTo("refresh");
+        // R7 observability: uspesan login inkrementira banka2_login_success_total.
+        verify(businessMetrics).recordLoginSuccess();
+        verify(businessMetrics, never()).recordLoginFailure();
     }
 
     @Test
@@ -189,23 +199,30 @@ class AuthServiceTest {
         when(userRepository.findByEmail(employee.getEmail())).thenReturn(Optional.empty());
         when(employeeRepository.findByEmail(employee.getEmail())).thenReturn(Optional.of(employee));
         when(jwtService.generateAccessToken(employee)).thenReturn("new-access");
+        // P1-auth-2 (1740): refresh se ROTIRA — vraca se NOV refresh, stari se blacklist-uje.
+        when(jwtService.generateRefreshToken(employee)).thenReturn("rotated-refresh");
 
         RefreshTokenRequestDto request = new RefreshTokenRequestDto();
         request.setRefreshToken("refresh-token");
         RefreshTokenResponseDto response = authService.refreshToken(request);
 
         assertThat(response.getAccessToken()).isEqualTo("new-access");
-        assertThat(response.getRefreshToken()).isEqualTo("refresh-token");
+        assertThat(response.getRefreshToken()).isEqualTo("rotated-refresh");
+        verify(jwtBlacklistService).blacklist("refresh-token");
     }
 
     @Test
     void loginRejectsInvalidCredentials() {
-        when(employeeRepository.findByEmail("missing@test.com")).thenReturn(Optional.empty());
-        when(userRepository.findByEmail("missing@test.com")).thenReturn(Optional.empty());
+        when(employeeRepository.findByEmailIgnoreCase("missing@test.com")).thenReturn(Optional.empty());
+        when(userRepository.findByEmailIgnoreCase("missing@test.com")).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> authService.login(new LoginRequestDto("missing@test.com", "bad")))
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("Neispravan email ili lozinka");
+        // R7 observability: neuspesan login inkrementira banka2_login_failure_total
+        // (input za BruteForceLogin Prometheus alert).
+        verify(businessMetrics).recordLoginFailure();
+        verify(businessMetrics, never()).recordLoginSuccess();
     }
 
     // ===== Employee login with salt-based password hashing =====
@@ -213,7 +230,7 @@ class AuthServiceTest {
     @Test
     void loginEmployeeSaltIsAppendedBeforeMatching() {
         // Verifies that the password + salt concatenation is passed to the encoder
-        when(employeeRepository.findByEmail(employee.getEmail())).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByEmailIgnoreCase(employee.getEmail())).thenReturn(Optional.of(employee));
         // The salt is "salt", so encoder should receive "myPass123salt"
         when(passwordEncoder.matches(eq("myPass123" + "salt"), eq(employee.getPassword())))
                 .thenReturn(true);
@@ -229,10 +246,10 @@ class AuthServiceTest {
     @Test
     void loginEmployeeWrongPasswordFallsToUserLookup() {
         // Employee exists but password doesn't match -> falls through to user lookup
-        when(employeeRepository.findByEmail(employee.getEmail())).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByEmailIgnoreCase(employee.getEmail())).thenReturn(Optional.of(employee));
         when(passwordEncoder.matches(eq("wrongPass" + employee.getSaltPassword()), eq(employee.getPassword())))
                 .thenReturn(false);
-        when(userRepository.findByEmail(employee.getEmail())).thenReturn(Optional.empty());
+        when(userRepository.findByEmailIgnoreCase(employee.getEmail())).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> authService.login(new LoginRequestDto(employee.getEmail(), "wrongPass")))
                 .isInstanceOf(RuntimeException.class)
@@ -261,7 +278,7 @@ class AuthServiceTest {
                 .permissions(Set.of("ADMIN"))
                 .build();
 
-        when(employeeRepository.findByEmail("inactive-emp@test.com")).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByEmailIgnoreCase("inactive-emp@test.com")).thenReturn(Optional.of(employee));
         when(passwordEncoder.matches(eq("password" + "salt"), eq("hashed-emp"))).thenReturn(true);
 
         assertThatThrownBy(() -> authService.login(new LoginRequestDto("inactive-emp@test.com", "password")))
@@ -278,8 +295,8 @@ class AuthServiceTest {
         inactiveUser.setActive(false);
         inactiveUser.setRole("CLIENT");
 
-        when(employeeRepository.findByEmail("inactive@test.com")).thenReturn(Optional.empty());
-        when(userRepository.findByEmail("inactive@test.com")).thenReturn(Optional.of(inactiveUser));
+        when(employeeRepository.findByEmailIgnoreCase("inactive@test.com")).thenReturn(Optional.empty());
+        when(userRepository.findByEmailIgnoreCase("inactive@test.com")).thenReturn(Optional.of(inactiveUser));
         when(passwordEncoder.matches(eq("password"), eq("hashed"))).thenReturn(true);
 
         assertThatThrownBy(() -> authService.login(new LoginRequestDto("inactive@test.com", "password")))
@@ -342,6 +359,44 @@ class AuthServiceTest {
         assertThatThrownBy(() -> authService.resetPassword(new PasswordResetDto("nonexistent", "NewPass12")))
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("Reset token does not exist");
+    }
+
+    // ===== TEST-auth-5: reset password on a DEACTIVATED account =====
+
+    @Test
+    void resetPasswordOnDeactivatedUser_succeedsButAccountStaysInactive_TEST_auth_5() {
+        // TEST-auth-5: postoje testovi za token-expiry/used/orphan, ali ne i za
+        // reset na DEAKTIVIRANOM nalogu. Karakterizacija trenutnog ponasanja:
+        // resetPassword NE proverava user.active — reset na deaktiviranom nalogu
+        // USPEVA (postavi novi hash, oznaci token iskoriscenim). To NIJE
+        // security rupa: login (vidi loginRejectsInactiveUser) i refresh
+        // (refreshTokenRejectsInactiveUser) i dalje gate-uju na active==false, pa
+        // resetovana lozinka ne daje pristup dok admin ne reaktivira nalog. Test
+        // pinuje da reset prolazi A da active flag ostaje netaknut (false).
+        User deactivated = new User();
+        deactivated.setId(50L);
+        deactivated.setEmail("deactivated@test.com");
+        deactivated.setPassword("old-hash");
+        deactivated.setActive(false);
+        deactivated.setRole("CLIENT");
+
+        PasswordResetToken token = new PasswordResetToken();
+        token.setToken("deact-token");
+        token.setUser(deactivated);
+        token.setEmployee(null);
+        token.setExpiresAt(LocalDateTime.now().plusMinutes(10));
+        token.setUsed(false);
+
+        when(passwordResetTokenRepository.findByToken("deact-token")).thenReturn(Optional.of(token));
+        when(passwordEncoder.encode("NewPass12")).thenReturn("new-hash");
+
+        authService.resetPassword(new PasswordResetDto("deact-token", "NewPass12"));
+
+        assertThat(deactivated.getPassword()).isEqualTo("new-hash");
+        assertThat(token.getUsed()).isTrue();
+        // Reset NE reaktivira nalog — i dalje deaktiviran (login ostaje blokiran).
+        assertThat(deactivated.isActive()).isFalse();
+        verify(userRepository).save(deactivated);
     }
 
     // ===== Reset password for regular user (not employee) =====
@@ -426,18 +481,116 @@ class AuthServiceTest {
     // ===== Refresh token rotation (new access from refresh) =====
 
     @Test
+    void refreshTokenRejectsBlacklistedRefreshToken() {
+        // N3: posle logout-a refresh token je blacklist-ovan. refreshToken() ne sme
+        // da izda nov access token za revoke-ovan refresh — inace je logout no-op.
+        when(jwtService.isRefreshToken("revoked-refresh")).thenReturn(true);
+        when(jwtBlacklistService.isBlacklisted("revoked-refresh")).thenReturn(true);
+
+        RefreshTokenRequestDto request = new RefreshTokenRequestDto();
+        request.setRefreshToken("revoked-refresh");
+
+        assertThatThrownBy(() -> authService.refreshToken(request))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("Invalid refresh token");
+        verify(jwtService, never()).generateAccessToken(any(User.class));
+        verify(jwtService, never()).generateAccessToken(any(Employee.class));
+    }
+
+    @Test
+    void refreshTokenRejectsInactiveUser() {
+        // N1: refresh deaktiviranog korisnickog naloga ne sme da izda nov access token.
+        User inactive = new User();
+        inactive.setId(20L);
+        inactive.setEmail("inactive-refresh@test.com");
+        inactive.setActive(false);
+        inactive.setRole("CLIENT");
+
+        when(jwtService.isRefreshToken("user-refresh")).thenReturn(true);
+        when(jwtService.extractEmail("user-refresh")).thenReturn("inactive-refresh@test.com");
+        when(userRepository.findByEmail("inactive-refresh@test.com")).thenReturn(Optional.of(inactive));
+
+        RefreshTokenRequestDto request = new RefreshTokenRequestDto();
+        request.setRefreshToken("user-refresh");
+
+        assertThatThrownBy(() -> authService.refreshToken(request))
+                .isInstanceOf(AuthenticationFailedException.class)
+                .hasMessageContaining("Nalog je deaktiviran");
+        verify(jwtService, never()).generateAccessToken(any(User.class));
+    }
+
+    @Test
+    void refreshTokenRejectsInactiveEmployee() {
+        // N1: refresh deaktiviranog employee naloga ne sme da izda nov access token.
+        Employee inactiveEmp = Employee.builder()
+                .id(21L)
+                .firstName("In")
+                .lastName("Active")
+                .email("inactive-emp-refresh@test.com")
+                .password("hashed")
+                .saltPassword("s")
+                .active(false)
+                .dateOfBirth(LocalDate.of(1990, 1, 1))
+                .gender("M")
+                .phone("+381")
+                .address("Addr")
+                .username("inactemp")
+                .position("Dev")
+                .department("IT")
+                .permissions(Set.of())
+                .build();
+
+        when(jwtService.isRefreshToken("emp-refresh")).thenReturn(true);
+        when(jwtService.extractEmail("emp-refresh")).thenReturn("inactive-emp-refresh@test.com");
+        when(userRepository.findByEmail("inactive-emp-refresh@test.com")).thenReturn(Optional.empty());
+        when(employeeRepository.findByEmail("inactive-emp-refresh@test.com"))
+                .thenReturn(Optional.of(inactiveEmp));
+
+        RefreshTokenRequestDto request = new RefreshTokenRequestDto();
+        request.setRefreshToken("emp-refresh");
+
+        assertThatThrownBy(() -> authService.refreshToken(request))
+                .isInstanceOf(AuthenticationFailedException.class)
+                .hasMessageContaining("Nalog je deaktiviran");
+        verify(jwtService, never()).generateAccessToken(any(Employee.class));
+    }
+
+    @Test
     void refreshTokenReturnsNewAccessTokenForUser() {
         when(jwtService.isRefreshToken("valid-refresh")).thenReturn(true);
         when(jwtService.extractEmail("valid-refresh")).thenReturn(user.getEmail());
         when(userRepository.findByEmail(user.getEmail())).thenReturn(Optional.of(user));
         when(jwtService.generateAccessToken(user)).thenReturn("new-access-token");
+        // P1-auth-2 (1740): rotacija refresh tokena.
+        when(jwtService.generateRefreshToken(user)).thenReturn("rotated-refresh");
 
         RefreshTokenRequestDto request = new RefreshTokenRequestDto();
         request.setRefreshToken("valid-refresh");
         RefreshTokenResponseDto response = authService.refreshToken(request);
 
         assertThat(response.getAccessToken()).isEqualTo("new-access-token");
-        assertThat(response.getRefreshToken()).isEqualTo("valid-refresh");
+        assertThat(response.getRefreshToken()).isEqualTo("rotated-refresh");
+    }
+
+    // ===== P1-auth-2 (R4 1740): refresh token rotation + reuse blacklist =====
+
+    @Test
+    void refreshTokenRotatesAndBlacklistsOldRefreshForUser() {
+        // REPRODUKCIJA: pre fix-a /auth/refresh vracao ISTI refresh (response==input)
+        // i NIKAD ga ne blacklist-uje -> ukraden refresh radi punih 7 dana.
+        when(jwtService.isRefreshToken("old-refresh")).thenReturn(true);
+        when(jwtService.extractEmail("old-refresh")).thenReturn(user.getEmail());
+        when(userRepository.findByEmail(user.getEmail())).thenReturn(Optional.of(user));
+        when(jwtService.generateAccessToken(user)).thenReturn("fresh-access");
+        when(jwtService.generateRefreshToken(user)).thenReturn("new-refresh");
+
+        RefreshTokenRequestDto request = new RefreshTokenRequestDto();
+        request.setRefreshToken("old-refresh");
+        RefreshTokenResponseDto response = authService.refreshToken(request);
+
+        // Nov refresh != stari + stari je blacklist-ovan (reuse stare kopije -> Invalid).
+        assertThat(response.getRefreshToken()).isEqualTo("new-refresh");
+        verify(jwtBlacklistService).blacklist("old-refresh");
     }
 
     // ===== Invalid refresh token handling =====
@@ -481,6 +634,27 @@ class AuthServiceTest {
         verify(notificationPublisher).sendPasswordResetMail(eq(user.getEmail()), anyString());
     }
 
+    // C1 Sc4 (§spec): reset link mora da vazi 15 minuta (ranije 30). Asertujemo TTL
+    // na sacuvanom PasswordResetToken-u (expiresAt ~ now + 15min, sa tolerancijom).
+    @Test
+    void requestPasswordResetSetsFifteenMinuteTtl_Sc4() {
+        when(userRepository.findByEmail(user.getEmail())).thenReturn(Optional.of(user));
+        org.mockito.ArgumentCaptor<PasswordResetToken> captor =
+                org.mockito.ArgumentCaptor.forClass(PasswordResetToken.class);
+        when(passwordResetTokenRepository.save(captor.capture())).thenAnswer(inv -> inv.getArgument(0));
+
+        LocalDateTime before = LocalDateTime.now();
+        authService.requestPasswordReset(new PasswordResetRequestDto(user.getEmail()));
+        LocalDateTime after = LocalDateTime.now();
+
+        LocalDateTime expiresAt = captor.getValue().getExpiresAt();
+        // expiresAt mora biti izmedju (before+15min) i (after+15min) — tj. tacno 15min TTL.
+        assertThat(expiresAt).isAfterOrEqualTo(before.plusMinutes(15).minusSeconds(2));
+        assertThat(expiresAt).isBeforeOrEqualTo(after.plusMinutes(15).plusSeconds(2));
+        // I eksplicitno: NIJE 30min (regresija-guard za staru vrednost).
+        assertThat(expiresAt).isBefore(before.plusMinutes(16));
+    }
+
     @Test
     void requestPasswordResetReturnsGenericResponseForUnknownEmail() {
         // SEC-07 (Email enumeration mitigation): endpoint UVEK vraca generic
@@ -521,11 +695,30 @@ class AuthServiceTest {
                 .permissions(Set.of())
                 .build();
 
-        when(employeeRepository.findByEmail("null-active@test.com")).thenReturn(Optional.of(empNullActive));
+        when(employeeRepository.findByEmailIgnoreCase("null-active@test.com")).thenReturn(Optional.of(empNullActive));
         when(passwordEncoder.matches("pass" + "s", "hashed")).thenReturn(true);
 
         assertThatThrownBy(() -> authService.login(new LoginRequestDto("null-active@test.com", "pass")))
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("Nalog je deaktiviran");
+    }
+
+    // ===== P1-auth-2 (R2 1365): login case-insensitivity =====
+
+    @Test
+    void loginIsCaseInsensitiveForEmail() {
+        // REPRODUKCIJA: pre fix-a login je radio exact findByEmail("USER@TEST.COM")
+        // -> miss (jer je sacuvan "user@test.com") -> tretiran kao pogresan kredencijal,
+        // dok lockout brojac normalizuje na lowercase -> razilazenje kljuceva.
+        // Sada login koristi findByEmailIgnoreCase i razresava nalog bez obzira na case.
+        when(employeeRepository.findByEmailIgnoreCase("USER@TEST.COM")).thenReturn(Optional.empty());
+        when(userRepository.findByEmailIgnoreCase("USER@TEST.COM")).thenReturn(Optional.of(user));
+        when(passwordEncoder.matches(eq("password"), eq(user.getPassword()))).thenReturn(true);
+        when(jwtService.generateAccessToken(user)).thenReturn("access");
+        when(jwtService.generateRefreshToken(user)).thenReturn("refresh");
+
+        AuthResponseDto response = authService.login(new LoginRequestDto("USER@TEST.COM", "password"));
+
+        assertThat(response.getAccessToken()).isEqualTo("access");
     }
 }

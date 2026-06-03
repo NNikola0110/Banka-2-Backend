@@ -82,6 +82,29 @@ public class Portfolio {
     @Column(nullable = false)
     private LocalDateTime lastModified;
 
+    /**
+     * Optimistic-locking verzija.
+     *
+     * <p>Bug 4 (REAL money/execution): kolona je istorijski bila nullable bez
+     * default-a, a {@code trading-seed.sql} je INSERT-ovao portfolije BEZ ove
+     * kolone → svi seed-ovani redovi su imali {@code version = NULL}. Hibernate
+     * optimistic locking NE moze da poredi {@code NULL} verziju pa svaki UPDATE
+     * seed-ovanog portfolija (SELL rezervacija, {@code updatePortfolio} pri
+     * izvrsenju ordera) puca na commit-u ("Could not commit JPA transaction" →
+     * 400 "No active transaction"); BUY orderi ostaju trajno zaglavljeni iako je
+     * banka-core settlement vec commit-ovao (conservation break — hartije se ne
+     * pripisu).
+     *
+     * <p>Fix (3 sloja, mirror CardSlot/SavingsInterestRate + {@code @ColumnDefault}):
+     * (1) field-init {@code = 0L} → nove/loadovane instance nikad nisu null;
+     * (2) {@code @ColumnDefault("0")} → sveza schema kolona ima DB default;
+     * (3) startup migration {@link rs.raf.trading.persistence.PortfolioVersionColumnMigration}
+     * + seed sa {@code version} kolonom → postojeci null redovi backfill-ovani na 0.
+     */
+    @Version
+    @org.hibernate.annotations.ColumnDefault("0")
+    private Long version = 0L;
+
     @PrePersist
     @PreUpdate
     protected void onUpdate() {

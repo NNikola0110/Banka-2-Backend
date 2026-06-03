@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import rs.raf.banka2_bek.account.model.Account;
 import rs.raf.banka2_bek.account.model.AccountCategory;
+import rs.raf.banka2_bek.account.model.AccountDefaults;
 import rs.raf.banka2_bek.account.model.AccountStatus;
 import rs.raf.banka2_bek.account.model.AccountSubtype;
 import rs.raf.banka2_bek.account.model.AccountType;
@@ -14,17 +15,21 @@ import rs.raf.banka2_bek.account.repository.AccountRepository;
 import rs.raf.banka2_bek.account.util.AccountNumberUtils;
 import rs.raf.banka2_bek.auth.dto.*;
 import rs.raf.banka2_bek.auth.exception.AuthenticationFailedException;
+import rs.raf.banka2_bek.auth.exception.EmailAlreadyExistsException;
+import rs.raf.banka2_bek.auth.exception.InvalidRefreshTokenException;
 import rs.raf.banka2_bek.auth.model.PasswordResetToken;
 import rs.raf.banka2_bek.notification.NotificationPublisher;
 import rs.raf.banka2_bek.auth.model.User;
 import rs.raf.banka2_bek.auth.repository.PasswordResetTokenRepository;
 import rs.raf.banka2_bek.auth.repository.UserRepository;
+import rs.raf.banka2_bek.auth.util.EmailMasker;
 import rs.raf.banka2_bek.client.model.Client;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.currency.model.Currency;
 import rs.raf.banka2_bek.currency.repository.CurrencyRepository;
 import rs.raf.banka2_bek.employee.model.Employee;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
+import rs.raf.banka2_bek.monitoring.BusinessMetrics;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -49,6 +54,8 @@ public class AuthService {
     private final JwtService jwtService;
     private final NotificationPublisher notificationPublisher;
     private final AccountLockoutService accountLockoutService;
+    private final JwtBlacklistService jwtBlacklistService;
+    private final BusinessMetrics businessMetrics;
 
     public AuthService(UserRepository userRepository,
                        EmployeeRepository employeeRepository,
@@ -59,7 +66,9 @@ public class AuthService {
                        PasswordEncoder passwordEncoder,
                        JwtService jwtService,
                        NotificationPublisher notificationPublisher,
-                       AccountLockoutService accountLockoutService) {
+                       AccountLockoutService accountLockoutService,
+                       JwtBlacklistService jwtBlacklistService,
+                       BusinessMetrics businessMetrics) {
         this.userRepository = userRepository;
         this.employeeRepository = employeeRepository;
         this.clientRepository = clientRepository;
@@ -70,6 +79,8 @@ public class AuthService {
         this.jwtService = jwtService;
         this.notificationPublisher = notificationPublisher;
         this.accountLockoutService = accountLockoutService;
+        this.jwtBlacklistService = jwtBlacklistService;
+        this.businessMetrics = businessMetrics;
     }
 
     /**
@@ -85,7 +96,8 @@ public class AuthService {
     @Transactional
     public String register(RegisterRequestDto request) {
         if (userRepository.existsByEmail(request.getEmail())) {
-            throw new RuntimeException("User with this email already exists");
+            // R1 296: duplikat email = 409 Conflict, ne bare RuntimeException→400.
+            throw new EmailAlreadyExistsException("User with this email already exists");
         }
 
         String hashedPassword = passwordEncoder.encode(request.getPassword());
@@ -165,9 +177,10 @@ public class AuthService {
                 .availableBalance(BigDecimal.ZERO)
                 .reservedAmount(BigDecimal.ZERO)
                 .accountCategory(AccountCategory.CLIENT)
-                .dailyLimit(new BigDecimal("250000"))
-                .monthlyLimit(new BigDecimal("1000000"))
-                .maintenanceFee(new BigDecimal("255"))
+                // R1-626: podrazumevani limiti/naknada iz jedinstvenog izvora.
+                .dailyLimit(AccountDefaults.DEFAULT_DAILY_LIMIT)
+                .monthlyLimit(AccountDefaults.DEFAULT_MONTHLY_LIMIT)
+                .maintenanceFee(AccountDefaults.MAINTENANCE_FEE)
                 .status(AccountStatus.ACTIVE)
                 .expirationDate(LocalDate.now().plusYears(5))
                 .createdAt(LocalDateTime.now())
@@ -188,8 +201,11 @@ public class AuthService {
         // Bacaja AccountLockedException ako je email lock-ovan; mapira se u 401.
         accountLockoutService.assertNotLocked(request.getEmail());
 
-        // First, try to find an employee with this email
-        Optional<Employee> employeeOpt = employeeRepository.findByEmail(request.getEmail());
+        // First, try to find an employee with this email.
+        // P1-auth-2 (R2 1365): case-insensitive lookup — lockout brojac (AccountLockoutService)
+        // normalizuje email na lowercase, pa login lookup mora biti isto case-insensitive
+        // da se isti nalog ne deli na dva razlicita lockout/login kljuca po case-u.
+        Optional<Employee> employeeOpt = employeeRepository.findByEmailIgnoreCase(request.getEmail());
         if (employeeOpt.isPresent()) {
             Employee employee = employeeOpt.get();
 
@@ -203,13 +219,10 @@ public class AuthService {
                     // naloga + tacnu sifru, bez recordFailure-a moze beskonacno da poll-uje
                     // (npr. provera da li nalog jos uvek postoji u sistemu, ili priprema
                     // za reactivation napad ako admin reaktivira nalog kasnije).
-                    accountLockoutService.recordFailure(request.getEmail());
-                    // Spec Sc 14 — login deaktiviranog naloga vraca 401, ne 400
-                    // (Bug T1-012 prijavljen 12.05.2026).
-                    throw new AuthenticationFailedException("Nalog je deaktiviran.");
+                    rejectInactive(request.getEmail());
                 }
 
-                accountLockoutService.recordSuccess(request.getEmail());
+                onSuccessfulLogin(request.getEmail());
                 String accessToken = jwtService.generateAccessToken(employee);
                 String refreshToken = jwtService.generateRefreshToken(employee);
                 return new AuthResponseDto(accessToken, refreshToken);
@@ -217,7 +230,8 @@ public class AuthService {
         }
 
         // If not found as employee or password didn't match, try regular user
-        Optional<User> userOpt = userRepository.findByEmail(request.getEmail());
+        // (case-insensitive — P1-auth-2 R2 1365, vidi gore).
+        Optional<User> userOpt = userRepository.findByEmailIgnoreCase(request.getEmail());
         if (userOpt.isPresent()) {
             User user = userOpt.get();
 
@@ -225,13 +239,10 @@ public class AuthService {
                 if (!user.isActive()) {
                     // BE-AUTH-04 fix: vidi gore — increment counter i za deaktivirane
                     // user naloge da napadac ne moze beskonacno da poll-uje.
-                    accountLockoutService.recordFailure(request.getEmail());
-                    // Isto kao employee — generic poruka ne otkriva da li email
-                    // postoji ili je deaktiviran. Vraca 401.
-                    throw new AuthenticationFailedException("Nalog je deaktiviran.");
+                    rejectInactive(request.getEmail());
                 }
 
-                accountLockoutService.recordSuccess(request.getEmail());
+                onSuccessfulLogin(request.getEmail());
                 String accessToken = jwtService.generateAccessToken(user);
                 String refreshToken = jwtService.generateRefreshToken(user);
                 return new AuthResponseDto(accessToken, refreshToken);
@@ -243,9 +254,29 @@ public class AuthService {
         // sad baca AccountLockedException u istom pozivu kad pretreknemo prag — tako
         // korisnik dobija lockout poruku na 5. pokusaju (Bug T1-015), ne tek na 6.
         accountLockoutService.recordFailure(request.getEmail());
+        businessMetrics.recordLoginFailure();
         // Spec Sc 2/3: 401 sa generic porukom "Neispravni unos" (poruka na SR jer
         // ostatak UI je na SR — Bug T1-017 mesan SR/EN).
         throw new AuthenticationFailedException("Neispravan email ili lozinka.");
+    }
+
+    /**
+     * R1-619: deljena grana za deaktiviran nalog (Employee i User su radili isto).
+     * Inkrementira lockout brojac (BE-AUTH-04 — da deaktiviran nalog ne dobija
+     * beskonacne probe) i baca 401 sa generic porukom (anti-enumeration). Uvek baca.
+     */
+    private void rejectInactive(String email) {
+        accountLockoutService.recordFailure(email);
+        businessMetrics.recordLoginFailure();
+        // Spec Sc 14 — login deaktiviranog naloga vraca 401, ne 400 (Bug T1-012).
+        // Generic poruka ne otkriva da li email postoji ili je deaktiviran.
+        throw new AuthenticationFailedException("Nalog je deaktiviran.");
+    }
+
+    /** R1-619: deljeni uspesan-login book-keeping (reset lockout + metrika). */
+    private void onSuccessfulLogin(String email) {
+        accountLockoutService.recordSuccess(email);
+        businessMetrics.recordLoginSuccess();
     }
 
     public String requestPasswordReset(PasswordResetRequestDto request) {
@@ -264,8 +295,10 @@ public class AuthService {
 
         if (user == null && employee == null) {
             // Interno logujemo, ali UI vraca generic success — bez 400/404 leakage.
+            // [P2-input-validation-1 / R4 1781] maskiraj email — anti-enumeration
+            // grana NE sme da loguje pun PII svakog ko enumerise.
             log.info("SEC-07: Password reset requested for unknown email (no account exists): {}",
-                    request.getEmail());
+                    EmailMasker.mask(request.getEmail()));
             return "If an account with that email exists, a password reset link has been sent.";
         }
 
@@ -278,7 +311,8 @@ public class AuthService {
         } else {
             passwordResetToken.setEmployee(employee);
         }
-        passwordResetToken.setExpiresAt(LocalDateTime.now().plusMinutes(30));
+        // C1 Sc4 (§spec): reset link vazi 15 minuta (ranije 30; "pod-konac" literal).
+        passwordResetToken.setExpiresAt(LocalDateTime.now().plusMinutes(15));
         passwordResetToken.setUsed(false);
 
         passwordResetTokenRepository.save(passwordResetToken);
@@ -339,7 +373,13 @@ public class AuthService {
         String refreshToken = request.getRefreshToken();
 
         if (!jwtService.isRefreshToken(refreshToken))
-            throw new RuntimeException("Invalid refresh token");
+            throw new InvalidRefreshTokenException("Invalid refresh token");
+
+        // N3: logout-om revoke-ovan refresh token ne sme da izda nov access token.
+        // Bez ove provere logout je no-op za refresh (blacklist nikad nije konsultovan
+        // na /auth/refresh putu), pa ukraden refresh token radi punih 7 dana.
+        if (jwtBlacklistService.isBlacklisted(refreshToken))
+            throw new InvalidRefreshTokenException("Invalid refresh token");
 
         String email = jwtService.extractEmail(refreshToken);
 
@@ -347,12 +387,41 @@ public class AuthService {
         if (user == null) {
             Employee employee = employeeRepository.findByEmail(email)
                 .orElseThrow(() -> new RuntimeException("User not found"));
+            // N1: deaktiviran nalog ne sme da dobije nov access token preko refresh-a.
+            // Bez ove provere, admin-disablovan nalog zadrzava pristup do 7 dana
+            // (refresh TTL) jer login-vremenski active flag nije ponovo proveravan.
+            if (!Boolean.TRUE.equals(employee.getActive())) {
+                throw new AuthenticationFailedException("Nalog je deaktiviran.");
+            }
             String newAccessToken = jwtService.generateAccessToken(employee);
-            return new RefreshTokenResponseDto(newAccessToken, refreshToken);
+            String rotatedRefresh = rotateRefreshToken(refreshToken, jwtService.generateRefreshToken(employee));
+            return new RefreshTokenResponseDto(newAccessToken, rotatedRefresh);
+        }
+
+        // N1: isto za korisnicke (CLIENT) naloge.
+        if (!user.isActive()) {
+            throw new AuthenticationFailedException("Nalog je deaktiviran.");
         }
 
         String newAccessToken = jwtService.generateAccessToken(user);
+        String rotatedRefresh = rotateRefreshToken(refreshToken, jwtService.generateRefreshToken(user));
 
-        return new RefreshTokenResponseDto(newAccessToken, refreshToken);
+        return new RefreshTokenResponseDto(newAccessToken, rotatedRefresh);
+    }
+
+    /**
+     * P1-auth-2 (R4 1740): refresh-token rotacija. Ranije je {@code /auth/refresh}
+     * vracao ISTI refresh token bez rotacije → ukraden refresh je bio upotrebljiv
+     * punih 7 dana (TTL), bez ikakve detekcije. Sada se pri svakom refresh-u izda
+     * NOV refresh token, a STARI se blacklist-uje do njegovog exp-a. Posledica:
+     * - ukraden stari refresh prestaje da radi cim ga legitiman korisnik iskoristi
+     *   (rotacija ga blacklist-uje);
+     * - reuse stare kopije (napadac ILI zrtva, ko god je drugi) odmah pada na
+     *   {@code isBlacklisted} provero na pocetku {@code refreshToken()} → "Invalid".
+     * Single-instance blacklist ogranicenje (BE-AUTH-07) i dalje vazi (memory store).
+     */
+    private String rotateRefreshToken(String oldRefreshToken, String newRefreshToken) {
+        jwtBlacklistService.blacklist(oldRefreshToken);
+        return newRefreshToken;
     }
 }

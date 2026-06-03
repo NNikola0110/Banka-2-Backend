@@ -25,4 +25,24 @@ public interface NotificationService {
             String referenceType,
             Long referenceId
     );
+
+    /**
+     * OT-1061: emituje notifikaciju SVAKOM aktivnom supervizoru. trading-service
+     * nema lokalnu listu supervizora pa ih razresava preko banka-core seam-a
+     * ({@code GET /internal/users/supervisors}) i salje svakom in-app notifikaciju
+     * (recipientType {@code "EMPLOYEE"}). Koristi se za operativne alerte koji
+     * nemaju jednog konkretnog primaoca (npr. tax obracun preskocen zbog FX-a).
+     *
+     * <p>Best-effort: ako razresenje supervizora ili pojedinacni in-app POST padne,
+     * greska se loguje i NE propagira (kao i {@link #notify}). {@code notificationType}
+     * MORA biti in-app-sending tip (npr. {@code TAX_CALCULATION_FAILED}); GENERAL
+     * (oba kanala iskljucena) bi bio no-op.
+     */
+    void notifySupervisors(
+            NotificationType notificationType,
+            String title,
+            String body,
+            String referenceType,
+            Long referenceId
+    );
 }

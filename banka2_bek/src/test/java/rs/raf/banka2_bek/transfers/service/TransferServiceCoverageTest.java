@@ -34,6 +34,7 @@ import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 
 /**
@@ -140,17 +141,20 @@ class TransferServiceCoverageTest {
         return t;
     }
 
+    // R1-653 (P3-bc-transfer-exchange-loan-savings-1): filtriranje (acct/datum) je
+    // sad u JPA fetch-join upitu (findForClientWithFilters), ne in-memory. Unit testovi
+    // pinuju da servis prosledjuje normalizovane parametre (blank->null, datum->LDT
+    // granice) i mapira rezultat — sam filter je odgovornost DB-a.
     @Test
-    void getAllTransfers_filtersByAccountNumberAndDates() {
+    void getAllTransfers_passesNormalizedFilterParamsToQuery() {
         Client client = new Client(); client.setId(1L);
+        Transfer t1 = makeTransfer("111", "222", LocalDateTime.of(2026, 1, 15, 10, 0));
 
-        Transfer t1 = makeTransfer("111", "222", LocalDateTime.of(2026, 1, 15, 10, 0)); // in range, acct match
-        Transfer t2 = makeTransfer("333", "444", LocalDateTime.of(2026, 1, 15, 10, 0)); // acct mismatch → skip
-        Transfer t3 = makeTransfer("111", "222", LocalDateTime.of(2025, 1, 1, 0, 0)); // before fromDate → skip
-        Transfer t4 = makeTransfer("111", "222", LocalDateTime.of(2027, 1, 1, 0, 0)); // after toDate → skip
-
-        when(transferRepository.findByCreatedByOrderByCreatedAtDesc(client))
-                .thenReturn(List.of(t1, t2, t3, t4));
+        when(transferRepository.findForClientWithFilters(
+                eq(client), eq("111"),
+                eq(LocalDate.of(2026, 1, 1).atStartOfDay()),
+                eq(LocalDate.of(2026, 12, 31).atTime(23, 59, 59))))
+                .thenReturn(List.of(t1));
 
         List<TransferResponseDto> result = transferService.getAllTransfers(
                 client, "111", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 12, 31));
@@ -162,7 +166,8 @@ class TransferServiceCoverageTest {
     void getAllTransfers_noFilters_returnsAll() {
         Client client = new Client(); client.setId(1L);
         Transfer t1 = makeTransfer("111", "222", LocalDateTime.of(2026, 1, 15, 10, 0));
-        when(transferRepository.findByCreatedByOrderByCreatedAtDesc(client)).thenReturn(List.of(t1));
+        when(transferRepository.findForClientWithFilters(client, null, null, null))
+                .thenReturn(List.of(t1));
 
         List<TransferResponseDto> result = transferService.getAllTransfers(client, null, null, null);
         assertThat(result).hasSize(1);
@@ -172,7 +177,9 @@ class TransferServiceCoverageTest {
     void getAllTransfers_blankAccountNumberIgnored() {
         Client client = new Client(); client.setId(1L);
         Transfer t1 = makeTransfer("111", "222", LocalDateTime.of(2026, 1, 15, 10, 0));
-        when(transferRepository.findByCreatedByOrderByCreatedAtDesc(client)).thenReturn(List.of(t1));
+        // blank account number mora da se normalizuje u null pre prosledjivanja upitu
+        when(transferRepository.findForClientWithFilters(client, null, null, null))
+                .thenReturn(List.of(t1));
 
         List<TransferResponseDto> result = transferService.getAllTransfers(client, "   ", null, null);
         assertThat(result).hasSize(1);
@@ -186,6 +193,7 @@ class TransferServiceCoverageTest {
 
         Client actor = new Client(); actor.setId(99L); actor.setEmail("auth@x");
         Company company = new Company();
+        company.setId(500L); // P1-authz-idor-1: same-company transfer dozvoljen (isti vlasnik)
         AuthorizedPerson ap = new AuthorizedPerson();
         ap.setClient(actor);
         company.setAuthorizedPersons(List.of(ap));

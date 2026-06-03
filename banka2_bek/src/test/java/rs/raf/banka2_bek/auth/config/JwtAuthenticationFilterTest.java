@@ -137,6 +137,57 @@ class JwtAuthenticationFilterTest {
     }
 
     @Test
+    void doFilterInternal_disabledAccount_returns401_doesNotSetAuthentication()
+            throws ServletException, IOException {
+        // N1: deaktiviran (disabled) nalog sa validno potpisanim access tokenom NE sme
+        // da zadrzi pristup. Filter mora odbiti sa 401 i NE postaviti Authentication.
+        String token = "valid-but-disabled";
+        request.addHeader("Authorization", "Bearer " + token);
+
+        UserDetails disabled = User.builder()
+                .username("marko@banka.rs")
+                .password("password")
+                .authorities(Collections.emptyList())
+                .disabled(true)
+                .build();
+
+        when(jwtService.extractEmail(token)).thenReturn("marko@banka.rs");
+        when(userDetailsService.loadUserByUsername("marko@banka.rs")).thenReturn(disabled);
+        // N1: enabled/locked guard je PRE isTokenValid — isTokenValid se ne dosegne.
+
+        filter.doFilterInternal(request, response, filterChain);
+
+        assertThat(response.getStatus()).isEqualTo(401);
+        verify(filterChain, never()).doFilter(request, response);
+        assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+    }
+
+    @Test
+    void doFilterInternal_lockedAccount_returns401_doesNotSetAuthentication()
+            throws ServletException, IOException {
+        // N1: zakljucan (accountLocked) nalog sa validnim tokenom mora dobiti 401.
+        String token = "valid-but-locked";
+        request.addHeader("Authorization", "Bearer " + token);
+
+        UserDetails locked = User.builder()
+                .username("marko@banka.rs")
+                .password("password")
+                .authorities(Collections.emptyList())
+                .accountLocked(true)
+                .build();
+
+        when(jwtService.extractEmail(token)).thenReturn("marko@banka.rs");
+        when(userDetailsService.loadUserByUsername("marko@banka.rs")).thenReturn(locked);
+        // N1: enabled/locked guard je PRE isTokenValid — isTokenValid se ne dosegne.
+
+        filter.doFilterInternal(request, response, filterChain);
+
+        assertThat(response.getStatus()).isEqualTo(401);
+        verify(filterChain, never()).doFilter(request, response);
+        assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+    }
+
+    @Test
     void doFilterInternal_refreshTokenAsBearer_returns401() throws ServletException, IOException {
         // SEC-03: refresh token ne sme da prodje kao access token kroz Bearer
         // header. Filter mora vratiti 401 i NE zvati doFilter za downstream.

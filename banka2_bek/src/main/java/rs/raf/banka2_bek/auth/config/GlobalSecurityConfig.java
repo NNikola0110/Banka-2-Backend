@@ -81,12 +81,11 @@ public class GlobalSecurityConfig  {
                                 "/auth/logout",
                                 "/auth-employee/activate",
                                 "/auth-employee/activation-token/*/status",
+                                "/auth-employee/resend-activation",
                                 "/swagger-ui.html",
                                 "/swagger-ui/**",
                                 "/v3/api-docs/**",
                                 "/v3/api-docs",
-                                "/exchange-rates",
-                                "/exchange/calculate",
                                 // /actuator/health/** pokriva: /actuator/health (aggregate),
                                 // /actuator/health/liveness (K8s liveness probe) i
                                 // /actuator/health/readiness (K8s readiness probe). Wildcard
@@ -96,6 +95,12 @@ public class GlobalSecurityConfig  {
                                 "/actuator/info",
                                 "/actuator/prometheus"
                         ).permitAll()
+                        // R1 364 (P2-authz-method-1): menjacnica — kurs lista i kalkulator
+                        // vise NISU permitAll. Spec (Celina 2 §Menjacnica) opisuje ulogovanog
+                        // klijenta; anonimni pristup je trosio eksternu Fixer/FX kvotu bez
+                        // autentifikacije (DoS na kvotu / besplatan FX feed). Sad zahtevaju
+                        // authenticated() (svaki ulogovan korisnik sme da vidi kurs/kalkulise).
+                        .requestMatchers("/exchange-rates", "/exchange/calculate").authenticated()
                         .requestMatchers("/employees/**").hasAnyRole("ADMIN", "EMPLOYEE")
                         // Self-lookup za klijenta — vraca svoj zapis po JWT email.
                         // MORA biti PRE generic /clients/** matchera (longest-prefix wins).
@@ -107,6 +112,19 @@ public class GlobalSecurityConfig  {
                         .requestMatchers("/accounts/bank").hasAnyRole("ADMIN", "EMPLOYEE")
                         .requestMatchers("/accounts/all/**").hasAnyRole("ADMIN", "EMPLOYEE")
                         .requestMatchers("/accounts/client/**").hasAnyRole("ADMIN", "EMPLOYEE")
+                        // P0-B9 N1 (IDOR/authz): kreiranje racuna i promena statusa racuna
+                        // su ZAPOSLENICKE operacije. Bez ovih matcher-a generic
+                        // anyRequest().authenticated() je puštao SVAKOG klijenta da:
+                        //  (a) POST /accounts kreira racun (i silent-fallback na prvog
+                        //      zaposlenog kao "kreatora"), i
+                        //  (b) PATCH /accounts/{id}/status promeni status TUDJEG racuna
+                        //      (zero-authz — npr. da reaktivira blokiran/zatvoren racun).
+                        // MORA biti PRE generic /accounts ruta (npr. /accounts/{id},
+                        // /accounts/my) koje ostaju client-accessible. Longest-prefix +
+                        // HTTP-metod specificnost: POST /accounts i PATCH .../status su
+                        // uze od generic GET /accounts/{id}.
+                        .requestMatchers(org.springframework.http.HttpMethod.POST, "/accounts").hasAnyRole("ADMIN", "EMPLOYEE")
+                        .requestMatchers(org.springframework.http.HttpMethod.PATCH, "/accounts/*/status").hasAnyRole("ADMIN", "EMPLOYEE")
                         .requestMatchers("/cards/*/unblock").hasAnyRole("ADMIN", "EMPLOYEE")
                         .requestMatchers("/cards/*/deactivate").hasAnyRole("ADMIN", "EMPLOYEE")
                         .requestMatchers(org.springframework.http.HttpMethod.PATCH, "/cards/requests/*/approve").hasAnyRole("ADMIN", "EMPLOYEE")
@@ -120,6 +138,16 @@ public class GlobalSecurityConfig  {
                         .requestMatchers(org.springframework.http.HttpMethod.POST, "/loans/*/early-repayment").authenticated()
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/loans/my").authenticated()
                         .requestMatchers("/loans/requests/**").hasAnyRole("ADMIN", "EMPLOYEE")
+                        // P0-B9 N3 (IDOR/authz): GET /loans (svi krediti, employee portal)
+                        // je curio SVE kredite svih klijenata bilo kom autentifikovanom
+                        // klijentu. Klijent svoje kredite vidi iskljucivo preko
+                        // GET /loans/my (gore). Pojedinacni GET /loans/{id} i
+                        // /loans/{id}/installments ostaju authenticated na URL nivou —
+                        // ownership (kredit pripada klijentu) se proverava u service-u
+                        // (LoanServiceImpl), jer klijent legitimno cita SVOJ kredit a
+                        // employee bilo koji. Exact-path match (bez '/**') da NE uhvati
+                        // /loans/{id}/* sub-rute.
+                        .requestMatchers(org.springframework.http.HttpMethod.GET, "/loans").hasAnyRole("ADMIN", "EMPLOYEE")
                         // ============================================================
                         // Trgovinske rute (/orders /portfolio /tax /funds /actuaries
                         // /listings /exchanges /options /margin-accounts /otc /profit-bank)
@@ -134,6 +162,10 @@ public class GlobalSecurityConfig  {
                         // browser-a), NE X-Api-Key. MORA biti DEKLARISAN PRE generic
                         // /interbank/** matcher-a (Spring uzima prvi match).
                         .requestMatchers("/interbank/otc/**").authenticated()
+                        // P1-9: FE poll ruta za inter-bank 2PC/OTC SAGA progres —
+                        // JWT-authenticated (browser), NE X-Api-Key. MORA biti PRE
+                        // generic /interbank/** matcher-a (Spring uzima prvi match).
+                        .requestMatchers("/interbank/payments/**").authenticated()
                         // Inter-bank /interbank endpoint je JEDINSTVEN ulaz za druge banke;
                         // InterbankAuthFilter validira X-Api-Key i postavlja ROLE_INTERBANK
                         // authority pre nego sto request stigne ovde (vidi protokol §2.10).
@@ -179,6 +211,22 @@ public class GlobalSecurityConfig  {
                 .formLogin(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)
                 .logout(AbstractHttpConfigurer::disable)
+                // P1-error-contract-1: bez custom entrypoint-a Spring 6 za anonimni
+                // zahtev na zasticenoj ruti vraca Http403ForbiddenEntryPoint (403 PRAZNO),
+                // ne 401. FE interceptor (api.ts) radi /auth/refresh SAMO na 401 →
+                // istekao access token bi izbacio korisnika iako ima validan refresh.
+                // authenticationEntryPoint → 401 JSON (anoniman/istekao token),
+                // accessDeniedHandler → 403 JSON (autentifikovan ali bez prava).
+                .exceptionHandling(ex -> ex
+                        .authenticationEntryPoint((request, response, authException) ->
+                                SecurityErrorResponder.writeJson(response,
+                                        org.springframework.http.HttpStatus.UNAUTHORIZED,
+                                        SecurityErrorResponder.SESSION_EXPIRED_MESSAGE))
+                        .accessDeniedHandler((request, response, accessDeniedException) ->
+                                SecurityErrorResponder.writeJson(response,
+                                        org.springframework.http.HttpStatus.FORBIDDEN,
+                                        SecurityErrorResponder.ACCESS_DENIED_MESSAGE))
+                )
                 .sessionManagement(session -> session
                 .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
         )
@@ -202,8 +250,17 @@ public class GlobalSecurityConfig  {
                         .referrerPolicy(r -> r.policy(
                                 org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter
                                         .ReferrerPolicy.NO_REFERRER))
+                        // P2-config-2 (R4 1786): uskladjeno sa FE nginx Permissions-Policy
+                        // (Banka-2-Frontend/nginx.conf) — geolocation=(self) za /branches
+                        // Leaflet mapu, microphone=(self) za Arbitro voice (Web Speech API);
+                        // camera/payment/usb disabled.
+                        // Ranije je Spring imao geolocation=()/microphone=() (drift) sto je
+                        // blokiralo te feature-e na direktan BE pristup.
+                        // Bug 6 (03.06): uklonjen `interest-cohort=()` — moderni browseri ga
+                        // odbacuju kao nepoznat policy-directive (warning u konzoli).
                         .permissionsPolicyHeader(p -> p.policy(
-                                "geolocation=(), microphone=(), camera=()"))
+                                "geolocation=(self), microphone=(self), camera=(), "
+                                        + "payment=(), usb=()"))
                 );
 
         return http.build();
@@ -212,6 +269,25 @@ public class GlobalSecurityConfig  {
     @Bean
     public AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
         return config.getAuthenticationManager();
+    }
+
+    /**
+     * R1-710: {@link InternalAuthFilter} je {@code @Component} koji nasledjuje
+     * {@code OncePerRequestFilter} — Spring Boot ga zato AUTO-registruje kao servlet
+     * filter U GLAVNOM servlet chain-u, a mi ga DODATNO dodajemo u Spring Security chain
+     * ({@code addFilterBefore} gore). Posledica: filter se izvrsava DVAPUT za {@code /internal/**}
+     * zahteve (jednom u servlet chain-u, jednom u security chain-u). Ovaj
+     * {@link FilterRegistrationBean} sa {@code setEnabled(false)} gasi servlet-container
+     * auto-registraciju; jedino merodavna ostaje Security-chain registracija (gde filter
+     * mora da postavi {@code ROLE_INTERNAL} pre {@code AuthorizationFilter}-a).
+     */
+    @Bean
+    public org.springframework.boot.web.servlet.FilterRegistrationBean<InternalAuthFilter>
+            internalAuthFilterServletDisable(InternalAuthFilter internalAuthFilter) {
+        var registration =
+                new org.springframework.boot.web.servlet.FilterRegistrationBean<>(internalAuthFilter);
+        registration.setEnabled(false);
+        return registration;
     }
 
     @Bean

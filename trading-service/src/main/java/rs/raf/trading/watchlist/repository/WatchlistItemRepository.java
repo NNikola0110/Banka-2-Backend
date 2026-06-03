@@ -23,4 +23,7 @@ public interface WatchlistItemRepository extends JpaRepository<WatchlistItem, Lo
     void deleteAllByWatchlistId(Long watchlistId);
 
     boolean existsByWatchlistIdAndListingId(Long watchlistId, Long listingId);
+
+    /** [P2-input-validation-1 / R1 517] broj stavki u listi (DoS limit guard). */
+    long countByWatchlistId(Long watchlistId);
 }

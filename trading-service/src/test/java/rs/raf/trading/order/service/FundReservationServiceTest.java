@@ -15,7 +15,6 @@ import rs.raf.trading.client.BankaCoreClientException;
 import rs.raf.trading.order.exception.InsufficientFundsException;
 import rs.raf.trading.order.exception.InsufficientHoldingsException;
 import rs.raf.trading.order.model.Order;
-import rs.raf.trading.order.model.SagaState;
 import rs.raf.trading.portfolio.model.Portfolio;
 import rs.raf.trading.portfolio.repository.PortfolioRepository;
 
@@ -95,7 +94,6 @@ class FundReservationServiceTest {
         assertThat(reqCap.getValue().amount()).isEqualByComparingTo("2500.00");
         assertThat(reqCap.getValue().currencyCode()).isEqualTo("RSD");
         assertThat(order.getBankaCoreReservationId()).isEqualTo("res-001");
-        assertThat(order.getSagaState()).isEqualTo(SagaState.FUNDS_RESERVED);
     }
 
     @Test
@@ -164,7 +162,6 @@ class FundReservationServiceTest {
 
         verify(bankaCoreClient).releaseFunds(eq("res-001"), eq("order-100-release"), any());
         assertThat(order.isReservationReleased()).isTrue();
-        assertThat(order.getSagaState()).isEqualTo(SagaState.COMPENSATED);
     }
 
     @Test

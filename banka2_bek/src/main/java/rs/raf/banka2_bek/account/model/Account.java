@@ -15,6 +15,13 @@ import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "accounts")
+// R4-1775: stack je PostgreSQL (podrzava CHECK constraint-e kroz Hibernate DDL),
+// a invarijanta "racun ima TACNO jednog vlasnika — klijenta ili kompaniju" je do sada
+// bila branjena samo aplikativnim @AssertTrue (zaobidjiva na native/bulk save/merge).
+// Sada postoji i pravi DB-level CHECK koji garantuje invarijantu nezavisno od puta upisa.
+@org.hibernate.annotations.Check(
+        name = "chk_account_single_owner",
+        constraints = "(client_id IS NULL) <> (company_id IS NULL)")
 @Getter
 @Setter
 @NoArgsConstructor
@@ -69,10 +76,15 @@ public class Account {
     @Builder.Default
     private BigDecimal availableBalance = BigDecimal.ZERO;  // Raspoloživo stanje (balance - rezervisano)
 
+    // R1-627: INTERNI reservation tracker — odrzavaju ga SAMO interbank/internalFunds
+    // flow-ovi (2PC, OTC: setReservedAmount uz odgovarajuci setAvailableBalance).
+    // NIJE izvor istine za prikazana "rezervisana sredstva" u AccountResponseDto —
+    // DTO racuna (balance - availableBalance) kao prikazani gep (vidi
+    // AccountServiceImplementation.toResponse). Dva razlicita pojma, ne dupli.
     @Column(nullable = false, precision = 19, scale = 4)
     @org.hibernate.annotations.ColumnDefault("0")
     @Builder.Default
-    private BigDecimal reservedAmount = BigDecimal.ZERO;    // Rezervisano za pending/approved ordere i placanja
+    private BigDecimal reservedAmount = BigDecimal.ZERO;    // Interno: rezervisano za 2PC/OTC reservation flow-ove
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 32)
@@ -126,8 +138,9 @@ public class Account {
     private LocalDateTime createdAt = LocalDateTime.now();
 
     // ── Validacija: tačno jedno od client/company mora biti postavljeno ───────
-    // MySQL ne podrzava CHECK constraints kroz Hibernate DDL auto,
-    // pa se validacija radi na aplikacionom nivou pre svakog persist/merge.
+    // R4-1775: PostgreSQL podrzava CHECK constraint-e — invarijanta je sada i na
+    // DB nivou (@Check chk_account_single_owner gore). @AssertTrue ostaje kao
+    // brza aplikaciona provera (lepsa poruka, hvata gresku pre round-trip-a do baze).
     @AssertTrue(message = "Racun mora imati vlasnika: ili klijenta ili kompaniju, ali ne oba.")
     @Transient
     public boolean isOwnerValid() {

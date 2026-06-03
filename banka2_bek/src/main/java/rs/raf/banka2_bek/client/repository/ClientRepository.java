@@ -13,6 +13,15 @@ public interface ClientRepository extends JpaRepository<Client, Long> {
 
     Optional<Client> findByEmail(String email);
 
+    /**
+     * P2-config-2 (R1 403): case-insensitive lookup za interni permission/identity
+     * resolve (trading-service zove preko email-a). Bez ovog, ako JWT subject dolazi
+     * sa razlicitim case-om od ono sto je u bazi, klijent dobija praznu permission
+     * listu → TRADE_STOCKS izostaje → 403 na POST /orders. Paritet sa
+     * {@code UserRepository.findByEmailIgnoreCase} / {@code EmployeeRepository}.
+     */
+    Optional<Client> findByEmailIgnoreCase(String email);
+
     boolean existsByEmail(String email);
 
     // PG cast za null-safe parametre (vidi CLAUDE.md Runda 24.04).

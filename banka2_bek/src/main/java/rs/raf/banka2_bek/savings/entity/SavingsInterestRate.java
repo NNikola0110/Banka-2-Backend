@@ -10,14 +10,24 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 
+/**
+ * TEST-savings-3 (✅ FIXED 02.06): uniqueness se enforce-uje SAMO medju AKTIVNIM
+ * redovima preko PostgreSQL PARTIAL UNIQUE INDEX-a
+ * {@code (currency_id, term_months) WHERE active = true} — kreira ga
+ * {@link rs.raf.banka2_bek.persistence.SavingsInterestRateIndexInitializer}
+ * na startu (isti obrazac kao {@link rs.raf.banka2_bek.persistence.CardSlotIndexInitializer}).
+ *
+ * <p>Ranije je tu stajao 3-kolonski {@code @UniqueConstraint}
+ * {@code (currency_id, term_months, active)} u kojem je {@code active} bio PUNI
+ * deo kljuca. Posledica: {@code upsertOnce} deaktivira tekuci red pa insert-uje nov;
+ * 3. promena rate-a za isti {@code (currency,term)} pravi DRUGI {@code (..,false)}
+ * red → DataIntegrityViolation → @Retryable 3× → 500. Net efekat: rate se mogao
+ * promeniti TACNO JEDNOM po (currency,term). Partial-unique {@code WHERE active=true}
+ * dozvoljava proizvoljno mnogo istorijskih {@code false} redova, a garantuje najvise
+ * JEDAN aktivan red po (currency,term) — sto je i poslovno pravilo.
+ */
 @Entity
-@Table(
-    name = "savings_interest_rates",
-    uniqueConstraints = @UniqueConstraint(
-        name = "uk_savings_rates_currency_term_active",
-        columnNames = {"currency_id", "term_months", "active"}
-    )
-)
+@Table(name = "savings_interest_rates")
 @Getter @Setter
 @NoArgsConstructor
 @AllArgsConstructor

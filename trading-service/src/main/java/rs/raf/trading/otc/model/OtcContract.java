@@ -102,6 +102,9 @@ public class OtcContract {
     @Column(name = "banka_core_reservation_id")
     private String bankaCoreReservationId;
 
+    @Version
+    private Long version;
+
     @PrePersist
     void onCreate() {
         if (createdAt == null) createdAt = LocalDateTime.now();

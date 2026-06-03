@@ -127,6 +127,20 @@ class PaymentRecipientServiceImplTest {
     }
 
     @Test
+    void createPaymentRecipient_throwsWhenDuplicateAccountNumberForClient() {
+        // R1-647: isti klijent ne sme da kreira dva primaoca sa istim brojem racuna.
+        when(clientRepository.findByEmail(CLIENT_EMAIL)).thenReturn(Optional.of(client));
+        when(paymentRecipientRepository.existsByClientAndAccountNumber(client, "987654321098765432"))
+                .thenReturn(true);
+
+        assertThatThrownBy(() -> paymentRecipientService.createPaymentRecipient(createRequest, CLIENT_EMAIL))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("vec postoji");
+
+        verify(paymentRecipientRepository, org.mockito.Mockito.never()).save(any(PaymentRecipient.class));
+    }
+
+    @Test
     void updatePaymentRecipient_updatesNameAndAccountNumber() {
         when(clientRepository.findByEmail(CLIENT_EMAIL)).thenReturn(Optional.of(client));
         when(paymentRecipientRepository.findByIdAndClient(10L, client)).thenReturn(Optional.of(existingRecipient));

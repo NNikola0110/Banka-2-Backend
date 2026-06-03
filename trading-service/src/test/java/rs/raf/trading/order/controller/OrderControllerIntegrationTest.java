@@ -375,4 +375,85 @@ class OrderControllerIntegrationTest {
                     .isIn(HttpStatus.UNAUTHORIZED, HttpStatus.FORBIDDEN);
         }
     }
+
+    // ── PATCH /orders/{id}/approve & /decline — authz gate ────────────────────
+    //
+    // OT-1038 / OT-1039 (TEST-tr-order-listing-portfolio-1): authz na approval
+    // rutama. SecurityConfig: `.requestMatchers("/orders/*/approve",
+    // "/orders/*/decline").hasAnyRole("ADMIN", "EMPLOYEE")`. Klijent (samo
+    // ROLE_CLIENT) ne sme da odobri/odbije/otkaze order kroz ove rute → 403 na
+    // HTTP nivou (filter chain), pre nego sto zahtev dodje do servisa. Ovo je
+    // i OT-1039 "client self-cancel" pin: klijent NE moze da otkaze ni SVOJ order
+    // preko /decline rute (ona je supervizorska — otkazivanje je supervizorska
+    // akcija, §13 "Portal Pregled ordera — samo za supervizore").
+    @Nested
+    @DisplayName("PATCH /orders/{id}/approve & /decline — authz")
+    class ApproveDeclineAuthz {
+
+        @Test
+        @DisplayName("OT-1038: CLIENT ne sme PATCH /approve → 403 (ne dodje do servisa)")
+        void clientApprove_forbidden() {
+            Listing listing = savedListing();
+            Order order = savedOrder(CLIENT_ID, "CLIENT", OrderStatus.PENDING, listing);
+
+            ResponseEntity<String> response = restTemplate.exchange(
+                    url("/orders/" + order.getId() + "/approve"),
+                    HttpMethod.PATCH,
+                    new HttpEntity<>(bearerHeaders(buildToken("client@test.com", "CLIENT"))),
+                    String.class);
+
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        }
+
+        @Test
+        @DisplayName("OT-1039: CLIENT ne sme PATCH /decline (self-cancel) — supervizorska ruta → 403")
+        void clientDeclineSelfCancel_forbidden() {
+            Listing listing = savedListing();
+            // Order pripada BAS ovom klijentu (self-cancel pokusaj) — i dalje 403,
+            // jer je /decline ruta supervizorska (otkazivanje radi supervizor).
+            Order ownOrder = savedOrder(CLIENT_ID, "CLIENT", OrderStatus.PENDING, listing);
+
+            ResponseEntity<String> response = restTemplate.exchange(
+                    url("/orders/" + ownOrder.getId() + "/decline"),
+                    HttpMethod.PATCH,
+                    new HttpEntity<>(bearerHeaders(buildToken("client@test.com", "CLIENT"))),
+                    String.class);
+
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        }
+
+        @Test
+        @DisplayName("OT-1038: neautentifikovan PATCH /approve → 401/403")
+        void unauthenticatedApprove_rejected() {
+            ResponseEntity<String> response = restTemplate.exchange(
+                    url("/orders/1/approve"),
+                    HttpMethod.PATCH,
+                    HttpEntity.EMPTY,
+                    String.class);
+
+            assertThat(response.getStatusCode())
+                    .isIn(HttpStatus.UNAUTHORIZED, HttpStatus.FORBIDDEN);
+        }
+
+        @Test
+        @DisplayName("OT-1038 karakterizacija: EMPLOYEE prolazi HTTP authz gate (nije 403); "
+                + "ne-supervizor agent NIJE blokiran na HTTP nivou (matcher je ROLE EMPLOYEE, "
+                + "ne SUPERVISOR authority) — pin trenutnog ponasanja")
+        void employeePassesHttpGate_notForbidden() {
+            // EMPLOYEE token ima ROLE_EMPLOYEE → prolazi `.hasAnyRole("ADMIN","EMPLOYEE")`.
+            // Posto order ne postoji, servis baca EntityNotFoundException → 404 (NE 403),
+            // sto dokazuje da je zahtev PROSAO authz gate i stigao do servisa. Razlika
+            // 404-vs-403 je upravo dokaz da EMPLOYEE nije blokiran na security nivou.
+            // (Spec §13 trazi supervizora; HTTP matcher koristi EMPLOYEE rolu — namerna
+            //  granularnost tima, dokumentovana ovim karakterizacionim testom.)
+            ResponseEntity<String> response = restTemplate.exchange(
+                    url("/orders/99999/approve"),
+                    HttpMethod.PATCH,
+                    new HttpEntity<>(bearerHeaders(buildToken("agent@test.com", "EMPLOYEE"))),
+                    String.class);
+
+            assertThat(response.getStatusCode()).isNotEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        }
+    }
 }

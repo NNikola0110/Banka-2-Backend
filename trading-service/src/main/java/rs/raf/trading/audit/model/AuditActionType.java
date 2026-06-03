@@ -12,5 +12,13 @@ public enum AuditActionType {
     ORDER_APPROVED,
     ORDER_DECLINED,
     PERMISSIONS_CHANGED,
-    TAX_RUN_TRIGGERED
+    TAX_RUN_TRIGGERED,
+
+    // P2-audit-coverage-1 (R5 1888): investicioni fondovi (Celina 4) money/lifecycle dogadjaji
+    FUND_CREATED,
+    FUND_INVEST,
+    FUND_WITHDRAW,
+
+    // P2-audit-coverage-1 (R1 439): dnevni cron reset svih aktuarskih limita
+    USED_LIMIT_RESET_ALL
 }

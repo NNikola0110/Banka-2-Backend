@@ -2,10 +2,13 @@ package rs.raf.banka2_bek.savings.service;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import rs.raf.banka2_bek.account.model.Account;
 import rs.raf.banka2_bek.account.repository.AccountRepository;
+import rs.raf.banka2_bek.audit.model.AuditActionType;
+import rs.raf.banka2_bek.audit.service.AuditLogService;
 import rs.raf.banka2_bek.savings.entity.SavingsDeposit;
 import rs.raf.banka2_bek.savings.entity.SavingsDepositStatus;
 import rs.raf.banka2_bek.savings.entity.SavingsInterestRate;
@@ -34,30 +37,72 @@ public class SavingsDepositProcessor {
     private final SavingsTransactionRepository txRepo;
     private final SavingsInterestRateService rateService;
     private final AccountRepository accountRepo;
+    // P2-audit-coverage-1 (R5 1889): audit auto-obnove depozita (dead enum SAVINGS_AUTO_RENEWED).
+    private final AuditLogService auditLogService;
+
+    @Value("${bank.registration-number}")
+    private String bankRegistrationNumber;
 
     @Transactional
     public void payMonthlyInterest(SavingsDeposit d, LocalDate today) {
+        // R7: kamata se NE sme isplacivati preko maturityDate. Posle downtime catch-up
+        // moze pokupiti deposit-e cija je nextInterestPaymentDate vec prosla maturity —
+        // takav payout bi placao kamatu za period koji ne postoji. No-op (guard).
+        if (d.getMaturityDate() != null
+                && d.getNextInterestPaymentDate().isAfter(d.getMaturityDate())) {
+            log.debug("Scheduler: deposit {} nextInterest {} > maturity {} — kamata preskocena (R7)",
+                    d.getId(), d.getNextInterestPaymentDate(), d.getMaturityDate());
+            return;
+        }
+
+        // P1-savings-loans-1 (R1-137 / R4-1734): multi-mesecni catch-up. Posle downtime
+        // nextInterestPaymentDate moze biti VISE meseci u proslosti. Ranije se placao samo
+        // JEDAN mesec po ciklusu — ako bi maturity grana istog ciklusa vratila glavnicu i
+        // postavila MATURED, zaostala kamata bi se izgubila. Sada while-petlja isplacuje
+        // SVE dospele mesece (uz R7 ogranicenje <= maturityDate) u jednom pozivu.
         BigDecimal monthlyInterest = SavingsCalculator.monthlyInterest(
                 d.getPrincipalAmount(), d.getAnnualInterestRate());
 
+        int monthsCovered = 0;
+        BigDecimal totalInterest = BigDecimal.ZERO;
+        while (!d.getNextInterestPaymentDate().isAfter(today)
+                && (d.getMaturityDate() == null
+                    || !d.getNextInterestPaymentDate().isAfter(d.getMaturityDate()))) {
+            totalInterest = totalInterest.add(monthlyInterest);
+            monthsCovered++;
+            d.setNextInterestPaymentDate(
+                    SavingsCalculator.nextMonthlyAnniversary(d.getNextInterestPaymentDate()));
+        }
+
+        if (monthsCovered == 0) {
+            // Nije dospela nijedna isplata (guard — scheduler filtrira, ali defanzivno).
+            return;
+        }
+
         Account linked = accountRepo.findForUpdateById(d.getLinkedAccountId())
                 .orElseThrow(() -> new IllegalStateException("Povezani racun ne postoji"));
-        linked.setBalance(linked.getBalance().add(monthlyInterest));
-        linked.setAvailableBalance(linked.getAvailableBalance().add(monthlyInterest));
+        linked.setBalance(linked.getBalance().add(totalInterest));
+        linked.setAvailableBalance(linked.getAvailableBalance().add(totalInterest));
         accountRepo.save(linked);
 
-        d.setTotalInterestPaid(d.getTotalInterestPaid().add(monthlyInterest));
-        d.setNextInterestPaymentDate(SavingsCalculator.nextMonthlyAnniversary(d.getNextInterestPaymentDate()));
+        // Double-entry: kamata je bankin trosak — debituje se bankin liability racun
+        // za UKUPAN iznos svih dospelih meseci, da novac ne nastaje iz vazduha (P0-B1).
+        debitBankAccount(d, totalInterest);
+
+        d.setTotalInterestPaid(d.getTotalInterestPaid().add(totalInterest));
         depositRepo.save(d);
 
-        txRepo.save(SavingsTransaction.builder()
-                .deposit(d).type(SavingsTransactionType.INTEREST_PAYMENT)
-                .amount(monthlyInterest).currency(d.getCurrency()).processedDate(today)
-                .description("Mesecna kamata depozita #" + d.getId())
-                .build());
+        // Audit trag: po jedna INTEREST_PAYMENT transakcija za svaki dospeli mesec.
+        for (int i = 0; i < monthsCovered; i++) {
+            txRepo.save(SavingsTransaction.builder()
+                    .deposit(d).type(SavingsTransactionType.INTEREST_PAYMENT)
+                    .amount(monthlyInterest).currency(d.getCurrency()).processedDate(today)
+                    .description("Mesecna kamata depozita #" + d.getId())
+                    .build());
+        }
 
-        log.info("Scheduler: isplacena kamata {} {} za deposit {}",
-                monthlyInterest, d.getCurrency().getCode(), d.getId());
+        log.info("Scheduler: isplacena kamata {} {} ({} mesec/i) za deposit {}",
+                totalInterest, d.getCurrency().getCode(), monthsCovered, d.getId());
     }
 
     @Transactional
@@ -67,6 +112,10 @@ public class SavingsDepositProcessor {
         linked.setBalance(linked.getBalance().add(d.getPrincipalAmount()));
         linked.setAvailableBalance(linked.getAvailableBalance().add(d.getPrincipalAmount()));
         accountRepo.save(linked);
+
+        // Double-entry: banka oslobadja custody glavnice — debituje se bankin liability
+        // racun za glavnicu (kontra-noga uplate na otvaranju, P0-B1 konzervacija).
+        debitBankAccount(d, d.getPrincipalAmount());
 
         d.setStatus(SavingsDepositStatus.MATURED);
         depositRepo.save(d);
@@ -79,6 +128,21 @@ public class SavingsDepositProcessor {
 
         log.info("Scheduler: vracena glavnica {} {} za deposit {}",
                 d.getPrincipalAmount(), d.getCurrency().getCode(), d.getId());
+    }
+
+    /**
+     * P0-B1 double-entry: debituje bankin liability racun u valuti depozita za
+     * {@code amount} (pesimisticki lock). Kontra-noga svake isplate klijentu
+     * (kamata/glavnica) — bez nje novac nastaje iz vazduha.
+     */
+    private void debitBankAccount(SavingsDeposit d, BigDecimal amount) {
+        Account bankAccount = accountRepo.findBankAccountForUpdateByCurrency(
+                bankRegistrationNumber, d.getCurrency().getCode())
+                .orElseThrow(() -> new IllegalStateException(
+                        "Banka nema racun u valuti " + d.getCurrency().getCode()));
+        bankAccount.setBalance(bankAccount.getBalance().subtract(amount));
+        bankAccount.setAvailableBalance(bankAccount.getAvailableBalance().subtract(amount));
+        accountRepo.save(bankAccount);
     }
 
     @Transactional
@@ -112,6 +176,24 @@ public class SavingsDepositProcessor {
                 .amount(d.getPrincipalAmount()).currency(d.getCurrency()).processedDate(today)
                 .description("Auto-obnova dospelog depozita #" + d.getId())
                 .build());
+
+        // R5 1889: SAVINGS_AUTO_RENEWED je bio definisan ali NIKAD emitovan (dead enum).
+        // Auto-obnova menja glavnicu/rok/stopu — money/lifecycle dogadjaj. Aktor = SYSTEM
+        // (scheduler thread, nema SecurityContext); target = NOVI depozit. Best-effort.
+        try {
+            auditLogService.record(
+                    0L, "SYSTEM",
+                    AuditActionType.SAVINGS_AUTO_RENEWED,
+                    "Savings deposit #" + d.getId() + " auto-renewed into #" + renewed.getId()
+                            + " (principal=" + d.getPrincipalAmount() + " " + d.getCurrency().getCode()
+                            + ", term=" + d.getTermMonths() + "m, rate=" + currentRate + ")",
+                    "SAVINGS_DEPOSIT", renewed.getId(),
+                    "depositId=" + d.getId(),
+                    "depositId=" + renewed.getId() + ",rate=" + currentRate);
+        } catch (Exception e) {
+            log.warn("Audit log fail (best-effort) action=SAVINGS_AUTO_RENEWED deposit={}: {}",
+                    renewed.getId(), e.getMessage());
+        }
 
         log.info("Scheduler: auto-obnova {} -> {} za client {}",
                 d.getId(), renewed.getId(), d.getClientId());

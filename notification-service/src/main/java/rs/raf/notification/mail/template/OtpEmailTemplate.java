@@ -10,6 +10,9 @@ public class OtpEmailTemplate {
     }
 
     public String buildBody(String code, int expiryMinutes) {
+        // [P1-notif-svc-1 / 1528] code je tehnicki bankin-generisan, ali escape
+        // defanzivno (consumer prosledjuje sirov string iz poruke).
+        String safeCode = EmailHtml.escape(code);
         return """
                 <!DOCTYPE html>
                 <html lang="sr">
@@ -46,7 +49,7 @@ public class OtpEmailTemplate {
                                             Kod istice za <strong>%d minuta</strong>.
                                         </p>
                                         <p style="margin:0 0 8px 0;font-size:13px;color:#6b7280;line-height:1.5;">
-                                            Imate 3 pokusaja za unos koda.
+                                            Imate ogranicen broj pokusaja za unos koda.
                                         </p>
                                         <p style="margin:16px 0 0 0;font-size:12px;color:#9ca3af;">
                                             Ako niste pokrenuli ovu transakciju, molimo kontaktirajte vaseg administratora.
@@ -66,6 +69,6 @@ public class OtpEmailTemplate {
                 </table>
                 </body>
                 </html>
-                """.formatted(code, expiryMinutes);
+                """.formatted(safeCode, expiryMinutes);
     }
 }

@@ -12,6 +12,7 @@ import org.springframework.stereotype.Component;
 import rs.raf.banka2_bek.assistant.config.AssistantProperties;
 import rs.raf.banka2_bek.assistant.tool.ToolDefinition;
 import rs.raf.banka2_bek.assistant.tool.ToolHandler;
+import rs.raf.banka2_bek.assistant.util.LogSanitizer;
 import rs.raf.banka2_bek.auth.util.UserContext;
 
 import java.util.Map;
@@ -84,7 +85,8 @@ public class CalculatorHandler implements ToolHandler {
                     "result", result == null ? "null" : result
             );
         } catch (SpelEvaluationException e) {
-            log.warn("Calculator eval failed for '{}': {}", expression, e.getMessage());
+            // [P2-input-validation-1 / R4 1782] sanitize CRLF iz user expression pre logovanja.
+            log.warn("Calculator eval failed for '{}': {}", LogSanitizer.sanitize(expression), e.getMessage());
             return Map.of("error", "Nije moguce izracunati izraz: " + e.getMessage(),
                           "expression", expression);
         }

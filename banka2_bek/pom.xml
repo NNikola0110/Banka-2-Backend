@@ -176,6 +176,24 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- Testcontainers PG (P2-schema-1) — H2 ne reprodukuje verno PG CHECK
+             constraint-e ni precision/unique DDL ponasanje, pa schema PG-smoke
+             testovi (Account CHECK, FundReservation unique dedup) pokrecu pravi
+             postgres kontejner. Test scope — ne ide u prod artefakt. Testovi se
+             gracefully preskacu (@EnabledIf dockerAvailable) bez Docker-a. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>1.20.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>1.20.0</version>
+            <scope>test</scope>
+        </dependency>
+
         <!-- TOTP (RFC 6238) -->
         <dependency>
             <groupId>com.warrenstrange</groupId>
@@ -338,11 +356,12 @@
                         </goals>
                     </execution>
                     <!--
-                        KT3 zahtev: 80% test coverage.
-                        Pokrece se na `verify` fazu — `mvn verify` ili CI build.
-                        Trenutno coverage = 84.48% (po excludes-u: assistant Arbitro,
-                        dto/config/exception/mapper). Ako neko cumadji testove i padne
-                        ispod 80%, build PUCA — KT3 enforcement.
+                        KT3 zahtev: 80% test coverage (cilj). Prag (haltOnFailure) je
+                        LINE 0.77 (vidi <minimum> ispod). Pokrece se na `verify` fazu —
+                        `mvn verify` ili CI build. R5-370: trenutni LINE coverage = 0.7949
+                        (~79.49%, 5242/6595) — usklađen komentar sa pravim brojem (ranije je
+                        ovde stajalo zavaravajucih 84.48%). Excludes: assistant Arbitro,
+                        dto/config/exception/mapper. Ako padne ispod 0.77, build PUCA.
                     -->
                     <execution>
                         <id>check</id>

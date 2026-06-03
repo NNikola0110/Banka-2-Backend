@@ -47,7 +47,10 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
         // Opciono.1 — odbaci blacklisted (logged-out) tokene pre signature check-a.
         if (blacklistService.isBlacklisted(token)) {
-            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            // P1-error-contract-1: JSON telo {"message":...} umesto praznog tela,
+            // da Mobile/FE prikazu "Sesija je istekla" umesto generic login greske.
+            SecurityErrorResponder.writeJson(response, org.springframework.http.HttpStatus.UNAUTHORIZED,
+                    SecurityErrorResponder.SESSION_EXPIRED_MESSAGE);
             return;
         }
 
@@ -57,7 +60,8 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             // Bearer access token, oborimo zahtev sa 401. Tokeni generisani pre fix-a
             // nemaju "type" claim — tretiraju se kao access (backwards-compat).
             if (jwtService.isRefreshToken(token)) {
-                response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                SecurityErrorResponder.writeJson(response, org.springframework.http.HttpStatus.UNAUTHORIZED,
+                        SecurityErrorResponder.SESSION_EXPIRED_MESSAGE);
                 return;
             }
 
@@ -65,6 +69,17 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
             if (email != null && SecurityContextHolder.getContext().getAuthentication() == null) {
                 UserDetails userDetails = userDetailsService.loadUserByUsername(email);
+
+                // N1: aktivnost/locked status se enforce-uje pri SVAKOM zahtevu, ne samo
+                // pri login-u. Bez ovoga, deaktiviran ili zakljucan nalog sa jos-vazecim
+                // access token-om (do 15 min) ili refresh-izdatim novim access token-om
+                // (do 7 dana) zadrzava pun pristup. Odbacujemo sa 401 i NE pozivamo
+                // downstream chain — kao kod blacklist/refresh-token grane.
+                if (!userDetails.isEnabled() || !userDetails.isAccountNonLocked()) {
+                    SecurityErrorResponder.writeJson(response, org.springframework.http.HttpStatus.UNAUTHORIZED,
+                            SecurityErrorResponder.SESSION_EXPIRED_MESSAGE);
+                    return;
+                }
 
                 if (jwtService.isTokenValid(token, userDetails)) {
                     UsernamePasswordAuthenticationToken authToken =
@@ -75,7 +90,8 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                 }
             }
         } catch (Exception e) {
-            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            SecurityErrorResponder.writeJson(response, org.springframework.http.HttpStatus.UNAUTHORIZED,
+                    SecurityErrorResponder.SESSION_EXPIRED_MESSAGE);
             return;
         }
 

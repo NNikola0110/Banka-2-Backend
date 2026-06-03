@@ -10,7 +10,7 @@ import java.time.Duration;
 
 /**
  * Custom poslovne metrike za trading-service.
- * Order engine metrike su premestje iz banka-core MetricsConfig
+ * Order engine metrike su premestje iz banka-core monitoring sloja
  * (gde su bile DEAD posle Faza 2f cutover-a — order/OTC/option/margin
  * logika sad zivi u trading-service-u).
  *

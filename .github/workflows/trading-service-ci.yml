@@ -1,6 +1,12 @@
 name: trading-service-ci
 
 on:
+  # R5 1944 (monorepo tradeoff, namerno): trigger se NE okida na 'banka2_bek/**'.
+  # banka-core deli DTO-e ka trading-u SAMO kroz 'banka2-contracts' modul (koji JESTE
+  # u paths) — DTO promene u contracts-u rebuild-uju trading. banka_core-interne klase
+  # nisu compile-time dependency trading-a, pa contract drift ne moze nastati ovim putem.
+  # Cena: izmena u banka2_bek koja sluci slomi cross-service runtime ugovor (ne preko
+  # contracts modula) nece pokrenuti trading CI — pokriveno integ/E2E na main-u.
   push:
     branches: [main]
     paths:

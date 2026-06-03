@@ -10,7 +10,13 @@ public class AccountCreatedConfirmationEmailTemplate {
     }
 
     public String buildBody(String firstName, String accountNumber, String accountType) {
-        String greeting = (firstName != null && !firstName.isBlank()) ? firstName : "Poštovani";
+        // [P2-input-validation-1 / R1 385] escape user-controlled vrednosti (ime,
+        // tip racuna, broj racuna) pre interpolacije u HTML telo — sprecava
+        // HTML/<script>/<img> injection iz firstName/accountType/accountNumber.
+        String greeting = EmailHtml.escape(
+                (firstName != null && !firstName.isBlank()) ? firstName : "Poštovani");
+        String safeAccountType = EmailHtml.escape(accountType);
+        String safeAccountNumber = EmailHtml.escape(accountNumber);
         return """
                 <!DOCTYPE html>
                 <html lang="sr">
@@ -82,6 +88,6 @@ public class AccountCreatedConfirmationEmailTemplate {
                 </table>
                 </body>
                 </html>
-                """.formatted(greeting, accountType, accountNumber);
+                """.formatted(greeting, safeAccountType, safeAccountNumber);
     }
 }

@@ -104,6 +104,50 @@ class AgentActionGatewayTest {
     }
 
     @Test
+    @DisplayName("P0-B8 N1: createPending CLIENT na EMPLOYEE-only akciju → AgenticActionForbiddenException")
+    void createPending_clientOnEmployeeOnlyAction_forbidden() {
+        EmployeeOnlyHandler empHandler = new EmployeeOnlyHandler();
+
+        assertThatThrownBy(() -> gateway.createPending(
+                "conv-1", "approve_loan_request", Map.of("requestId", 1),
+                clientUser, empHandler))
+                .isInstanceOf(AgentActionGateway.AgenticActionForbiddenException.class);
+
+        // Akcija ne sme biti perzistirana ni rate-counter potrosen.
+        verify(repository, never()).save(any(AgentAction.class));
+        assertThat(empHandler.previewBuilt).isFalse();
+    }
+
+    @Test
+    @DisplayName("P0-B8 N1: createPending EMPLOYEE na EMPLOYEE-only akciju → prolazi")
+    void createPending_employeeOnEmployeeOnlyAction_allowed() {
+        when(repository.save(any(AgentAction.class))).thenAnswer(inv -> inv.getArgument(0));
+        EmployeeOnlyHandler empHandler = new EmployeeOnlyHandler();
+        UserContext employeeUser = new UserContext(7L, UserRole.EMPLOYEE);
+
+        AgentActionPreviewDto preview = gateway.createPending(
+                "conv-1", "approve_loan_request", Map.of("requestId", 1),
+                employeeUser, empHandler);
+
+        assertThat(preview.getActionUuid()).isNotBlank();
+        assertThat(empHandler.previewBuilt).isTrue();
+        verify(repository).save(any(AgentAction.class));
+    }
+
+    @Test
+    @DisplayName("P0-B8 N1: createPending CLIENT na akciju bez role gate-a (allowedRoles prazno) → prolazi")
+    void createPending_clientOnUnrestrictedAction_allowed() {
+        when(repository.save(any(AgentAction.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        AgentActionPreviewDto preview = gateway.createPending(
+                "conv-1", "create_payment", Map.of("amount", 100),
+                clientUser, handler);
+
+        assertThat(preview.getActionUuid()).isNotBlank();
+        verify(repository).save(any(AgentAction.class));
+    }
+
+    @Test
     @DisplayName("createPending: throws AgenticRateLimitedException posle prevelikog broja akcija")
     void createPending_rateLimited() {
         properties.getAgentic().setRateLimitPerMin(2);
@@ -251,6 +295,32 @@ class AgentActionGatewayTest {
     }
 
     private static <T> T eq(T value) { return org.mockito.ArgumentMatchers.eq(value); }
+
+    /**
+     * P0-B8 N1: EMPLOYEE-only handler (allowedRoles == ["EMPLOYEE"]) za role-gate
+     * testove. Belezi da li je buildPreview pozvan da bi se moglo dokazati da
+     * gateway odbija PRE bilo kakvog rada kad rola nije dozvoljena.
+     */
+    private static class EmployeeOnlyHandler implements WriteToolHandler {
+        boolean previewBuilt = false;
+
+        @Override public String name() { return "approve_loan_request"; }
+        @Override public List<String> allowedRoles() { return List.of("EMPLOYEE"); }
+        @Override
+        public rs.raf.banka2_bek.assistant.tool.ToolDefinition definition() {
+            return rs.raf.banka2_bek.assistant.tool.ToolDefinition.builder()
+                    .name(name()).description("emp only").build();
+        }
+        @Override
+        public PreviewResult buildPreview(Map<String, Object> args, UserContext user) {
+            previewBuilt = true;
+            return new PreviewResult("approve loan", Map.of("requestId", 1));
+        }
+        @Override
+        public Map<String, Object> executeFinal(Map<String, Object> args, UserContext user, String otpCode) {
+            return Map.of("loanId", 1L, "status", "APPROVED");
+        }
+    }
 
     /** Test double koji prati pozive bez stvarnog state mutacije. */
     private static class TestWriteHandler implements WriteToolHandler {

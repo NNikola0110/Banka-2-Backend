@@ -2,6 +2,7 @@ package rs.raf.banka2_bek.card.service.implementation;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.core.userdetails.UserDetails;
@@ -20,11 +21,13 @@ import rs.raf.banka2_bek.card.repository.CardRepository;
 import rs.raf.banka2_bek.card.service.CardService;
 import rs.raf.banka2_bek.client.model.Client;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
+import rs.raf.banka2_bek.internalapi.service.InternalIdempotencyService;
 import rs.raf.banka2_bek.notification.NotificationPublisher;
 import rs.raf.banka2_bek.notification.model.NotificationType;
 import rs.raf.banka2_bek.notification.service.NotificationService;
 import rs.raf.banka2_bek.audit.model.AuditActionType;
 import rs.raf.banka2_bek.audit.service.AuditLogService;
+import rs.raf.banka2_bek.audit.service.CurrentAuditActorResolver;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -37,6 +40,14 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class CardServiceImpl implements CardService {
 
+    // R1-639: izvuceni magic brojevi/stringovi iz koda u imenovane konstante.
+    /** Podrazumevani limit kartice kad klijent/zaposleni ne posalje vrednost. */
+    private static final BigDecimal DEFAULT_CARD_LIMIT = BigDecimal.valueOf(100000);
+    /** Validnost kartice u godinama (od izdavanja do isteka). */
+    private static final int CARD_VALIDITY_YEARS = 4;
+    /** Srednji deo maske broja kartice — 8 zvezdica (Celina 2 §321: 5798********5571). */
+    private static final String CARD_MASK_MIDDLE = "********";
+
     private final CardRepository cardRepository;
     private final AccountRepository accountRepository;
     private final ClientRepository clientRepository;
@@ -44,6 +55,14 @@ public class CardServiceImpl implements CardService {
     private final NotificationService notificationService;
     // BE-PAY-01: audit log za card lifecycle (block/unblock/limit change)
     private final AuditLogService auditLogService;
+    // P2-audit-coverage-1 (R5 1891): aktor = IZVRSILAC (iz SecurityContext), ne vlasnik kartice.
+    private final CurrentAuditActorResolver currentAuditActorResolver;
+    // P1-idempotency-1 (R5-1849): replay-guard za prepaid top-up/withdraw. Deli
+    // `internal_requests` dedup store (UNIQUE na idempotencyKey, atomic same-tx
+    // insert) — isti mehanizam koji SAGA/internal-funds koriste, bez novog
+    // PG-DDL-a. Optional collaborator: kad kljuc nije prosledjen (stari klijenti)
+    // ili u unit testovima koji ne mockuju ovaj bean, ostaje null i ne dira se.
+    private final InternalIdempotencyService internalIdempotencyService;
 
     /**
      * BE-PAY-01 audit hook helper: best-effort.
@@ -52,6 +71,26 @@ public class CardServiceImpl implements CardService {
                                  String description, String targetType, Long targetId) {
         try {
             auditLogService.record(actorId, actorType, action, description, targetType, targetId);
+        } catch (Exception e) {
+            log.warn("Audit log fail (best-effort) action={} target={}/{}: {}",
+                    action, targetType, targetId, e.getMessage());
+        }
+    }
+
+    /**
+     * P2-audit-coverage-1 (R5 1891): audit hook gde je AKTOR izvrsilac iz
+     * SecurityContext-a (ne vlasnik kartice). Best-effort + null-safe (resolver
+     * je opcioni collaborator — u unit testovima koji ga ne mockuju ostaje null,
+     * pa pada na SYSTEM aktora). targetId nosi pogodjeni resurs (kartica).
+     */
+    private void recordAuditByCurrentActor(AuditActionType action, String description,
+                                           String targetType, Long targetId) {
+        try {
+            CurrentAuditActorResolver.AuditActor actor = currentAuditActorResolver != null
+                    ? currentAuditActorResolver.resolveCurrentActor()
+                    : CurrentAuditActorResolver.SYSTEM;
+            auditLogService.record(actor.actorId(), actor.actorType(), action,
+                    description, targetType, targetId);
         } catch (Exception e) {
             log.warn("Audit log fail (best-effort) action={} target={}/{}: {}",
                     action, targetType, targetId, e.getMessage());
@@ -78,7 +117,7 @@ public class CardServiceImpl implements CardService {
                 throw new RuntimeException("Nemate pristup ovom racunu");
             }
             checkCardLimit(account, client);
-            BigDecimal limit = request.getCardLimit() != null ? request.getCardLimit() : BigDecimal.valueOf(100000);
+            BigDecimal limit = request.getCardLimit() != null ? request.getCardLimit() : DEFAULT_CARD_LIMIT;
             CardType cardType = request.getCardType() != null ? request.getCardType() : CardType.VISA;
             CardCategory cardCategory = request.getCardCategory() != null ? request.getCardCategory() : CardCategory.DEBIT;
             BigDecimal creditLimit = request.getCreditLimit() != null ? request.getCreditLimit() : BigDecimal.ZERO;
@@ -93,7 +132,7 @@ public class CardServiceImpl implements CardService {
             throw new RuntimeException("Racun nema vlasnika (klijenta)");
         }
         checkCardLimit(account, client);
-        BigDecimal limit = request.getCardLimit() != null ? request.getCardLimit() : BigDecimal.valueOf(100000);
+        BigDecimal limit = request.getCardLimit() != null ? request.getCardLimit() : DEFAULT_CARD_LIMIT;
         CardType cardType = request.getCardType() != null ? request.getCardType() : CardType.VISA;
         CardCategory cardCategory = request.getCardCategory() != null ? request.getCardCategory() : CardCategory.DEBIT;
         BigDecimal creditLimit = request.getCreditLimit() != null ? request.getCreditLimit() : BigDecimal.ZERO;
@@ -117,7 +156,7 @@ public class CardServiceImpl implements CardService {
 
         checkCardLimit(account, client);
 
-        BigDecimal cardLimit = limit != null ? limit : BigDecimal.valueOf(100000);
+        BigDecimal cardLimit = limit != null ? limit : DEFAULT_CARD_LIMIT;
         CardType type = cardType != null ? cardType : CardType.VISA;
         CardCategory cat = cardCategory != null ? cardCategory : CardCategory.DEBIT;
         BigDecimal credit = creditLimit != null ? creditLimit : BigDecimal.ZERO;
@@ -137,9 +176,40 @@ public class CardServiceImpl implements CardService {
     @Override
     @Transactional(readOnly = true)
     public List<CardResponseDto> getCardsByAccount(Long accountId) {
+        // P0-B9 N2 (IDOR): bez ove provere bilo koji klijent je mogao da procita
+        // sve kartice TUDJEG racuna (ime vlasnika + saldi/limiti) sekvencijalnim
+        // accountId-em. CLIENT sme samo kartice racuna koji mu pripada; EMPLOYEE/
+        // ADMIN (employee portal) bilo koji; no-auth interni poziv (scheduler/unit)
+        // prolazi nepromenjen.
+        assertAccountAccessibleByCaller(accountId);
         return cardRepository.findByAccountId(accountId).stream()
                 .map(this::toMaskedResponse)
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * P0-B9 N2 ownership guard za {@code getCardsByAccount}. Baca
+     * {@link AccessDeniedException} (-&gt; HTTP 403) ako je pozivalac CLIENT a
+     * racun mu ne pripada. Zaposleni (ROLE_EMPLOYEE/ROLE_ADMIN/SUPERVISOR) i
+     * nezasticeni interni pozivi (bez auth konteksta — unit testovi/scheduleri)
+     * prolaze.
+     */
+    private void assertAccountAccessibleByCaller(Long accountId) {
+        if (isCallerEmployeeOrAdmin()) return;
+        Client client = getOptionalClient();
+        if (client == null) return; // no-auth / interni — ne diramo (B8 obrazac)
+        Account account = accountRepository.findById(accountId).orElse(null);
+        if (account == null) return; // nepostojeci racun -> prazna lista (ne otkrivamo postojanje)
+        boolean isOwner = account.getClient() != null
+                && account.getClient().getId().equals(client.getId());
+        boolean isCompanyAuthorized = account.getCompany() != null
+                && account.getCompany().getAuthorizedPersons() != null
+                && account.getCompany().getAuthorizedPersons().stream()
+                        .anyMatch(ap -> ap.getClient() != null
+                                && ap.getClient().getId().equals(client.getId()));
+        if (!isOwner && !isCompanyAuthorized) {
+            throw new AccessDeniedException("Nemate pristup karticama ovog racuna.");
+        }
     }
 
     @Override
@@ -187,12 +257,12 @@ public class CardServiceImpl implements CardService {
             }
         }
 
-        // BE-PAY-01: audit hook za card block
+        // BE-PAY-01 + P2-audit-coverage-1 (R5 1891): aktor = IZVRSILAC (zaposleni
+        // ili sam klijent), ne vlasnik kartice. Vlasnik ostaje u targetId/opisu.
         Long ownerId = card.getClient() != null ? card.getClient().getId() : null;
-        recordAuditSafe(
-                ownerId, "CLIENT",
+        recordAuditByCurrentActor(
                 AuditActionType.CARD_BLOCKED,
-                "Card " + cardId + " blocked",
+                "Card " + cardId + " blocked (owner client=" + ownerId + ")",
                 "CARD", cardId);
 
         return response;
@@ -201,6 +271,14 @@ public class CardServiceImpl implements CardService {
     @Override
     @Transactional
     public CardResponseDto unblockCard(Long cardId) {
+        // P0-B8 N3: odblokiranje je EMPLOYEE/ADMIN akcija (klijent moze samo da
+        // BLOKIRA svoju karticu — vidi blockCard — ali ne i da je odblokira).
+        // HTTP put je zasticen URL-om (/cards/*/unblock hasAnyRole ADMIN,EMPLOYEE),
+        // ali agentic in-process poziv (UnblockCardActionHandler) zaobilazi
+        // kontroler i URL security. Bez ovog guard-a, klijent je mogao kroz
+        // Arbitro agenta da odblokira BILO KOJU karticu. Guard odbija
+        // autentifikovanog CLIENT-a.
+        assertNotClientCaller("Odblokiranje kartice je dozvoljeno samo zaposlenima.");
         Card card = cardRepository.findById(cardId)
                 .orElseThrow(() -> new RuntimeException("Kartica nije pronadjena"));
 
@@ -234,12 +312,12 @@ public class CardServiceImpl implements CardService {
             }
         }
 
-        // BE-PAY-01: audit hook za card unblock
+        // BE-PAY-01 + P2-audit-coverage-1 (R5 1891): aktor = IZVRSILAC (zaposleni —
+        // klijent ne sme odblokirati, assertNotClientCaller iznad), ne vlasnik kartice.
         Long ownerId = card.getClient() != null ? card.getClient().getId() : null;
-        recordAuditSafe(
-                ownerId, "EMPLOYEE",
+        recordAuditByCurrentActor(
                 AuditActionType.CARD_UNBLOCKED,
-                "Card " + cardId + " unblocked",
+                "Card " + cardId + " unblocked (owner client=" + ownerId + ")",
                 "CARD", cardId);
 
         return response;
@@ -256,7 +334,43 @@ public class CardServiceImpl implements CardService {
         }
 
         card.setStatus(CardStatus.DEACTIVATED);
-        return toMaskedResponse(cardRepository.save(card));
+        CardResponseDto deactivateResponse = toMaskedResponse(cardRepository.save(card));
+
+        // P2-audit-coverage-1 (R5 1890): trajna (ireverzibilna) deaktivacija kartice je
+        // najosetljivija card-lifecycle akcija a jedina je bila bez audit traga (block/
+        // unblock/limit-change jesu). Aktor = izvrsilac iz SecurityContext.
+        Long ownerId = card.getClient() != null ? card.getClient().getId() : null;
+        recordAuditByCurrentActor(
+                AuditActionType.CARD_DEACTIVATED,
+                "Card " + cardId + " deactivated (owner client=" + ownerId + ")",
+                "CARD", cardId);
+
+        return deactivateResponse;
+    }
+
+    @Override
+    @Transactional
+    public CardResponseDto activateCard(Long cardId) {
+        Card card = cardRepository.findById(cardId)
+                .orElseThrow(() -> new RuntimeException("Kartica nije pronadjena"));
+
+        // C2 Sc32: deaktivirana kartica je IREVERZIBILNA — literal spec poruka.
+        // IllegalStateException → 403 (CardExceptionHandler). Invarijanta drzi: nigde
+        // u kodu ne postoji put DEACTIVATED→ACTIVE, ovaj endpoint to eksplicitno odbija.
+        if (card.getStatus() == CardStatus.DEACTIVATED) {
+            throw new IllegalStateException(
+                    "Kartica je deaktivirana i ne može se ponovo aktivirati");
+        }
+
+        // Blokirana kartica se aktivira iskljucivo preko zaposlenog (unblockCard);
+        // ovaj put je ne dira (klijent ne sme da je odblokira sam).
+        if (card.getStatus() == CardStatus.BLOCKED) {
+            throw new IllegalStateException(
+                    "Blokiranu karticu može da odblokira samo zaposleni u banci.");
+        }
+
+        // Vec aktivna — idempotentno vraca trenutno stanje (bez izmene).
+        return toMaskedResponse(card);
     }
 
     @Override
@@ -288,13 +402,17 @@ public class CardServiceImpl implements CardService {
             }
         }
 
-        // BE-PAY-01: audit hook za card limit change
+        // BE-PAY-01 + P2-audit-coverage-1 (R5 1891): aktor = IZVRSILAC (iz SecurityContext),
+        // ne vlasnik kartice. old/new limit u oldValue/newValue.
         Long ownerId = card.getClient() != null ? card.getClient().getId() : null;
         try {
+            CurrentAuditActorResolver.AuditActor actor = currentAuditActorResolver != null
+                    ? currentAuditActorResolver.resolveCurrentActor()
+                    : CurrentAuditActorResolver.SYSTEM;
             auditLogService.record(
-                    ownerId, "CLIENT",
+                    actor.actorId(), actor.actorType(),
                     AuditActionType.CARD_LIMIT_CHANGED,
-                    "Card " + cardId + " limit changed",
+                    "Card " + cardId + " limit changed (owner client=" + ownerId + ")",
                     "CARD", cardId,
                     String.valueOf(oldLimit), String.valueOf(newLimit));
         } catch (Exception e) {
@@ -382,14 +500,16 @@ public class CardServiceImpl implements CardService {
                         ? creditLimit : BigDecimal.ZERO)
                 .prepaidBalance(BigDecimal.ZERO)
                 .outstandingBalance(BigDecimal.ZERO)
-                .cvv(Card.generateCvv())
+                // R1-500-CVV (PCI-DSS Req 3.2): CVV se VISE NE CUVA at-rest. Polje je
+                // @Transient na entitetu i nikad se ne verifikuje, pa ga ovde ni ne
+                // generisemo/postavljamo — kartica se kreira bez perzistovanog CVV-a.
                 .account(account)
                 .client(client)
                 .cardLimit(limit)
                 .cardSlot(slot)
                 .status(CardStatus.ACTIVE)
                 .createdAt(LocalDate.now())
-                .expirationDate(LocalDate.now().plusYears(4))
+                .expirationDate(LocalDate.now().plusYears(CARD_VALIDITY_YEARS))
                 .build();
 
         return cardRepository.save(card);
@@ -422,8 +542,9 @@ public class CardServiceImpl implements CardService {
 
     /**
      * BE-ACC-01 (PCI-DSS): CVV nikad ne sme da napusti server posle izdavanja
-     * kartice. Iako entity {@code Card.cvv} cuva plaintext za internu verifikaciju
-     * (TODO: hash), DTO uvek vraca {@code null} bez obzira na endpoint
+     * kartice. R1-500-CVV: CVV se vise NE CUVA at-rest ({@code Card.cvv} je
+     * {@code @Transient}, kolona uklonjena), pa je ovde uvek {@code null};
+     * DTO uvek vraca {@code null} bez obzira na endpoint
      * (create / get / top-up / withdraw). {@code cardNumber} se vraca u
      * punom obliku samo na createCard/createCardForAccount (jednom — posiljaocu
      * obavestenja); maskirani prikaz koristi {@link #toMaskedResponse(Card)}.
@@ -471,12 +592,17 @@ public class CardServiceImpl implements CardService {
                 .build();
     }
 
+    /**
+     * Maskira broj kartice u format iz Celine 2 §321: prve 4 cifre, potom 8
+     * zvezdica, pa zadnje 4 cifre (primer {@code 5798********5571} — bez razmaka).
+     * Kartice krace od 8 cifara se vracaju nepromenjene.
+     */
     private String maskCardNumber(String cardNumber) {
         if (cardNumber == null || cardNumber.length() < 8) return cardNumber;
         String digits = cardNumber.replaceAll("\\s+", "");
         String first4 = digits.substring(0, 4);
         String last4 = digits.substring(digits.length() - 4);
-        return first4 + " **** **** " + last4;
+        return first4 + CARD_MASK_MIDDLE + last4;
     }
 
     private Client getAuthenticatedClient() {
@@ -501,24 +627,53 @@ public class CardServiceImpl implements CardService {
     @Override
     @Transactional
     public CardResponseDto topUpPrepaidCard(Long cardId, Long sourceAccountId, BigDecimal amount) {
+        return topUpPrepaidCard(cardId, sourceAccountId, amount, null);
+    }
+
+    @Override
+    @Transactional
+    public CardResponseDto topUpPrepaidCard(Long cardId, Long sourceAccountId, BigDecimal amount,
+                                            String idempotencyKey) {
+        // P1-idempotency-1 (R5-1849): replay guard. P2-2 pessimistic lock samo
+        // SERIJALIZUJE konkurentne pozive (lost-update), ali DVA SEKVENCIJALNA
+        // identicna zahteva (double-click / OkHttp retry / network retry) oba
+        // prodju — drugi cita vec-azuriran balans i ponovo primeni transfer =
+        // dvostruka dopuna. Klijent-generisan Idempotency-Key cini operaciju
+        // exactly-once: na replay vracamo trenutno (jednom-azurirano) stanje kartice.
+        String dedupKey = normalizeIdempotencyKey("card-topup", cardId, idempotencyKey);
+        if (dedupKey != null && internalIdempotencyService != null
+                && internalIdempotencyService.findCached(dedupKey).isPresent()) {
+            Card existing = cardRepository.findByIdForUpdate(cardId)
+                    .orElseThrow(() -> new RuntimeException("Kartica nije pronadjena"));
+            return toResponse(existing);
+        }
+
         if (amount == null || amount.signum() <= 0) {
             throw new IllegalArgumentException("Iznos dopune mora biti veci od 0.");
         }
-        Card card = cardRepository.findById(cardId)
+        // P2-2 lost-update fix: pessimistic lock NA KARTICI serijalizuje paralelne
+        // top-up-e iste kartice. Lock samo na sourceAccount (ispod) ne pomaze kad
+        // dve dopune dolaze iz RAZLICITIH racuna — zakljucaju razlicite redove i
+        // oba pregaze isti prepaidBalance read.
+        Card card = cardRepository.findByIdForUpdate(cardId)
                 .orElseThrow(() -> new RuntimeException("Kartica nije pronadjena"));
-        if (card.getCardCategory() != CardCategory.INTERNET_PREPAID) {
-            throw new IllegalStateException("Dopuna je dostupna samo za INTERNET_PREPAID kartice.");
-        }
-        if (card.getStatus() != CardStatus.ACTIVE) {
-            throw new IllegalStateException("Kartica nije aktivna — nije moguca dopuna.");
-        }
 
-        // CLIENT samo svoju karticu sme; EMPLOYEE/ADMIN moze za bilo koju.
+        // P1-authz-idor-1 (R1 115): ownership PRE provere stanja/kategorije —
+        // inace su poruke "nije INTERNET_PREPAID" / "nije aktivna" curile postojanje
+        // i tip tudje kartice klijentu koji nije vlasnik. CLIENT samo svoju karticu;
+        // EMPLOYEE/ADMIN bilo koju.
         if (!isCallerEmployeeOrAdmin()) {
             Client client = getAuthenticatedClient();
             if (card.getClient() == null || !card.getClient().getId().equals(client.getId())) {
                 throw new RuntimeException("Nemate pristup ovoj kartici");
             }
+        }
+
+        if (card.getCardCategory() != CardCategory.INTERNET_PREPAID) {
+            throw new IllegalStateException("Dopuna je dostupna samo za INTERNET_PREPAID kartice.");
+        }
+        if (card.getStatus() != CardStatus.ACTIVE) {
+            throw new IllegalStateException("Kartica nije aktivna — nije moguca dopuna.");
         }
 
         // BE-ACC-03: pessimistic lock na sourceAccount sprecava lost-update race
@@ -541,29 +696,53 @@ public class CardServiceImpl implements CardService {
         accountRepository.save(sourceAccount);
 
         card.setPrepaidBalance(card.getPrepaidBalance().add(amount));
-        return toResponse(cardRepository.save(card));
+        CardResponseDto response = toResponse(cardRepository.save(card));
+        recordIdempotencyMarker(dedupKey, "card-topup");
+        return response;
     }
 
     @Override
     @Transactional
     public CardResponseDto withdrawFromPrepaidCard(Long cardId, Long targetAccountId, BigDecimal amount) {
+        return withdrawFromPrepaidCard(cardId, targetAccountId, amount, null);
+    }
+
+    @Override
+    @Transactional
+    public CardResponseDto withdrawFromPrepaidCard(Long cardId, Long targetAccountId, BigDecimal amount,
+                                                   String idempotencyKey) {
+        // P1-idempotency-1 (R5-1849): replay guard (simetricno sa top-up putanjom).
+        String dedupKey = normalizeIdempotencyKey("card-withdraw", cardId, idempotencyKey);
+        if (dedupKey != null && internalIdempotencyService != null
+                && internalIdempotencyService.findCached(dedupKey).isPresent()) {
+            Card existing = cardRepository.findByIdForUpdate(cardId)
+                    .orElseThrow(() -> new RuntimeException("Kartica nije pronadjena"));
+            return toResponse(existing);
+        }
+
         if (amount == null || amount.signum() <= 0) {
             throw new IllegalArgumentException("Iznos povlacenja mora biti veci od 0.");
         }
-        Card card = cardRepository.findById(cardId)
+        // P2-2 lost-update fix: pessimistic lock NA KARTICI serijalizuje paralelne
+        // mutacije prepaidBalance-a iste kartice (simetricno sa top-up putanjom).
+        Card card = cardRepository.findByIdForUpdate(cardId)
                 .orElseThrow(() -> new RuntimeException("Kartica nije pronadjena"));
-        if (card.getCardCategory() != CardCategory.INTERNET_PREPAID) {
-            throw new IllegalStateException("Povlacenje je dostupno samo za INTERNET_PREPAID kartice.");
-        }
-        if (card.getPrepaidBalance() == null || card.getPrepaidBalance().compareTo(amount) < 0) {
-            throw new IllegalArgumentException("Nedovoljno sredstava na kartici: dostupno " + card.getPrepaidBalance());
-        }
 
+        // P1-authz-idor-1 (R1 115): ownership PRE provere stanja/balansa — inace
+        // su poruke "nije INTERNET_PREPAID" / "Nedovoljno sredstava: dostupno X"
+        // curile postojanje, tip i prepaid balans tudje kartice ne-vlasniku.
         if (!isCallerEmployeeOrAdmin()) {
             Client client = getAuthenticatedClient();
             if (card.getClient() == null || !card.getClient().getId().equals(client.getId())) {
                 throw new RuntimeException("Nemate pristup ovoj kartici");
             }
+        }
+
+        if (card.getCardCategory() != CardCategory.INTERNET_PREPAID) {
+            throw new IllegalStateException("Povlacenje je dostupno samo za INTERNET_PREPAID kartice.");
+        }
+        if (card.getPrepaidBalance() == null || card.getPrepaidBalance().compareTo(amount) < 0) {
+            throw new IllegalArgumentException("Nedovoljno sredstava na kartici: dostupno " + card.getPrepaidBalance());
         }
 
         // BE-ACC-03: pessimistic lock na targetAccount za simetricnost sa
@@ -583,7 +762,87 @@ public class CardServiceImpl implements CardService {
         targetAccount.setAvailableBalance(targetAccount.getAvailableBalance().add(amount));
         accountRepository.save(targetAccount);
 
-        return toResponse(card);
+        CardResponseDto response = toResponse(card);
+        recordIdempotencyMarker(dedupKey, "card-withdraw");
+        return response;
+    }
+
+    /**
+     * Gradi dedup kljuc {@code <prefix>-<cardId>-<clientKey>} ili {@code null}
+     * kad klijent ne posalje Idempotency-Key (tada se replay-guard preskace i
+     * ponasanje je identicno staroj putanji).
+     */
+    private String normalizeIdempotencyKey(String prefix, Long cardId, String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return null;
+        }
+        // Vezujemo kljuc za (prefix, cardId) da isti klijent-generisani kljuc ne
+        // moze slucajno da kolidira preko razlicitih kartica/operacija. Trim na
+        // sirinu internal_requests.idempotency_key kolone (100).
+        String composed = prefix + "-" + cardId + "-" + idempotencyKey.trim();
+        return composed.length() > 100 ? composed.substring(0, 100) : composed;
+    }
+
+    /**
+     * Upisuje dedup marker u istoj transakciji kao novcana noga — UNIQUE
+     * constraint cini "obradi jednom" atomicnim: konkurentni replay koji prodje
+     * lock dobija {@code DataIntegrityViolationException} (propagira → caller
+     * dobija gresku, ne dupli transfer). No-op kad kljuc nije prosledjen.
+     */
+    private void recordIdempotencyMarker(String dedupKey, String endpoint) {
+        if (dedupKey != null && internalIdempotencyService != null) {
+            internalIdempotencyService.store(dedupKey, endpoint, 200, "OK");
+        }
+    }
+
+    /**
+     * R1 317: prebacuje istekle (ne-DEACTIVATED) kartice u DEACTIVATED. Vidi
+     * {@link CardService#expireDueCards(LocalDate)}. Idempotentno — kartica koja
+     * je vec DEACTIVATED se ne pokupi ({@code findExpiredWithStatusNot} iskljucuje
+     * DEACTIVATED), pa ponovljeno pokretanje istog dana ne radi nista.
+     */
+    @Override
+    @Transactional
+    public int expireDueCards(LocalDate asOf) {
+        LocalDate cutoff = asOf != null ? asOf : LocalDate.now();
+        List<Card> expired = cardRepository.findExpiredWithStatusNot(cutoff, CardStatus.DEACTIVATED);
+        if (expired.isEmpty()) {
+            return 0;
+        }
+        int count = 0;
+        for (Card card : expired) {
+            CardStatus previous = card.getStatus();
+            card.setStatus(CardStatus.DEACTIVATED);
+            cardRepository.save(card);
+            count++;
+
+            Long ownerId = card.getClient() != null ? card.getClient().getId() : null;
+            // Audit (best-effort) — istekla kartica je sistemska deaktivacija
+            // (aktor = SYSTEM/scheduler, nema SecurityContext).
+            recordAuditSafe(0L, "SYSTEM", AuditActionType.CARD_DEACTIVATED,
+                    "Card " + card.getId() + " auto-deactivated (expired " + card.getExpirationDate()
+                            + ", was " + previous + ", owner client=" + ownerId + ")",
+                    "CARD", card.getId());
+
+            // Best-effort obavestenje vlasniku.
+            if (card.getClient() != null) {
+                try {
+                    String last4 = card.getCardNumber().length() >= 4
+                            ? card.getCardNumber().substring(card.getCardNumber().length() - 4)
+                            : card.getCardNumber();
+                    notificationService.notify(
+                            card.getClient().getId(), "CLIENT",
+                            NotificationType.CARD_BLOCKED,
+                            "Kartica istekla",
+                            "Vaša kartica koja se završava na " + last4 + " je istekla i deaktivirana je.",
+                            "CARD", card.getId());
+                } catch (Exception e) {
+                    log.warn("Card expiry notify fail (best-effort) card={}: {}", card.getId(), e.getMessage());
+                }
+            }
+        }
+        log.info("Card expiry: {} istekle kartice prebacene u DEACTIVATED (cutoff={})", count, cutoff);
+        return count;
     }
 
     private void requireAuthenticated() {
@@ -602,5 +861,25 @@ public class CardServiceImpl implements CardService {
                     || "ADMIN".equals(role) || "EMPLOYEE".equals(role)
                     || "SUPERVISOR".equals(role);
         });
+    }
+
+    /**
+     * P0-B8 N3: privilege-escalation guard. Baca {@link AccessDeniedException}
+     * ako je trenutno autentifikovani pozivalac CLIENT. Zaposleni
+     * (ROLE_EMPLOYEE / ROLE_ADMIN / SUPERVISOR) i nezasticeni interni pozivi
+     * (bez autentikacije — unit testovi) prolaze. Zatvara agentic put kojim je
+     * klijent kroz Arbitro agenta mogao da odblokira karticu, bez promene
+     * legitimnog HTTP employee puta.
+     */
+    private void assertNotClientCaller(String message) {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || auth.getAuthorities() == null) return; // interni/no-auth — ne diramo
+        boolean isClient = auth.getAuthorities().stream().anyMatch(a -> {
+            String role = a.getAuthority();
+            return "ROLE_CLIENT".equals(role) || "CLIENT".equals(role);
+        });
+        if (isClient && !isCallerEmployeeOrAdmin()) {
+            throw new AccessDeniedException(message);
+        }
     }
 }

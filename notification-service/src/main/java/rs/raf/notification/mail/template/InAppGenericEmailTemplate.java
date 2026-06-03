@@ -28,8 +28,13 @@ public class InAppGenericEmailTemplate {
      * @return kompletan HTML string spreman za slanje
      */
     public String buildBody(String firstName, String title, String body) {
+        // [P1-notif-svc-1 / 1528 / 1742] escape svih dinamickih (user-controlled)
+        // vrednosti pre interpolacije u HTML telo — sprecava HTML/<script>/<img>
+        // injection iz title/body/firstName.
+        String safeTitle = EmailHtml.escape(title);
+        String safeBody = EmailHtml.escape(body);
         String greeting = (firstName != null && !firstName.isBlank())
-                ? "Poštovani " + firstName + ","
+                ? "Poštovani " + EmailHtml.escape(firstName) + ","
                 : "Poštovana korisnice,";
         return """
                 <!DOCTYPE html>
@@ -68,6 +73,6 @@ public class InAppGenericEmailTemplate {
                 </table>
                 </body>
                 </html>
-                """.formatted(title, title, greeting, body);
+                """.formatted(safeTitle, safeTitle, greeting, safeBody);
     }
 }

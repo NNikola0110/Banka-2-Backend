@@ -14,6 +14,14 @@ package rs.raf.banka2_bek.interbank.model;
 public enum InterbankOtcContractStatus {
     /** Ugovor vazeci, kupac jos nije iskoristio opciju, settlementDate nije prosao. */
     ACTIVE,
+    /**
+     * P1-interbank-otc-2 (1336/1535) — prelazno stanje: kupac je pokrenuo exercise,
+     * sredstva su rezervisana i 2PC je u toku, ali jos nije commit-ovan. Sluzi kao
+     * pessimistic-lock claim marker da dva konkurentna exercise-a ne udju oba u 2PC
+     * (drugi vidi != ACTIVE pod lock-om → 409). Na uspesan COMMIT_TX → EXERCISED;
+     * na pad/odustajanje → vraca se u ACTIVE (rezervacija oslobodjena).
+     */
+    EXERCISING,
     /** Kupac iskoristio opciju i transakcija je commitovana. Vidi protokol §2.7.2. */
     EXERCISED,
     /** Settlement datum prosao bez iskoriscenja — rezervacija se oslobadja. */

@@ -1,6 +1,11 @@
 name: notification-service-ci
 
 on:
+  # R5 1944 (monorepo tradeoff, namerno): trigger se NE okida na 'banka2_bek/**'.
+  # notification-service deli tipove (NotificationMessage, NotificationKind) SAMO kroz
+  # 'banka2-contracts' modul (koji JESTE u paths) → contract promene rebuild-uju ovaj
+  # servis. banka_core-interne klase nisu compile-time dependency, pa contract drift ne
+  # moze nastati ovim putem. Pokriveno integ/E2E na main-u.
   push:
     branches: [main]
     paths:

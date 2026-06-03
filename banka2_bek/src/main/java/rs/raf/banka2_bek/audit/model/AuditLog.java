@@ -15,7 +15,16 @@ import java.time.LocalDateTime;
  * @Version niti @UpdateTimestamp jer su zapisi immutable.
  */
 @Entity
-@Table(name = "audit_logs")
+// R5-1899: findFiltered filtrira po action_type + actor_id, findByTargetTypeAndTargetId
+// po (target_type, target_id). Particionisanje je samo po created_at (pomaze time-range),
+// pa su unutar particije svi ostali filteri seq-scan. Entitet ranije nije definisao
+// nijedan @Index → (LIKE ... INCLUDING ALL) particionisanje nije imalo sta da kopira.
+// Hibernate kreira indexe na parent particionisanoj tabeli → propagiraju se na nove particije.
+@Table(name = "audit_logs", indexes = {
+        @Index(name = "idx_audit_actor_id", columnList = "actor_id"),
+        @Index(name = "idx_audit_action_type", columnList = "action_type"),
+        @Index(name = "idx_audit_target", columnList = "target_type, target_id")
+})
 @Getter
 @Setter
 @NoArgsConstructor

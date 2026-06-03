@@ -49,6 +49,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -80,6 +81,8 @@ class OrderServiceImplCoverageTest {
     @Mock private rs.raf.trading.security.TradingUserResolver tradingUserResolver;
     @Mock private rs.raf.trading.notification.service.NotificationService notificationService;
     @Mock private rs.raf.trading.audit.service.AuditLogService auditLogService;
+    @Mock private rs.raf.trading.margin.repository.MarginAccountRepository marginAccountRepository;
+    @Mock private rs.raf.trading.margin.service.MarginOrderSettlementService marginOrderSettlementService;
 
     @InjectMocks
     private OrderServiceImpl orderService;
@@ -118,6 +121,11 @@ class OrderServiceImplCoverageTest {
         testPortfolio.setAverageBuyPrice(new BigDecimal("140"));
 
         lenient().when(currencyConversionService.getRate(anyString(), anyString())).thenReturn(BigDecimal.ONE);
+        // §66/R1-183: convertToRsdForLimit zove convert(amount, listing, "RSD").
+        // Default mid-rate=1 (identitet) za postojece testove.
+        lenient().when(currencyConversionService.convert(
+                any(BigDecimal.class), anyString(), anyString()))
+                .thenAnswer(inv -> inv.getArgument(0));
         lenient().when(currencyConversionService.convertForPurchase(
                 any(BigDecimal.class), anyString(), anyString(), anyBoolean()))
                 .thenAnswer(inv -> new CurrencyConversionService.ConversionResult(
@@ -321,7 +329,7 @@ class OrderServiceImplCoverageTest {
     void computeAfterHoursExceptionFallback() {
         asClient();
         when(listingRepository.findById(1L)).thenReturn(Optional.of(listing(ListingType.STOCK, "NASDAQ")));
-        when(exchangeManagementService.isAfterHours("NASDAQ")).thenThrow(new RuntimeException("boom"));
+        when(exchangeManagementService.isClosedOrAfterHours("NASDAQ")).thenThrow(new RuntimeException("boom"));
         stubPrices();
         when(orderStatusService.determineStatus(anyString(), anyLong(), any())).thenReturn(OrderStatus.PENDING);
         stubSave();
@@ -329,6 +337,44 @@ class OrderServiceImplCoverageTest {
         OrderDto result = orderService.createOrder(dtoMarketBuy());
 
         assertThat(result).isNotNull();
+    }
+
+    @Test
+    @DisplayName("OT-1082: createOrder — zatvorena/after-hours berza → order.afterHours=true "
+            + "(happy-path; do sada testiran samo exception-fallback false)")
+    void afterHoursTrue_whenExchangeClosedOrAfterHours() {
+        asClient();
+        when(listingRepository.findById(1L)).thenReturn(Optional.of(listing(ListingType.STOCK, "NASDAQ")));
+        // §404 / R1-190: spori fill se primenjuje kad je berza ZATVORENA ili u
+        // after-hours prozoru → computeAfterHours vraca true.
+        when(exchangeManagementService.isClosedOrAfterHours("NASDAQ")).thenReturn(true);
+        stubPrices();
+        when(orderStatusService.determineStatus(anyString(), anyLong(), any())).thenReturn(OrderStatus.PENDING);
+        stubSave();
+
+        var captor = org.mockito.ArgumentCaptor.forClass(Order.class);
+        OrderDto result = orderService.createOrder(dtoMarketBuy());
+
+        verify(orderRepository).save(captor.capture());
+        assertThat(captor.getValue().isAfterHours()).isTrue();
+        assertThat(result.isAfterHours()).isTrue();
+    }
+
+    @Test
+    @DisplayName("OT-1082: createOrder — otvorena berza (isClosedOrAfterHours=false) → order.afterHours=false")
+    void afterHoursFalse_whenExchangeOpen() {
+        asClient();
+        when(listingRepository.findById(1L)).thenReturn(Optional.of(listing(ListingType.STOCK, "NASDAQ")));
+        when(exchangeManagementService.isClosedOrAfterHours("NASDAQ")).thenReturn(false);
+        stubPrices();
+        when(orderStatusService.determineStatus(anyString(), anyLong(), any())).thenReturn(OrderStatus.PENDING);
+        stubSave();
+
+        var captor = org.mockito.ArgumentCaptor.forClass(Order.class);
+        orderService.createOrder(dtoMarketBuy());
+
+        verify(orderRepository).save(captor.capture());
+        assertThat(captor.getValue().isAfterHours()).isFalse();
     }
 
     // ─── FUND-order putanja ───────────────────────────────────────────────
@@ -522,6 +568,50 @@ class OrderServiceImplCoverageTest {
         verify(actuaryInfoRepository).save(ai);
     }
 
+    // ─── P1-dividends-order-1 (163): margin BUY parcijalni cancel ──────────────
+
+    @Test
+    @DisplayName("163: margin BUY parcijalni cancel oslobadja MARGIN rezervaciju, NE banka-core funds")
+    void partialCancelMarginBuy_releasesMarginReservationNotBankaCoreFunds() {
+        // Margin BUY order APPROVED, qty 10, approxPrice 100/kom -> reservedMargin po 10 kom.
+        // Parcijalni cancel 4 kom -> mora osloboditi pro-rata MARGIN rezervaciju za 4 kom
+        // (releaseMarginBuyReservation), a NE bankaCoreClient.releaseFunds (margin rezervacija
+        // NIJE u banka-core funds reserve nego u MarginAccount.reservedMargin).
+        when(tradingUserResolver.resolveCurrent()).thenReturn(new UserContext(CLIENT_ID, "CLIENT"));
+        when(tradingUserResolver.resolveName(CLIENT_ID, "CLIENT")).thenReturn("Stefan Jovanovic");
+
+        Order approved = new Order();
+        approved.setId(63L);
+        approved.setStatus(OrderStatus.APPROVED);
+        approved.setDirection(OrderDirection.BUY);
+        approved.setUserRole("CLIENT");
+        approved.setUserId(CLIENT_ID);
+        approved.setListing(listing(ListingType.STOCK, "NASDAQ"));
+        approved.setQuantity(10);
+        approved.setRemainingPortions(10);
+        approved.setContractSize(1);
+        approved.setMargin(true);
+        approved.setApproximatePrice(new BigDecimal("100.0000"));
+        approved.setReservedAccountId(900L); // margin orderi i dalje nose linked racun
+        approved.setReservedAmount(new BigDecimal("1000.0000"));
+        approved.setReservationReleased(false);
+
+        when(orderRepository.findByIdForUpdate(63L)).thenReturn(Optional.of(approved));
+        when(orderRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        orderService.cancelOrder(63L, 4);
+
+        // Pro-rata margin release za 4 kom: approxPrice 100 * 4 = 400.
+        var amtCaptor = org.mockito.ArgumentCaptor.forClass(BigDecimal.class);
+        verify(marginOrderSettlementService).releaseMarginBuyReservation(eq(approved), amtCaptor.capture());
+        assertThat(amtCaptor.getValue()).isEqualByComparingTo("400.0000");
+        // NIKAD ne dira banka-core funds reserve za margin order.
+        verify(bankaCoreClient, never()).releaseFunds(anyString(), anyString(), any());
+        verify(bankaCoreClient, never()).reserveFunds(anyString(), any());
+        // remainingPortions umanjen na 6.
+        assertThat(approved.getRemainingPortions()).isEqualTo(6);
+    }
+
     // ─── BE-ORD-04: cancelOrder race compensation ──────────────────────────────
 
     @Test
@@ -607,6 +697,5 @@ class OrderServiceImplCoverageTest {
                 .isInstanceOf(rs.raf.trading.order.exception.InsufficientFundsException.class);
 
         assertThat(approved.isReservationReleased()).isTrue();
-        assertThat(approved.getSagaState()).isEqualTo(rs.raf.trading.order.model.SagaState.COMPENSATED);
     }
 }

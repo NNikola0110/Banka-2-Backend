@@ -42,6 +42,17 @@ public class InternalUsersController {
     }
 
     /**
+     * OT-1061: vraca id-eve svih aktivnih supervizora. trading-service ga koristi
+     * da razresi primaoce tax-FX-failure in-app notifikacije (nema lokalnu listu
+     * supervizora). Literal {@code supervisors} segment ne kolidira sa
+     * {@code {userRole}/{id}} (koja trazi DVA segmenta) niti sa {@code by-email/{email}}.
+     */
+    @GetMapping("/users/supervisors")
+    public ResponseEntity<List<Long>> getSupervisorIds() {
+        return ResponseEntity.ok(lookupService.getSupervisorIds());
+    }
+
+    /**
      * Vraca identitet korisnika (id + rola) za datu rolu + id.
      */
     @GetMapping("/users/{userRole}/{id}")

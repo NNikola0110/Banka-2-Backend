@@ -8,9 +8,13 @@ import lombok.Setter;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
+// R4-1774: ranije je `reservationId` imao DVA redundantna unique constrainta —
+// `@Column(unique=true)` (linija dole) I `@Table(indexes=@Index(unique=true))`.
+// Hibernate je emitovao dva odvojena UNIQUE constrainta/indexa nad istom kolonom.
+// Zadrzano je SAMO `@Column(unique=true)` (konvencija ostatka codebase-a za
+// jednokolonske unique-eve); tabelarni unique-index uklonjen.
 @Entity
-@Table(name = "fund_reservations",
-       indexes = @Index(name = "idx_fund_reservation_rid", columnList = "reservationId", unique = true))
+@Table(name = "fund_reservations")
 @Getter
 @Setter
 @NoArgsConstructor

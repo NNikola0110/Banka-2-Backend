@@ -137,6 +137,16 @@ public class SavingsDepositService {
         source.setAvailableBalance(source.getAvailableBalance().subtract(dto.getPrincipalAmount()));
         accountRepo.save(source);
 
+        // Double-entry (P0-B1): glavnica napusta klijentov racun i ulazi u custody
+        // banke — kreditira se bankin liability racun za isti iznos, da suma para u
+        // sistemu ostane nepromenjena (net = 0). Kontra-noga je debit banke na
+        // dospecu/raskidu (returnPrincipal / withdrawEarly).
+        Account bankAccount = accountRepo.findBankAccountForUpdateByCurrency(
+                bankRegistrationNumber, currencyCode)
+                .orElseThrow(() -> new IllegalStateException(
+                    "Banka nema racun u valuti " + currencyCode));
+        creditAccount(bankAccount, dto.getPrincipalAmount());
+
         LocalDate today = LocalDate.now(ZoneOffset.UTC);
         LocalDate maturity = today.plusMonths(dto.getTermMonths());
         LocalDate firstInterest = today.plusMonths(1);
@@ -242,11 +252,17 @@ public class SavingsDepositService {
                 .orElseThrow(() -> new IllegalArgumentException("Povezani racun ne postoji"));
         creditAccount(linked, returned);
 
-        Account bankAccount = accountRepo.findBankAccountByCurrencyId(
-                bankRegistrationNumber, d.getCurrency().getId())
+        // Double-entry (P0-B1): banka oslobadja celu glavnicu iz custody-ja (debit
+        // principal — kontra-noga uplate na otvaranju), a penal zadrzava (credit
+        // penalty). Neto na banci = -principal + penalty = -returned, sto tacno
+        // balansira klijentov +returned (suma = 0). Pre fix-a banka je SAMO kreditirana
+        // penalom dok je vracena glavnica nastajala iz vazduha. Jedan net update
+        // (-returned) umesto debit+credit da bi knjizenje bilo atomsko po racunu.
+        Account bankAccount = accountRepo.findBankAccountForUpdateByCurrency(
+                bankRegistrationNumber, d.getCurrency().getCode())
                 .orElseThrow(() -> new IllegalStateException(
                     "Banka nema racun u valuti " + d.getCurrency().getCode()));
-        creditAccount(bankAccount, penalty);
+        debitAccount(bankAccount, returned);
 
         d.setStatus(SavingsDepositStatus.WITHDRAWN_EARLY);
         depositRepo.save(d);
@@ -301,6 +317,12 @@ public class SavingsDepositService {
     private void creditAccount(Account account, BigDecimal amount) {
         account.setBalance(account.getBalance().add(amount));
         account.setAvailableBalance(account.getAvailableBalance().add(amount));
+        accountRepo.save(account);
+    }
+
+    private void debitAccount(Account account, BigDecimal amount) {
+        account.setBalance(account.getBalance().subtract(amount));
+        account.setAvailableBalance(account.getAvailableBalance().subtract(amount));
         accountRepo.save(account);
     }
 }

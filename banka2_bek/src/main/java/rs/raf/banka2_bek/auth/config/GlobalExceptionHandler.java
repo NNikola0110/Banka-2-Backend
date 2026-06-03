@@ -1,6 +1,7 @@
 package rs.raf.banka2_bek.auth.config;
 
 import jakarta.persistence.EntityNotFoundException;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -16,8 +17,10 @@ import rs.raf.banka2_bek.payment.exception.PaymentAlreadyFinalizedException;
 import rs.raf.banka2_bek.payment.exception.PaymentNotFoundException;
 import rs.raf.banka2_bek.payment.exception.PaymentNotOwnedException;
 import rs.raf.banka2_bek.payment.exception.PaymentTimeoutException;
+import rs.raf.banka2_bek.payment.exception.QuickApproveSettlementNotWiredException;
 import org.springframework.security.access.AccessDeniedException;
 
+@Slf4j
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
@@ -120,6 +123,10 @@ public class GlobalExceptionHandler {
             // @Version concurrent update na commit fazi -> 409 (UI moze da retry-uje).
             status = HttpStatus.CONFLICT;
             message = "Resurs je u medjuvremenu modifikovan. Osvezite stranicu i pokusajte ponovo.";
+        } else if (cause instanceof org.springframework.dao.DataIntegrityViolationException) {
+            // R5 1884 — unique/constraint pad na commit fazi -> 409, bez SQL leak-a.
+            status = HttpStatus.CONFLICT;
+            message = "Zahtev je u konfliktu sa postojecim podacima.";
         }
         return ResponseEntity.status(status).body(new MessageResponseDto(message));
     }
@@ -247,6 +254,80 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.LOCKED)
                 .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /**
+     * Quick Approve — defensive guard: payment je ne-settle-ovan a settlement
+     * (debit/credit/FX) nije wired (Phase-2 FCM). Vracamo 501 Not Implemented umesto
+     * lazne completion-e bez pomeranja novca. Trenutno nedostizno (nema code path
+     * koji kreira settle-pending payment), ali stiti od buduceg FCM regresa.
+     */
+    @ExceptionHandler(QuickApproveSettlementNotWiredException.class)
+    public ResponseEntity<MessageResponseDto> handleQuickApproveNotWired(
+            QuickApproveSettlementNotWiredException ex) {
+        return ResponseEntity
+                .status(HttpStatus.NOT_IMPLEMENTED)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /**
+     * R5 1884 / R1 296 — duplikat email (registracija / kreiranje klijenta) je 409
+     * Conflict, ne bare 400. Mora biti pre {@link #handleRuntimeException} (Spring
+     * bira najspecificniji tip, ali eksplicitan handler garantuje 409).
+     */
+    @ExceptionHandler(rs.raf.banka2_bek.auth.exception.EmailAlreadyExistsException.class)
+    public ResponseEntity<MessageResponseDto> handleEmailAlreadyExists(
+            rs.raf.banka2_bek.auth.exception.EmailAlreadyExistsException ex) {
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /**
+     * R1 296 — nevalidan/revoke-ovan refresh token na {@code /auth/refresh} je 401
+     * Unauthorized (klijent mora ponovo da se autentifikuje), ne 400.
+     */
+    @ExceptionHandler(rs.raf.banka2_bek.auth.exception.InvalidRefreshTokenException.class)
+    public ResponseEntity<MessageResponseDto> handleInvalidRefreshToken(
+            rs.raf.banka2_bek.auth.exception.InvalidRefreshTokenException ex) {
+        return ResponseEntity
+                .status(HttpStatus.UNAUTHORIZED)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /**
+     * R5 1884 (TOCTOU) — kada dve paralelne registracije iste adrese obe prodju
+     * pre-check, DB unique constraint puca na commit-u sa
+     * {@link org.springframework.dao.DataIntegrityViolationException}. Pre fix-a je
+     * propadao na catch-all 400 (ili 500 kroz TransactionSystemException). Sada je
+     * 409 Conflict sa STATICNOM porukom (sirov constraint/SQL detalj se NE prosledjuje —
+     * info-disclosure) + server-side log.
+     */
+    @ExceptionHandler(org.springframework.dao.DataIntegrityViolationException.class)
+    public ResponseEntity<MessageResponseDto> handleDataIntegrityViolation(
+            org.springframework.dao.DataIntegrityViolationException ex) {
+        log.warn("DataIntegrityViolation (verovatno duplikat/unique constraint): {}",
+                ex.getMostSpecificCause().getMessage());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new MessageResponseDto("Zahtev je u konfliktu sa postojecim podacima."));
+    }
+
+    /**
+     * R1 158 / R1 698 — {@code ResponseStatusException} nosi svoj eksplicitan
+     * status (npr. {@code AuditLogController.getById} baca
+     * {@code ResponseStatusException(NOT_FOUND)} za nepostojeci id). Bez ovog
+     * handler-a catch-all {@link #handleRuntimeException} (ResponseStatusException je
+     * RuntimeException) bi ga premapirao na 400 → klijent dobija pogresan kod
+     * (404 postaje 400). Ovde postujemo originalni status i poruku.
+     */
+    @ExceptionHandler(org.springframework.web.server.ResponseStatusException.class)
+    public ResponseEntity<MessageResponseDto> handleResponseStatus(
+            org.springframework.web.server.ResponseStatusException ex) {
+        String reason = ex.getReason() != null ? ex.getReason() : ex.getMessage();
+        return ResponseEntity
+                .status(ex.getStatusCode())
+                .body(new MessageResponseDto(reason));
     }
 
     @ExceptionHandler(RuntimeException.class)

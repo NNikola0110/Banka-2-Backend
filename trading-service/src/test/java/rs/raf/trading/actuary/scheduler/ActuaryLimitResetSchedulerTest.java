@@ -8,8 +8,14 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import rs.raf.trading.actuary.repository.ActuaryInfoRepository;
+import rs.raf.trading.audit.model.AuditActionType;
+import rs.raf.trading.audit.service.AuditLogService;
 
 import static org.assertj.core.api.Assertions.assertThatNoException;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
@@ -17,6 +23,9 @@ class ActuaryLimitResetSchedulerTest {
 
     @Mock
     private ActuaryInfoRepository actuaryInfoRepository;
+
+    @Mock
+    private AuditLogService auditLogService;
 
     @InjectMocks
     private ActuaryLimitResetScheduler scheduler;
@@ -53,6 +62,19 @@ class ActuaryLimitResetSchedulerTest {
             scheduler.resetDailyLimits();
 
             verify(actuaryInfoRepository, times(1)).resetAllUsedLimits();
+        }
+
+        @Test
+        @DisplayName("R1 439: dnevni reset emituje USED_LIMIT_RESET_ALL audit (SCHEDULER aktor)")
+        void emitsAudit_R1_439() {
+            when(actuaryInfoRepository.resetAllUsedLimits()).thenReturn(7);
+
+            scheduler.resetDailyLimits();
+
+            verify(auditLogService).recordAfterCommit(
+                    eq(0L), eq("SCHEDULER"),
+                    eq(AuditActionType.USED_LIMIT_RESET_ALL),
+                    anyString(), eq("ACTUARY"), isNull());
         }
 
         @Test

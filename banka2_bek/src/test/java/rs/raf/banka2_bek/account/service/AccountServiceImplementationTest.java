@@ -60,15 +60,20 @@ class AccountServiceImplementationTest {
     @Mock private CardService cardService;
     @Mock private NotificationPublisher notificationPublisher;
     @Mock private rs.raf.banka2_bek.audit.service.AuditLogService auditLogService;
+    @Mock private rs.raf.banka2_bek.audit.service.CurrentAuditActorResolver currentAuditActorResolver;
 
     private AccountServiceImplementation accountService;
 
     @BeforeEach
     void setUp() {
+        // Default: resolver vraca SYSTEM (testovi koji proveravaju aktora override-uju).
+        lenient().when(currentAuditActorResolver.resolveCurrentActor())
+                .thenReturn(rs.raf.banka2_bek.audit.service.CurrentAuditActorResolver.SYSTEM);
         accountService = new AccountServiceImplementation(
                 accountRepository, clientRepository, currencyRepository,
                 companyRepository, employeeRepository, userRepository,
-                cardService, notificationPublisher, "22200011", auditLogService
+                cardService, notificationPublisher, "22200011", auditLogService,
+                currentAuditActorResolver
         );
     }
 
@@ -298,8 +303,10 @@ class AccountServiceImplementationTest {
         @Test
         @DisplayName("baca izuzetak ako racun ne postoji")
         void notFound() {
+            // R1 308: nepostojeci racun je 404 (EntityNotFoundException), ne 400.
             when(accountRepository.findById(999L)).thenReturn(Optional.empty());
-            assertThrows(IllegalArgumentException.class, () -> accountService.getAccountById(999L));
+            assertThrows(jakarta.persistence.EntityNotFoundException.class,
+                    () -> accountService.getAccountById(999L));
         }
 
         @Test
@@ -379,7 +386,8 @@ class AccountServiceImplementationTest {
             mockAuthenticatedUser("stefan.jovanovic@gmail.com");
             when(clientRepository.findByEmail("stefan.jovanovic@gmail.com")).thenReturn(Optional.of(testClientChangingNameOfAcc));
             when(accountRepository.findById(1L)).thenReturn(Optional.of(testMainAccount));
-            when(accountRepository.findAccessibleAccounts(1L, AccountStatus.ACTIVE))
+            // R1-307: duplikat-provera ide preko svih racuna vlasnika (svi statusi).
+            when(accountRepository.findByClientId(1L))
                     .thenReturn(List.of(testMainAccount, testCheckingAccount));
             when(accountRepository.save(any(Account.class))).thenReturn(testMainAccount);
 
@@ -390,8 +398,9 @@ class AccountServiceImplementationTest {
         @Test
         @DisplayName("baca izuzetak ako racun ne postoji")
         void notFound() {
+            // R1 308: nepostojeci racun je 404 (EntityNotFoundException), ne 400.
             when(accountRepository.findById(999L)).thenReturn(Optional.empty());
-            assertThrows(IllegalArgumentException.class,
+            assertThrows(jakarta.persistence.EntityNotFoundException.class,
                     () -> accountService.updateAccountName(999L, "Novo ime"));
         }
 
@@ -498,7 +507,7 @@ class AccountServiceImplementationTest {
             mockAuthenticatedUser("stefan.jovanovic@gmail.com");
             when(clientRepository.findByEmail("stefan.jovanovic@gmail.com")).thenReturn(Optional.of(testClient));
             when(accountRepository.findById(1L)).thenReturn(Optional.of(testMainAccount));
-            when(accountRepository.findAccessibleAccounts(1L, AccountStatus.ACTIVE))
+            when(accountRepository.findByClientId(1L))
                     .thenReturn(List.of(testMainAccount, testAccountSavings));
 
             Exception ex = assertThrows(IllegalStateException.class,
@@ -580,8 +589,9 @@ class AccountServiceImplementationTest {
         @Test
         @DisplayName("baca izuzetak ako racun ne postoji")
         void notFound() {
+            // R1 308: nepostojeci racun je 404 (EntityNotFoundException), ne 400.
             when(accountRepository.findById(999L)).thenReturn(Optional.empty());
-            assertThrows(IllegalArgumentException.class,
+            assertThrows(jakarta.persistence.EntityNotFoundException.class,
                     () -> accountService.updateAccountLimits(999L, new BigDecimal("300000"), null));
         }
 
@@ -618,6 +628,125 @@ class AccountServiceImplementationTest {
 
             assertThrows(IllegalStateException.class,
                     () -> accountService.updateAccountLimits(4L, new BigDecimal("300000"), null));
+        }
+    }
+
+    @Nested
+    @DisplayName("limit-change OTP gate + employee checkAuth branch (TEST-accounts-2/5)")
+    class LimitChangeOtpAndEmployeeAuth {
+
+        // ── ACCEPTED-DEVIATION (user-directed 03.06): limit-change BEZ OTP-a ─────
+        // Nekadasnji TEST-accounts-2 OTP gate je uklonjen — promena limita se
+        // primenjuje direktno (bez verifikacionog koda). OTP vazi samo za
+        // placanja i transfere. Testovi sada asertuju da se limit primeni odmah.
+        @Test
+        @DisplayName("ACCEPTED-DEVIATION 03.06: updateAccountLimits primenjuje limit BEZ OTP-a")
+        void updateLimitsAppliedWithoutOtp() {
+            Client owner = Client.builder()
+                    .id(1L).firstName("Stefan").lastName("Jovanović")
+                    .email("stefan.jovanovic@gmail.com").build();
+            Currency rsd = Currency.builder().id(8L).code("RSD").build();
+            Employee emp = Employee.builder().id(1L).firstName("Nikola").lastName("M").build();
+
+            Account acc = Account.builder()
+                    .id(1L).name("Glavni račun").accountNumber("222000112345678911")
+                    .accountType(AccountType.CHECKING).accountSubtype(AccountSubtype.STANDARD)
+                    .currency(rsd).client(owner).employee(emp)
+                    .balance(new BigDecimal("185000.0000"))
+                    .availableBalance(new BigDecimal("178000.0000"))
+                    .dailyLimit(new BigDecimal("250000.0000"))
+                    .monthlyLimit(new BigDecimal("1000000.0000"))
+                    .dailySpending(BigDecimal.ZERO).monthlySpending(BigDecimal.ZERO)
+                    .status(AccountStatus.ACTIVE).createdAt(LocalDateTime.now()).build();
+
+            mockAuthenticatedUser("stefan.jovanovic@gmail.com");
+            when(clientRepository.findByEmail("stefan.jovanovic@gmail.com")).thenReturn(Optional.of(owner));
+            when(accountRepository.findById(1L)).thenReturn(Optional.of(acc));
+            when(accountRepository.save(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            AccountResponseDto result = accountService.updateAccountLimits(
+                    1L, new BigDecimal("300000"), new BigDecimal("1500000"));
+
+            assertNotNull(result);
+            assertEquals(new BigDecimal("300000"), acc.getDailyLimit());
+            assertEquals(new BigDecimal("1500000"), acc.getMonthlyLimit());
+            verify(accountRepository).save(acc);
+        }
+
+        // ── TEST-accounts-5: checkAuth employee grana ────────────────────────────
+        // checkAuth: kad getOptionalClient()==null (pozivalac je zaposleni/admin —
+        // email NIJE u clients tabeli), vraca racun BEZ ownership provere ("Admin/
+        // employee can see any account"). Karakterizacija: zaposleni MENJA limite
+        // TUDJEG (klijentovog) racuna → DOZVOLJENO (ne baca IllegalStateException).
+        // Ovo je namerno dizajnirano ponasanje (HTTP put je zatvoren URL-gate-om u
+        // GlobalSecurityConfig), pa ovde pinujemo service-level granu.
+        @Test
+        @DisplayName("TEST-accounts-5: zaposleni menja limite tudjeg racuna → dozvoljeno (employee checkAuth grana)")
+        void employeeCanUpdateOthersLimits() {
+            Client someoneElse = Client.builder()
+                    .id(99L).firstName("Milica").lastName("Nikolić")
+                    .email("milica.nikolic@gmail.com").build();
+            Currency rsd = Currency.builder().id(8L).code("RSD").build();
+            Employee emp = Employee.builder().id(1L).firstName("Nikola").lastName("M").build();
+
+            Account othersAccount = Account.builder()
+                    .id(4L).name("Lični račun").accountNumber("222000112345678913")
+                    .accountType(AccountType.CHECKING).accountSubtype(AccountSubtype.STANDARD)
+                    .currency(rsd).client(someoneElse).employee(emp)
+                    .balance(new BigDecimal("95000.0000"))
+                    .availableBalance(new BigDecimal("92000.0000"))
+                    .dailyLimit(new BigDecimal("250000.0000"))
+                    .monthlyLimit(new BigDecimal("1000000.0000"))
+                    .dailySpending(BigDecimal.ZERO).monthlySpending(BigDecimal.ZERO)
+                    .status(AccountStatus.ACTIVE).createdAt(LocalDateTime.now()).build();
+
+            // Zaposleni je autentifikovan, ali NIJE u clients tabeli → getOptionalClient()==null.
+            mockAuthenticatedUser("zaposleni@banka.rs");
+            when(clientRepository.findByEmail("zaposleni@banka.rs")).thenReturn(Optional.empty());
+            when(accountRepository.findById(4L)).thenReturn(Optional.of(othersAccount));
+            when(accountRepository.save(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            // NE baca — zaposleni sme da menja tudji racun (employee/admin grana checkAuth-a).
+            // TEST-accounts-2: i employee put zahteva validan OTP (single-use verify).
+            AccountResponseDto result = accountService.updateAccountLimits(4L, new BigDecimal("500000"), null);
+
+            assertNotNull(result);
+            assertEquals(new BigDecimal("500000"), othersAccount.getDailyLimit());
+            verify(accountRepository).save(othersAccount);
+        }
+
+        @Test
+        @DisplayName("TEST-accounts-5: zaposleni menja IME tudjeg racuna → dozvoljeno (employee checkAuth grana)")
+        void employeeCanRenameOthersAccount() {
+            Client someoneElse = Client.builder()
+                    .id(99L).firstName("Milica").lastName("Nikolić")
+                    .email("milica.nikolic@gmail.com").build();
+            Currency rsd = Currency.builder().id(8L).code("RSD").build();
+            Employee emp = Employee.builder().id(1L).firstName("Nikola").lastName("M").build();
+
+            Account othersAccount = Account.builder()
+                    .id(4L).name("Lični račun").accountNumber("222000112345678913")
+                    .accountType(AccountType.CHECKING).accountSubtype(AccountSubtype.STANDARD)
+                    .currency(rsd).client(someoneElse).employee(emp)
+                    .balance(new BigDecimal("95000.0000"))
+                    .availableBalance(new BigDecimal("92000.0000"))
+                    .dailyLimit(new BigDecimal("250000.0000"))
+                    .monthlyLimit(new BigDecimal("1000000.0000"))
+                    .dailySpending(BigDecimal.ZERO).monthlySpending(BigDecimal.ZERO)
+                    .status(AccountStatus.ACTIVE).createdAt(LocalDateTime.now()).build();
+
+            mockAuthenticatedUser("zaposleni@banka.rs");
+            when(clientRepository.findByEmail("zaposleni@banka.rs")).thenReturn(Optional.empty());
+            when(accountRepository.findById(4L)).thenReturn(Optional.of(othersAccount));
+            // R1-307: duplikat-provera ide preko racuna VLASNIKA (klijent #99), ne pozivaoca.
+            when(accountRepository.findByClientId(99L)).thenReturn(List.of(othersAccount));
+            when(accountRepository.save(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            AccountResponseDto result = accountService.updateAccountName(4L, "Preimenovani racun");
+
+            assertNotNull(result);
+            assertEquals("Preimenovani racun", othersAccount.getName());
+            verify(accountRepository).save(othersAccount);
         }
     }
 
@@ -914,6 +1043,36 @@ class AccountServiceImplementationTest {
 
             AccountResponseDto result = accountService.changeAccountStatus(1L, "BLOCKED");
             assertEquals("BLOCKED", result.getStatus());
+        }
+
+        @Test
+        @DisplayName("R5 1891: audit aktor je IZVRSILAC (zaposleni), ne vlasnik racuna (klijent)")
+        void changeStatus_auditActorIsExecutorNotOwner_R5_1891() {
+            Currency rsd = Currency.builder().id(8L).code("RSD").build();
+            // Vlasnik racuna je klijent #1; izvrsilac je zaposleni #7.
+            Client owner = Client.builder().id(1L).firstName("Stefan").lastName("J").build();
+
+            Account account = Account.builder()
+                    .id(1L).accountNumber("222000112345678911")
+                    .accountType(AccountType.CHECKING).currency(rsd)
+                    .client(owner)
+                    .balance(BigDecimal.valueOf(100000)).availableBalance(BigDecimal.valueOf(100000))
+                    .dailyLimit(BigDecimal.TEN).monthlyLimit(BigDecimal.TEN)
+                    .status(AccountStatus.ACTIVE).createdAt(LocalDateTime.now()).build();
+
+            when(accountRepository.findById(1L)).thenReturn(Optional.of(account));
+            when(accountRepository.save(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
+            // Izvrsilac (employee #7) iz SecurityContext-a preko resolver-a.
+            when(currentAuditActorResolver.resolveCurrentActor())
+                    .thenReturn(new rs.raf.banka2_bek.audit.service.CurrentAuditActorResolver.AuditActor(7L, "EMPLOYEE"));
+
+            accountService.changeAccountStatus(1L, "BLOCKED");
+
+            // Aktor = izvrsilac (7/EMPLOYEE), NE vlasnik (1/CLIENT); target = racun.
+            verify(auditLogService).record(
+                    eq(7L), eq("EMPLOYEE"),
+                    eq(rs.raf.banka2_bek.audit.model.AuditActionType.ACCOUNT_STATUS_CHANGED),
+                    anyString(), eq("ACCOUNT"), eq(1L), any(), any());
         }
 
         @Test
@@ -1784,7 +1943,10 @@ class AccountServiceImplementationTest {
             SecurityContextHolder.setContext(ctx);
 
             when(accountRepository.findById(1L)).thenReturn(Optional.empty());
-            assertThrows(IllegalArgumentException.class, () -> accountService.updateAccountName(1L, "x"));
+            // R1 308: checkAuth not-found je EntityNotFoundException (→404). Provera
+            // autentifikacije je posle resolve-a racuna, pa not-found dolazi prvi.
+            assertThrows(jakarta.persistence.EntityNotFoundException.class,
+                    () -> accountService.updateAccountName(1L, "x"));
         }
     }
 
@@ -1818,7 +1980,7 @@ class AccountServiceImplementationTest {
     class UpdateAccountNameAdmin {
 
         @Test
-        @DisplayName("admin can rename any account without duplicate check")
+        @DisplayName("admin can rename owner's account (dedup runs against owner accounts)")
         void adminRenamesAccount() {
             Currency rsd = Currency.builder().id(8L).code("RSD").build();
             Client owner = Client.builder().id(1L).firstName("Stefan").lastName("J")
@@ -1834,10 +1996,42 @@ class AccountServiceImplementationTest {
             mockAuthenticatedUser("admin@banka.rs");
             when(clientRepository.findByEmail("admin@banka.rs")).thenReturn(Optional.empty());
             when(accountRepository.findById(1L)).thenReturn(Optional.of(account));
+            // R1-307: dedup sada ide preko racuna VLASNIKA (client owner), ne preskace se za admina.
+            when(accountRepository.findByClientId(1L)).thenReturn(List.of(account));
             when(accountRepository.save(any(Account.class))).thenReturn(account);
 
             AccountResponseDto result = accountService.updateAccountName(1L, "New Name");
             assertNotNull(result);
+        }
+
+        @Test
+        @DisplayName("R1-307: admin rename catches duplicate against INACTIVE owner account (all statuses)")
+        void adminRename_duplicateAcrossAllStatuses_rejected() {
+            Currency rsd = Currency.builder().id(8L).code("RSD").build();
+            Client owner = Client.builder().id(1L).firstName("Stefan").lastName("J")
+                    .email("stefan@test.com").build();
+            Account active = Account.builder()
+                    .id(1L).name("Old Name").accountNumber("222000112345678911")
+                    .accountType(AccountType.CHECKING).currency(rsd).client(owner).employee(null)
+                    .balance(BigDecimal.ZERO).availableBalance(BigDecimal.ZERO)
+                    .dailyLimit(BigDecimal.TEN).monthlyLimit(BigDecimal.TEN)
+                    .status(AccountStatus.ACTIVE).createdAt(LocalDateTime.now()).build();
+            // Duplikat se nalazi na INACTIVE racunu — stari kod (samo ACTIVE) bi ga propustio.
+            Account inactiveDup = Account.builder()
+                    .id(2L).name("Rezerva").accountNumber("222000112345678912")
+                    .accountType(AccountType.CHECKING).currency(rsd).client(owner).employee(null)
+                    .balance(BigDecimal.ZERO).availableBalance(BigDecimal.ZERO)
+                    .dailyLimit(BigDecimal.TEN).monthlyLimit(BigDecimal.TEN)
+                    .status(AccountStatus.INACTIVE).createdAt(LocalDateTime.now()).build();
+
+            mockAuthenticatedUser("admin@banka.rs");
+            when(clientRepository.findByEmail("admin@banka.rs")).thenReturn(Optional.empty());
+            when(accountRepository.findById(1L)).thenReturn(Optional.of(active));
+            when(accountRepository.findByClientId(1L)).thenReturn(List.of(active, inactiveDup));
+
+            Exception ex = assertThrows(IllegalStateException.class,
+                    () -> accountService.updateAccountName(1L, "Rezerva"));
+            assertTrue(ex.getMessage().contains("already used"));
         }
     }
 }

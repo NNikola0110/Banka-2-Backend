@@ -21,6 +21,7 @@ import rs.raf.banka2_bek.notification.model.Notification;
 import rs.raf.banka2_bek.notification.model.NotificationType;
 import rs.raf.banka2_bek.notification.repository.NotificationRepository;
 import rs.raf.banka2_bek.notification.service.NotificationServiceImpl;
+import rs.raf.banka2.contracts.internal.InternalNotificationRequest;
 
 import java.util.List;
 import java.util.Optional;
@@ -60,12 +61,10 @@ class NotificationServiceImplTest {
     private ArgumentCaptor<Notification> notificationCaptor;
 
     @Test
-    void notify_persistsNotificationAndDelegatesToPublisher() {
-        Client client = mock(Client.class);
-        when(client.getEmail()).thenReturn("marko@test.rs");
-        when(client.getFirstName()).thenReturn("Marko");
-        when(clientRepository.findById(CLIENT_ID)).thenReturn(Optional.of(client));
-
+    void notify_persistsNotificationButDoesNotEmailForPaymentType_R1_380() {
+        // P2-notif-reliability-2 (R1 380): PAYMENT je sad sendsEmail=false — placanje
+        // vec salje DEDIKOVANI sendPaymentConfirmationMail na call-site-u; notify()
+        // sme samo da napuni bell (in-app), NE da posalje JOS jedan (generic) email.
         notificationService.notify(CLIENT_ID, "CLIENT", NotificationType.PAYMENT,
                 "Placanje", "Vase placanje je izvrseno", "PAYMENT", 99L);
 
@@ -80,24 +79,54 @@ class NotificationServiceImplTest {
         assertEquals("PAYMENT", saved.getReferenceType());
         assertEquals(99L, saved.getReferenceId().longValue());
 
-        verify(notificationPublisher).sendInAppGenericMail(
-                "marko@test.rs", "Marko", "Placanje", "Vase placanje je izvrseno");
+        // KLJUCNO: NEMA generic email-a (inace bi klijent dobio DVA emaila).
+        verify(notificationPublisher, never()).sendInAppGenericMail(any(), any(), any(), any());
     }
 
     @Test
-    void notify_resolvesEmployeeContactForEmployeeRecipient() {
+    void notify_transferAndCardTypes_doNotEmail_R1_380() {
+        // TRANSFER / CARD_BLOCKED / CARD_UNBLOCKED / LOAN_* svi imaju dedikovan email
+        // na call-site-u → notify() ne sme da salje generic email.
+        for (NotificationType t : new NotificationType[]{
+                NotificationType.TRANSFER, NotificationType.CARD_BLOCKED,
+                NotificationType.CARD_UNBLOCKED, NotificationType.LOAN_CREATED,
+                NotificationType.LOAN_APPROVED, NotificationType.LOAN_REJECTED}) {
+            assertFalse(t.isSendsEmail(),
+                    t + " mora biti sendsEmail=false (dedikovan email na call-site-u)");
+        }
+    }
+
+    @Test
+    void notify_limitChange_stillEmails_R1_380() {
+        // LIMIT_CHANGE NEMA dedikovan email → notify() generic email je JEDINI kanal,
+        // pa ostaje sendsEmail=true.
+        Client client = mock(Client.class);
+        when(client.getEmail()).thenReturn("marko@test.rs");
+        when(client.getFirstName()).thenReturn("Marko");
+        when(clientRepository.findById(CLIENT_ID)).thenReturn(Optional.of(client));
+
+        notificationService.notify(CLIENT_ID, "CLIENT", NotificationType.LIMIT_CHANGE,
+                "Limit promenjen", "Novi limit", "CARD", 3L);
+
+        verify(notificationRepository).save(any(Notification.class));
+        verify(notificationPublisher).sendInAppGenericMail(
+                "marko@test.rs", "Marko", "Limit promenjen", "Novi limit");
+    }
+
+    @Test
+    void notify_resolvesEmployeeContactForEmailType() {
         Employee employee = mock(Employee.class);
         when(employee.getEmail()).thenReturn("supervizor@banka.rs");
         when(employee.getFirstName()).thenReturn("Nikola");
         when(employeeRepository.findById(EMPLOYEE_ID)).thenReturn(Optional.of(employee));
 
-        notificationService.notify(EMPLOYEE_ID, "EMPLOYEE", NotificationType.ACCOUNT_LOCKED,
-                "Nalog je zakljucan", "Vas nalog je privremeno zakljucan", null, null);
+        // LIMIT_CHANGE je email-sending tip bez reference (dedup se ne primenjuje).
+        notificationService.notify(EMPLOYEE_ID, "EMPLOYEE", NotificationType.LIMIT_CHANGE,
+                "Limit promenjen", "Novi limit kartice", null, null);
 
         verify(notificationRepository).save(any(Notification.class));
         verify(notificationPublisher).sendInAppGenericMail(
-                "supervizor@banka.rs", "Nikola", "Nalog je zakljucan",
-                "Vas nalog je privremeno zakljucan");
+                "supervizor@banka.rs", "Nikola", "Limit promenjen", "Novi limit kartice");
     }
 
     @Test
@@ -106,8 +135,9 @@ class NotificationServiceImplTest {
         // exception and still keep the saved Notification (in-app row already persisted).
         when(clientRepository.findById(CLIENT_ID)).thenReturn(Optional.empty());
 
-        notificationService.notify(CLIENT_ID, "CLIENT", NotificationType.PAYMENT,
-                "Placanje", "telo", null, null);
+        // LIMIT_CHANGE je email-sending tip → trigeruje resolveContact (koji pada).
+        notificationService.notify(CLIENT_ID, "CLIENT", NotificationType.LIMIT_CHANGE,
+                "Limit", "telo", null, null);
 
         verify(notificationRepository).save(any(Notification.class));
         verify(notificationPublisher, never()).sendInAppGenericMail(
@@ -130,10 +160,41 @@ class NotificationServiceImplTest {
                 .sendInAppGenericMail(any(), any(), any(), any());
 
         assertDoesNotThrow(() ->
-                notificationService.notify(CLIENT_ID, "CLIENT", NotificationType.PAYMENT,
-                        "Placanje", "Vase placanje je izvrseno", null, null));
+                notificationService.notify(CLIENT_ID, "CLIENT", NotificationType.LIMIT_CHANGE,
+                        "Limit", "telo", null, null));
 
         verify(notificationRepository).save(any(Notification.class));
+    }
+
+    // ── P2-notif-reliability-2 (R4 1791): in-app dedup po (recipient,type,ref) ──
+
+    @Test
+    void notify_duplicateInApp_skipsSecondSave_R4_1791() {
+        // Postoji vec notifikacija za isti (recipient, type, referenceType, referenceId)
+        // → drugi notify() (npr. SAGA recovery / scheduler re-fire) ne pravi dupli red.
+        when(notificationRepository
+                .existsByRecipientIdAndRecipientTypeAndNotificationTypeAndReferenceTypeAndReferenceId(
+                        CLIENT_ID, "CLIENT", NotificationType.ORDER_EXECUTED, "ORDER", 42L))
+                .thenReturn(true);
+
+        notificationService.notify(CLIENT_ID, "CLIENT", NotificationType.ORDER_EXECUTED,
+                "Order izvrsen", "Body", "ORDER", 42L);
+
+        verify(notificationRepository, never()).save(any(Notification.class));
+    }
+
+    @Test
+    void notify_noReference_dedupNotApplied_R4_1791() {
+        // Bez reference (referenceId==null) dedup se NE primenjuje (ne mozemo
+        // razlikovati ad-hoc evente) → notifikacija se uvek upisuje.
+        notificationService.notify(CLIENT_ID, "CLIENT", NotificationType.ORDER_EXECUTED,
+                "Order izvrsen", "Body", null, null);
+
+        verify(notificationRepository).save(any(Notification.class));
+        // exists-provera se ne poziva kad nema reference.
+        verify(notificationRepository, never())
+                .existsByRecipientIdAndRecipientTypeAndNotificationTypeAndReferenceTypeAndReferenceId(
+                        any(), any(), any(), any(), any());
     }
 
     // [B1 — Test coverage] Verifies that types with sendsEmail=false never trigger the
@@ -152,8 +213,9 @@ class NotificationServiceImplTest {
     void notify_unrecognisedRecipientTypeDoesNotPublishAndDoesNotPropagate() {
         // Notification still persisted, publisher never invoked because contact
         // resolution throws InAppNotificationException — which the service swallows.
-        notificationService.notify(CLIENT_ID, "ROBOT", NotificationType.PAYMENT,
-                "Placanje", "telo", null, null);
+        // LIMIT_CHANGE je email-sending tip → resolveContact se poziva i pada na ROBOT.
+        notificationService.notify(CLIENT_ID, "ROBOT", NotificationType.LIMIT_CHANGE,
+                "Limit", "telo", null, null);
 
         verify(notificationRepository).save(any(Notification.class));
         verify(notificationPublisher, never()).sendInAppGenericMail(
@@ -238,6 +300,176 @@ class NotificationServiceImplTest {
         notificationService.markAllRead(EMPLOYEE_ID, "EMPLOYEE");
 
         verify(notificationRepository).markAllReadForRecipient(EMPLOYEE_ID, "EMPLOYEE");
+    }
+
+    // ── TEST-notif-bc-1: createInternalNotification (cross-DB ulaz iz trading-service) ──
+
+    @Test
+    void createInternalNotification_persistsMappedNotification_TEST_notif_bc_1() {
+        InternalNotificationRequest req = new InternalNotificationRequest(
+                CLIENT_ID, "CLIENT", "ORDER_EXECUTED", "Order izvrsen",
+                "Vas BUY order je popunjen", "ORDER", 42L, "idem-1");
+
+        notificationService.createInternalNotification(req);
+
+        verify(notificationRepository).save(notificationCaptor.capture());
+        Notification saved = notificationCaptor.getValue();
+        assertEquals(CLIENT_ID, saved.getRecipientId());
+        assertEquals("CLIENT", saved.getRecipientType());
+        assertEquals(NotificationType.ORDER_EXECUTED, saved.getNotificationType());
+        assertEquals("Order izvrsen", saved.getTitle());
+        assertEquals("Vas BUY order je popunjen", saved.getBody());
+        assertEquals("ORDER", saved.getReferenceType());
+        assertEquals(42L, saved.getReferenceId().longValue());
+        assertFalse(saved.isRead());
+        // Cross-DB ulaz NE okida email — trading-service paralelno publishuje RabbitMQ event.
+        verify(notificationPublisher, never()).sendInAppGenericMail(any(), any(), any(), any());
+    }
+
+    @Test
+    void createInternalNotification_unknownType_fallsBackToGeneral_TEST_notif_bc_1() {
+        InternalNotificationRequest req = new InternalNotificationRequest(
+                EMPLOYEE_ID, "EMPLOYEE", "THIS_TYPE_DOES_NOT_EXIST", "Test",
+                "Body", null, null, "idem-2");
+
+        notificationService.createInternalNotification(req);
+
+        verify(notificationRepository).save(notificationCaptor.capture());
+        assertEquals(NotificationType.GENERAL, notificationCaptor.getValue().getNotificationType());
+    }
+
+    @Test
+    void createInternalNotification_nullType_fallsBackToGeneral_TEST_notif_bc_1() {
+        // valueOf(null) baca NullPointerException → fallback GENERAL.
+        InternalNotificationRequest req = new InternalNotificationRequest(
+                CLIENT_ID, "CLIENT", null, "Test", "Body", null, null, "idem-3");
+
+        notificationService.createInternalNotification(req);
+
+        verify(notificationRepository).save(notificationCaptor.capture());
+        assertEquals(NotificationType.GENERAL, notificationCaptor.getValue().getNotificationType());
+    }
+
+    @Test
+    void createInternalNotification_nullTitleAndMessage_storedAsEmptyStrings_TEST_notif_bc_1() {
+        InternalNotificationRequest req = new InternalNotificationRequest(
+                CLIENT_ID, "CLIENT", "GENERAL", null, null, null, null, "idem-4");
+
+        notificationService.createInternalNotification(req);
+
+        verify(notificationRepository).save(notificationCaptor.capture());
+        Notification saved = notificationCaptor.getValue();
+        assertEquals("", saved.getTitle());
+        assertEquals("", saved.getBody());
+    }
+
+    @Test
+    void createInternalNotification_duplicateReference_skipsSave_TEST_notif_bc_1() {
+        // In-app dedup i na cross-DB putanji (R4 1791) — postojeci ref → no save.
+        when(notificationRepository
+                .existsByRecipientIdAndRecipientTypeAndNotificationTypeAndReferenceTypeAndReferenceId(
+                        CLIENT_ID, "CLIENT", NotificationType.ORDER_EXECUTED, "ORDER", 42L))
+                .thenReturn(true);
+
+        InternalNotificationRequest req = new InternalNotificationRequest(
+                CLIENT_ID, "CLIENT", "ORDER_EXECUTED", "Order", "Body", "ORDER", 42L, "idem-5");
+
+        notificationService.createInternalNotification(req);
+
+        verify(notificationRepository, never()).save(any(Notification.class));
+    }
+
+    // ── TEST-notif-bc-2 / OT-1819 (✅ FIXED 02.06): queueEmail publish-after-commit.
+    // notify() PRVO perzistuje in-app red, PA publishuje email. Kad postoji aktivna
+    // transakcija, publish se ODLAZE u TransactionSynchronization.afterCommit (email
+    // ide SAMO ako biznis tx commit-uje; rollback → NEMA email-a). Bez aktivne tx-e
+    // (npr. ovaj cist Mockito test) publish ide odmah (best-effort), pa redosled
+    // save→publish i dalje vazi.
+
+    @Test
+    void queueEmail_persistsInAppBeforePublishingEmail_TEST_notif_bc_2() {
+        Client client = mock(Client.class);
+        when(client.getEmail()).thenReturn("marko@test.rs");
+        when(client.getFirstName()).thenReturn("Marko");
+        when(clientRepository.findById(CLIENT_ID)).thenReturn(Optional.of(client));
+
+        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(
+                notificationRepository, notificationPublisher);
+
+        // LIMIT_CHANGE je email-sending tip (jedini kanal je generic email).
+        // Bez aktivne tx-e → immediate publish (best-effort).
+        notificationService.notify(CLIENT_ID, "CLIENT", NotificationType.LIMIT_CHANGE,
+                "Limit", "telo", null, null);
+
+        // in-app save se desava PRE email publish-a.
+        inOrder.verify(notificationRepository).save(any(Notification.class));
+        inOrder.verify(notificationPublisher).sendInAppGenericMail(
+                "marko@test.rs", "Marko", "Limit", "telo");
+    }
+
+    // ── OT-1819: publish-after-commit — email ide SAMO posle commit-a, NE pre rollback-a.
+    // Ova dva testa rucno aktiviraju TransactionSynchronizationManager (bez full Spring
+    // konteksta) i simuliraju commit (triggerAfterCommit) vs rollback (clear bez commit-a).
+
+    @Test
+    void queueEmail_inTransaction_publishesOnlyAfterCommit_OT_1819() {
+        Client client = mock(Client.class);
+        when(client.getEmail()).thenReturn("marko@test.rs");
+        when(client.getFirstName()).thenReturn("Marko");
+        when(clientRepository.findById(CLIENT_ID)).thenReturn(Optional.of(client));
+
+        org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
+        try {
+            notificationService.notify(CLIENT_ID, "CLIENT", NotificationType.LIMIT_CHANGE,
+                    "Limit", "telo", null, null);
+
+            // In-app je sacuvan ODMAH (unutar tx-e), ali email JOS NIJE publish-ovan —
+            // ceka commit (registrovan je afterCommit hook).
+            verify(notificationRepository).save(any(Notification.class));
+            verify(notificationPublisher, never()).sendInAppGenericMail(any(), any(), any(), any());
+
+            // Simuliraj COMMIT → afterCommit hook se okida → email se publishuje.
+            triggerAfterCommit();
+            verify(notificationPublisher).sendInAppGenericMail(
+                    "marko@test.rs", "Marko", "Limit", "telo");
+        } finally {
+            org.springframework.transaction.support.TransactionSynchronizationManager.clearSynchronization();
+        }
+    }
+
+    @Test
+    void queueEmail_inTransaction_doesNotPublishOnRollback_OT_1819() {
+        Client client = mock(Client.class);
+        when(client.getEmail()).thenReturn("marko@test.rs");
+        when(client.getFirstName()).thenReturn("Marko");
+        when(clientRepository.findById(CLIENT_ID)).thenReturn(Optional.of(client));
+
+        org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
+        try {
+            notificationService.notify(CLIENT_ID, "CLIENT", NotificationType.LIMIT_CHANGE,
+                    "Limit", "telo", null, null);
+
+            // afterCommit registrovan, ali tx se NIKAD ne commit-uje (rollback) →
+            // afterCommit se NE poziva → email se NE publishuje.
+            verify(notificationPublisher, never()).sendInAppGenericMail(any(), any(), any(), any());
+            // Rollback: synchronizacije se odbacuju bez afterCommit poziva.
+        } finally {
+            org.springframework.transaction.support.TransactionSynchronizationManager.clearSynchronization();
+        }
+
+        // Posle rollback-a (clear bez triggerAfterCommit) email NIKAD nije poslat.
+        verify(notificationPublisher, never()).sendInAppGenericMail(any(), any(), any(), any());
+    }
+
+    /**
+     * OT-1819: rucno okida sve registrovane {@code afterCommit} hook-ove (simulacija
+     * uspesnog tx commit-a) bez bootstrap-ovanja {@code PlatformTransactionManager}-a.
+     */
+    private static void triggerAfterCommit() {
+        for (org.springframework.transaction.support.TransactionSynchronization sync :
+                org.springframework.transaction.support.TransactionSynchronizationManager.getSynchronizations()) {
+            sync.afterCommit();
+        }
     }
 
     private Notification notification(boolean read) {

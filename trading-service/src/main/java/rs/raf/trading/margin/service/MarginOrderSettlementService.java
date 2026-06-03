@@ -12,6 +12,7 @@ import rs.raf.trading.client.BankaCoreClientException;
 import rs.raf.trading.margin.event.MarginAccountBlockedEvent;
 import rs.raf.trading.margin.model.MarginAccount;
 import rs.raf.trading.margin.model.MarginAccountStatus;
+import rs.raf.trading.margin.model.MarginCallPolicy;
 import rs.raf.trading.margin.model.MarginTransaction;
 import rs.raf.trading.margin.model.MarginTransactionType;
 import rs.raf.trading.margin.repository.MarginAccountRepository;
@@ -138,10 +139,11 @@ public class MarginOrderSettlementService {
      * </ul>
      *
      * @param fillSeq redni broj fill-a (za idempotency key)
+     * @param fillQuantity kolicina ovog fill-a (za pro-rata oslobadjanje viska rezervacije)
      * @param fillTotal total = qty × pricePerShare za ovaj fill
      */
     @Transactional
-    public void settleMarginBuyFill(Order order, int fillSeq, BigDecimal fillTotal) {
+    public void settleMarginBuyFill(Order order, int fillSeq, int fillQuantity, BigDecimal fillTotal) {
         MarginAccount margin = lockMarginAccount(order);
         if (margin == null) {
             throw new IllegalStateException(
@@ -153,11 +155,24 @@ public class MarginOrderSettlementService {
                 .setScale(4, RoundingMode.HALF_UP);
         BigDecimal userPart = fillTotal.subtract(bankPart).setScale(4, RoundingMode.HALF_UP);
 
-        // 1. Skini userPart sa initialMargin + reservedMargin (rezervacija konzumirana).
+        // P1-margin-1 (R2 1325) — visak rezervacije pri fill-u po nizoj ceni.
+        // Rezervacija (reserveForMarginBuy) je napravljena po APPROX ceni naloga, a
+        // fill ide po STVARNOJ trzisnoj ceni. Ako je fill cena < approx, userPart
+        // ovog fill-a (skinut sa reservedMargin) je manji od pro-rata REZERVISANOG
+        // userPart-a za ovu kolicinu → razlika ostaje zaglavljena u reservedMargin.
+        // Na DONE {@code releaseReservationSafe} racuna ostatak preko
+        // {@code remainingPortions} (=0) → 0 → visak NIKAD ne oslobodi
+        // (availableInitialMargin trajno umanjen). Resenje: za svaki fill oslobodi
+        // PRO-RATA visak rezervacije {@code reservedUserPart(fill) − userPart(fill)}.
+        BigDecimal reservedReleaseSurplus = computeReservationSurplusForFill(
+                order, margin, fillQuantity, userPart);
+
+        // 1. Skini userPart sa initialMargin + reservedMargin (rezervacija konzumirana),
+        //    plus oslobodi pro-rata visak rezervacije (fill cena < approx).
         BigDecimal newIm = margin.getInitialMargin().subtract(userPart)
                 .setScale(4, RoundingMode.HALF_UP);
         BigDecimal rm = margin.getReservedMargin() != null ? margin.getReservedMargin() : BigDecimal.ZERO;
-        BigDecimal newReserved = rm.subtract(userPart).max(BigDecimal.ZERO)
+        BigDecimal newReserved = rm.subtract(userPart).subtract(reservedReleaseSurplus).max(BigDecimal.ZERO)
                 .setScale(4, RoundingMode.HALF_UP);
 
         if (newIm.compareTo(BigDecimal.ZERO) < 0) {
@@ -235,9 +250,16 @@ public class MarginOrderSettlementService {
             throw new IllegalStateException(
                     "Margin order " + order.getId() + " nema povezan margin racun.");
         }
-        // SELL je dozvoljen i na blokiranom racunu (Marzni_Racuni.txt ne brani SELL na blocked).
-        // Spec §137 brani BUY i SELL, ali order je vec APPROVED — pretpostavka je da je
-        // ovo poslednji fill koji ce racun mozda odblokirati.
+        // P2-4 (Marzni_Racuni.txt §137): blokiran margin racun odbija SVAKI pokusaj
+        // kupovine/prodaje — ne samo BUY. Raniji komentar je tvrdio da je SELL
+        // dozvoljen na blokiranom racunu ("recover via SELL"), ali to NIJE u skladu
+        // sa literalnim spec-om §137 koji glasi: "svaki pokusaj kupovine/prodaje
+        // Stocks preko marznog racuna automatski odbija". Odblokiranje ide
+        // iskljucivo kroz uplatu na racun (Marzni_Racuni.txt §139), ne kroz SELL fill.
+        // OrderExecutionService/SingleOrderExecutor pre-checkuje blokiran status i
+        // cisto declime order (bez beskonacnog retry-a); ovaj guard je hard
+        // enforcement po spec-u za slucaj direktnog poziva.
+        ensureActive(margin);
 
         BigDecimal bankPart = fillTotal.multiply(margin.getBankParticipation())
                 .setScale(4, RoundingMode.HALF_UP);
@@ -306,6 +328,42 @@ public class MarginOrderSettlementService {
     }
 
     /**
+     * P1-margin-1 (R2 1325): pro-rata visak rezervacije za jedan margin BUY fill.
+     *
+     * <p>Rezervisani userPart za CEO nalog (reserveForMarginBuy) je baziran na
+     * APPROX iznosu naloga u valuti margin racuna (RSD):
+     * {@code reservedTotalRsd = approximatePrice × exchangeRate} (gde je
+     * exchangeRate listing→RSD, postavljen za margin ordere u OrderServiceImpl).
+     * userPart faktor = {@code 1 − bankParticipation}. Pro-rata po kolicini fill-a:
+     * {@code reservedUserPart(fill) = reservedTotalRsd × (1 − BP) × fillQty / totalQty}.
+     *
+     * <p>Visak koji treba osloboditi = {@code max(0, reservedUserPart(fill) −
+     * actualUserPart(fill))}. actualUserPart je vec skinut sa reservedMargin u
+     * settle-u; ovaj visak je deo koji je bio rezervisan ali ne i utrosen (fill po
+     * nizoj ceni od approx). Ako fill cena >= approx (visak <= 0), vraca 0 — nista
+     * dodatno se ne oslobadja (settle skida samo stvarno utroseni userPart).
+     *
+     * <p>Defenzivno vraca 0 ako order nema {@code approximatePrice}/{@code quantity}
+     * ({@code exchangeRate} null → 1) — legacy/ne-margin slucaj.
+     */
+    private BigDecimal computeReservationSurplusForFill(Order order, MarginAccount margin,
+                                                        int fillQuantity, BigDecimal actualUserPart) {
+        if (order.getApproximatePrice() == null || order.getQuantity() == null
+                || order.getQuantity() <= 0 || fillQuantity <= 0) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal rate = order.getExchangeRate() != null ? order.getExchangeRate() : BigDecimal.ONE;
+        BigDecimal reservedTotalInMarginCcy = order.getApproximatePrice().multiply(rate);
+        BigDecimal userFactor = BigDecimal.ONE.subtract(margin.getBankParticipation());
+        BigDecimal reservedUserPartForFill = reservedTotalInMarginCcy
+                .multiply(userFactor)
+                .multiply(BigDecimal.valueOf(fillQuantity))
+                .divide(BigDecimal.valueOf(order.getQuantity()), 4, RoundingMode.HALF_UP);
+        return reservedUserPartForFill.subtract(actualUserPart).max(BigDecimal.ZERO)
+                .setScale(4, RoundingMode.HALF_UP);
+    }
+
+    /**
      * Resolves margin account za order. Vraca null ako nije margin order.
      */
     private MarginAccount lockMarginAccount(Order order) {
@@ -334,30 +392,98 @@ public class MarginOrderSettlementService {
     }
 
     /**
-     * Marzni_Racuni.txt §133-139: ako IM padne ispod MM, racun se blokira.
-     * Ako IM predje MM (npr. posle SELL koji dodaje userPart), racun se odblokira.
+     * P2-4: read-only provera da li je margin racun ovog ordera BLOCKED.
+     *
+     * <p>Koristi je {@code SingleOrderExecutor} da PRE fill-a odluci da li margin
+     * BUY/SELL fill treba odbiti (Marzni_Racuni.txt §137) — i to tako sto cisto
+     * declime order, umesto da pusti {@link #settleMarginSellFill}/
+     * {@link #settleMarginBuyFill} da baci {@code IllegalStateException} koji bi
+     * fill engine retry-ovao svaki tick (beskonacno).
+     *
+     * <p>Bez pessimistic lock-a (samo citanje statusa). Vraca {@code false} ako
+     * order nije margin ili racun nije pronadjen (tada regularna fill putanja
+     * preuzima i baca svoju gresku).
+     *
+     * @return {@code true} ako je margin racun pronadjen i status mu je BLOCKED.
+     */
+    @Transactional(readOnly = true)
+    public boolean isMarginAccountBlocked(Order order) {
+        if (order == null || !order.isMargin()) {
+            return false;
+        }
+        Long ownerId = order.getUserId();
+        return marginAccountRepository.findFirstByUserIdAndStatus(ownerId, MarginAccountStatus.ACTIVE)
+                .or(() -> marginAccountRepository.findByUserId(ownerId).stream().findFirst())
+                .map(m -> m.getStatus() == MarginAccountStatus.BLOCKED)
+                .orElse(false);
+    }
+
+    /**
+     * Marzni_Racuni.txt §133-139: ako RASPOLOZIVI IM padne ispod MM, racun se
+     * blokira. Ako predje MM (npr. posle SELL koji dodaje userPart), odblokira se.
+     *
+     * <p><b>P1-margin-1 (R3 1548) — kasni margin call:</b> prag je RASPOLOZIVI
+     * initialMargin {@code (IM − reservedMargin)}, ne sirovi IM. Tako je post-fill
+     * margin-call konzistentan sa dnevnim scheduler-om
+     * ({@link MarginAccountRepository#findEligibleForBlock}) i {@code withdraw}
+     * guard-om (P1-8) — racun sa zarobljenom rezervacijom (hold za jos jedan
+     * in-flight BUY) blokira se cim raspoloziva marza padne ispod MM.
      */
     private void checkMarginCallAndBlock(MarginAccount margin) {
-        boolean shouldBlock = margin.getInitialMargin().compareTo(margin.getMaintenanceMargin()) < 0;
+        BigDecimal availableIm = margin.getAvailableInitialMargin();
+        // R1 769: deljena margin-call politika (prag = raspoloziva marza vs MM).
+        boolean shouldBlock = MarginCallPolicy.shouldBlock(margin);
         boolean isBlocked = margin.getStatus() == MarginAccountStatus.BLOCKED;
 
         if (shouldBlock && !isBlocked) {
             margin.setStatus(MarginAccountStatus.BLOCKED);
             marginAccountRepository.save(margin);
-            BigDecimal deficit = margin.getMaintenanceMargin().subtract(margin.getInitialMargin());
+            BigDecimal deficit = MarginCallPolicy.deficit(margin);
+            // P1-margin-1 (R1 204): ranije se ovde slao email=null → listener bi
+            // tiho preskocio notifikaciju (margin-call trgovinom NIKAD nije slao
+            // email). Sada razresavamo email vlasnika (UserMarginAccount → banka-core
+            // getUserById). Za CompanyMarginAccount banka-core nema company-email
+            // lookup, pa ostaje null (dnevni scheduler ima istu granicu) — bar
+            // korisnicki margin racuni sada dobijaju email.
+            String ownerEmail = resolveMarginOwnerEmail(margin);
             eventPublisher.publishEvent(new MarginAccountBlockedEvent(
-                    null, // email resolve nije moguc ovde — listener-u svejedno
+                    // R1 381: userId + marginAccountId za in-app (bell) notifikaciju.
+                    margin.getUserId(),
+                    margin.getId(),
+                    ownerEmail,
                     margin.getMaintenanceMargin().toString(),
                     margin.getInitialMargin().toString(),
                     deficit.toString()
             ));
-            log.warn("MARGIN CALL (post-fill): account #{} blocked. IM={}, MM={}",
-                    margin.getId(), margin.getInitialMargin(), margin.getMaintenanceMargin());
+            log.warn("MARGIN CALL (post-fill): account #{} blocked. availableIM={} (IM={}, reserved={}), MM={}",
+                    margin.getId(), availableIm, margin.getInitialMargin(),
+                    margin.getReservedMargin(), margin.getMaintenanceMargin());
         } else if (!shouldBlock && isBlocked) {
             margin.setStatus(MarginAccountStatus.ACTIVE);
             marginAccountRepository.save(margin);
-            log.info("Margin account #{} auto-unblocked: IM={} >= MM={}",
-                    margin.getId(), margin.getInitialMargin(), margin.getMaintenanceMargin());
+            log.info("Margin account #{} auto-unblocked: availableIM={} >= MM={}",
+                    margin.getId(), availableIm, margin.getMaintenanceMargin());
+        }
+    }
+
+    /**
+     * P1-margin-1 (R1 204): razresava email vlasnika margin racuna za margin-call
+     * notifikaciju. UserMarginAccount → banka-core {@code getUserById(CLIENT, userId)}.
+     * CompanyMarginAccount (userId==null) → null (banka-core nema company-email
+     * lookup bez wire-promene). Best-effort: bilo koji fail vraca null (listener
+     * preskace email, ali counter/log ostaju).
+     */
+    private String resolveMarginOwnerEmail(MarginAccount margin) {
+        Long userId = margin.getUserId();
+        if (userId == null) {
+            return null;
+        }
+        try {
+            return bankaCoreClient.getUserById(rs.raf.trading.common.UserRole.CLIENT, userId).email();
+        } catch (RuntimeException ex) {
+            log.warn("Margin call (post-fill): nije moguce razresiti email vlasnika {}: {}",
+                    userId, ex.getMessage());
+            return null;
         }
     }
 

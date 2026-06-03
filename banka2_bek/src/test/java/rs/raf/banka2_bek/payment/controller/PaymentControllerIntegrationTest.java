@@ -38,7 +38,6 @@ import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.company.model.Company;
 import rs.raf.banka2_bek.company.repository.CompanyRepository;
 import rs.raf.banka2_bek.exchange.ExchangeService;
-import rs.raf.banka2_bek.exchange.dto.CalculateExchangeResponseDto;
 import rs.raf.banka2_bek.exchange.dto.ExchangeRateDto;
 import rs.raf.banka2_bek.payment.repository.PaymentAccountRepository;
 import rs.raf.banka2_bek.payment.repository.PaymentRepository;
@@ -207,8 +206,8 @@ class PaymentControllerIntegrationTest {
         createBankAccount("222000100000000140", bankCompany, employee, usd, new BigDecimal("5000000.00"));
 
         // Mock cross-currency exchange: 100 EUR -> 108 USD
-        when(exchangeService.calculateCross(100.0, "EUR", "USD"))
-                .thenReturn(new CalculateExchangeResponseDto(108.0, 1.08, "EUR", "USD"));
+        when(exchangeService.calculateCrossExact(new BigDecimal("100.00"), "EUR", "USD"))
+                .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("108.00"), new BigDecimal("1.08")));
 
         String fromNumber = "333333333333333333";
         String toNumber = "222444444444444444";

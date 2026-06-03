@@ -78,6 +78,21 @@ public class TradingGlobalExceptionHandler {
                 .body(new MessageResponseDto(ex.getMessage()));
     }
 
+    /**
+     * Bare {@code IllegalStateException} se app-wide mapira na 403 FORBIDDEN jer ga
+     * vecina modula (order/actuary/investmentfund/stock) koristi kao invarijant/authz-denial
+     * signal. Genuini state-conflict-i u tim modulima nose TIPIZIRAN izuzetak
+     * ({@code OrderStateConflictException}/{@code FundInactiveException}&rarr;409), pa ne
+     * padaju ovde.
+     *
+     * <p>NAMERNA DIVERGENCIJA: {@code OtcExceptionHandler} i {@code InternalApiExceptionHandler}
+     * (scoped, HIGHEST_PRECEDENCE) mapiraju {@code IllegalStateException}&rarr;409 jer u tim
+     * kontekstima on UVEK znaci state-conflict (OTC ugovor/ponuda u losem statusu; interni
+     * API nedovoljna kolicina — banka-core klijent se oslanja na 409 za INSUFFICIENT_QUANTITY).
+     * Status zavisi od modula koji baca i to je svesna konvencija (dokumentovano u oba scoped
+     * handler-a), ne nekonzistentnost koju treba "popraviti" remapiranjem (to bi obrnulo
+     * postojece 403 ugovore i polomilo zelene web-test suite).
+     */
     @ExceptionHandler(IllegalStateException.class)
     public ResponseEntity<MessageResponseDto> handleForbidden(IllegalStateException ex) {
         return ResponseEntity
@@ -218,6 +233,61 @@ public class TradingGlobalExceptionHandler {
         String message = ex.getReason() != null ? ex.getReason() : ex.getMessage();
         return ResponseEntity
                 .status(ex.getStatusCode())
+                .body(new MessageResponseDto(message));
+    }
+
+    /**
+     * R1 409 — nedovoljno sredstava / nedovoljno hartija je 409 Conflict (stanje
+     * resursa konfliktuje sa zahtevom), ne 400 Bad Request (payload je validan).
+     * Konzistentno sa internim API mapiranjem (banka-core reserve daje 409) i sa
+     * {@code OtcExceptionHandler}/{@code OrderExceptionHandler}.
+     */
+    @ExceptionHandler({
+            rs.raf.trading.order.exception.InsufficientFundsException.class,
+            rs.raf.trading.order.exception.InsufficientHoldingsException.class
+    })
+    public ResponseEntity<MessageResponseDto> handleInsufficient(RuntimeException ex) {
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new MessageResponseDto(ex.getMessage()));
+    }
+
+    /**
+     * R1 819 — necitljiv JSON request body (npr. nepostojeca enum vrednost za
+     * {@code mode}/{@code cadence}/{@code direction}). Jackson baca
+     * {@link com.fasterxml.jackson.databind.exc.InvalidFormatException} (umotanu u
+     * {@link org.springframework.http.converter.HttpMessageNotReadableException})
+     * sa stack-trace-nom porukom koja curi interne tipove. Globalni handler ovde
+     * detektuje enum-parse gresku i vraca prijateljsku poruku sa spiskom validnih
+     * vrednosti — DRY zamena za per-polje custom deserializer-e.
+     */
+    @ExceptionHandler(org.springframework.http.converter.HttpMessageNotReadableException.class)
+    public ResponseEntity<MessageResponseDto> handleNotReadable(
+            org.springframework.http.converter.HttpMessageNotReadableException ex) {
+        String message = "Telo zahteva nije moguce procitati (proverite format polja).";
+        // Spring Boot 4 koristi Jackson 3 (paket tools.jackson). Prodji cause-lanac
+        // trazeci InvalidFormatException (npr. nepostojeca enum vrednost za
+        // mode/cadence/direction) — moze biti umotana dublje od getCause().
+        tools.jackson.databind.exc.InvalidFormatException ife = null;
+        for (Throwable c = ex.getCause(); c != null; c = c.getCause()) {
+            if (c instanceof tools.jackson.databind.exc.InvalidFormatException found) {
+                ife = found;
+                break;
+            }
+        }
+        if (ife != null && ife.getTargetType() != null && ife.getTargetType().isEnum()) {
+            var path = ife.getPath();
+            String field = path.isEmpty()
+                    ? "polje"
+                    : path.get(path.size() - 1).getPropertyName();
+            String allowed = java.util.Arrays.stream(ife.getTargetType().getEnumConstants())
+                    .map(Object::toString)
+                    .collect(java.util.stream.Collectors.joining(", "));
+            message = "Nevalidna vrednost za '" + field + "': '" + ife.getValue()
+                    + "'. Dozvoljene vrednosti: " + allowed + ".";
+        }
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
                 .body(new MessageResponseDto(message));
     }
 

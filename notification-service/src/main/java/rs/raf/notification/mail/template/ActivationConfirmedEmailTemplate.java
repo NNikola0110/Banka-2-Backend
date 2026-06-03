@@ -10,7 +10,9 @@ public class ActivationConfirmedEmailTemplate {
     }
 
     public String buildBody(String firstName) {
-        String greeting = (firstName != null && !firstName.isBlank()) ? firstName : "Poštovani";
+        // [P2-input-validation-1 / R1 385] escape user-controlled firstName.
+        String greeting = EmailHtml.escape(
+                (firstName != null && !firstName.isBlank()) ? firstName : "Poštovani");
         return """
                 <!DOCTYPE html>
                 <html lang="sr">

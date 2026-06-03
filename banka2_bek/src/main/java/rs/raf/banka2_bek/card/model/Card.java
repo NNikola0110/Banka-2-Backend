@@ -45,7 +45,24 @@ public class Card {
     @Column(nullable = false, length = 30)
     private String cardName;
 
-    @Column(nullable = false, length = 3)
+    /**
+     * R1-500-CVV (PCI-DSS Req 3.2): CVV/CVV2 se NIKAD ne sme cuvati at-rest posle
+     * autorizacije kartice. Ranije je ova vrednost bila perzistovana PLAINTEXT u
+     * {@code cards.cvv} koloni "za internu verifikaciju" — ali nijedan flow u
+     * codebase-u je nikad nije ČITAO radi verifikacije (jedini callovi
+     * {@code getCvv()} su test-asercije da DTO vraca {@code null}). Posto se nikad
+     * ne verifikuje, ispravan PCI fix je da se VISE NE CUVA.
+     *
+     * <p>Polje je sada {@link jakarta.persistence.Transient @Transient}: ostaje na
+     * entitetu (in-memory only, da builder/getter/setter pozivi i dalje rade), ali
+     * Hibernate ga NIKAD ne mapira u kolonu, ne cita ni ne pise. Na svezoj semi
+     * ({@code ddl-auto=create}) kolona {@code cvv} se uopste ne kreira; na
+     * postojecim prod bazama ({@code ddl-auto=update} — Hibernate ne dropuje
+     * kolone) legacy NOT-NULL {@code cvv} kolonu uklanja
+     * {@code CardCvvColumnMigration} (DROP COLUMN), cime se i postojeci plaintext
+     * podaci trajno bricu.
+     */
+    @jakarta.persistence.Transient
     private String cvv;
 
     /**
@@ -101,8 +118,10 @@ public class Card {
     private BigDecimal prepaidBalance = BigDecimal.ZERO;
 
     /**
-     * Za CREDIT: maksimalni iznos koji klijent moze da troši na rate.
-     * Za DEBIT i INTERNET_PREPAID: 0.
+     * Za CREDIT: nominalni kreditni limit. <b>R1-636: trenutno KOZMETICKO polje</b> —
+     * cuva se i prikazuje, ali nijedan payment/transakcioni put ga ne koristi
+     * (CREDIT kartica trosi kao DEBIT, direktan debit Account-a). Vidi
+     * {@link CardCategory#CREDIT}. Za DEBIT i INTERNET_PREPAID: 0.
      */
     @Column(name = "credit_limit", precision = 19, scale = 4, nullable = false)
     @org.hibernate.annotations.ColumnDefault("0")
@@ -110,8 +129,11 @@ public class Card {
     private BigDecimal creditLimit = BigDecimal.ZERO;
 
     /**
-     * Za CREDIT: trenutno duguje banci. Otplata smanjuje, placanja povecavaju.
-     * Za DEBIT i INTERNET_PREPAID: 0.
+     * Za CREDIT: namenjeno za "trenutno duguje banci". <b>R1-636: trenutno
+     * KOZMETICKO polje</b> — write-once ZERO pri kreiranju kartice; nijedan
+     * charge/otplata put ga NE menja (nema kreditne linije ni mesecne otplate),
+     * samo se cuva i prikazuje. Vidi {@link CardCategory#CREDIT}. Funkcionalan
+     * credit-line je buduci feature. Za DEBIT i INTERNET_PREPAID: 0.
      */
     @Column(name = "outstanding_balance", precision = 19, scale = 4, nullable = false)
     @org.hibernate.annotations.ColumnDefault("0")
@@ -150,7 +172,7 @@ public class Card {
     /**
      * Generates a valid card number for the given card type.
      * VISA: 16 digits, prefix 4XXXXX
-     * MASTERCARD: 16 digits, prefix 51-55
+     * MASTERCARD: 16 digits, prefix 51-55 ili 2221-2720 (Celina 2 §288)
      * DINACARD: 16 digits, prefix 9891
      * AMERICAN_EXPRESS: 15 digits, prefix 34 or 37
      * The last digit is always the Luhn check digit.
@@ -173,8 +195,16 @@ public class Card {
 
         switch (cardType) {
             case MASTERCARD:
-                // 51-55 range
-                prefix = "5" + (random.nextInt(5) + 1);
+                // Celina 2 §288: MasterCard pocinje sa 51-55 ILI 2221-2720.
+                // Biramo nasumicno izmedju dva validna opsega da generator pokrije
+                // ceo BIN prostor brenda (a ne samo legacy 51-55).
+                if (random.nextBoolean()) {
+                    // 51-55 (legacy 2-cifreni prefiks)
+                    prefix = "5" + (random.nextInt(5) + 1);
+                } else {
+                    // 2221-2720 (4-cifreni prefiks, novi MC opseg)
+                    prefix = String.valueOf(2221 + random.nextInt(2720 - 2221 + 1));
+                }
                 totalDigits = 16;
                 break;
             case DINACARD:
@@ -200,13 +230,6 @@ public class Card {
         // Calculate Luhn check digit
         sb.append(calculateLuhnCheckDigit(sb.toString()));
         return sb.toString();
-    }
-
-    /**
-     * Backward-compatible overload — defaults to VISA.
-     */
-    public static String generateCardNumber() {
-        return generateCardNumber(CardType.VISA);
     }
 
     private static int calculateLuhnCheckDigit(String partial) {

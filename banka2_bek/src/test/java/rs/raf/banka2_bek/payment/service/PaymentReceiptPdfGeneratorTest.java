@@ -52,16 +52,21 @@ class PaymentReceiptPdfGeneratorTest {
         assertTrue(pdf.length > 0);
 
         String text = extractPdfText(pdf);
-        assertTrue(text.contains("Transaction Receipt"));
+        // [P1-i18n-1 / 1855] PDF potvrda je na srpskom (kohezivno sa mejlovima)
+        assertTrue(text.contains("Potvrda o transakciji"));
         assertTrue(text.contains("101"));
         assertTrue(text.contains("2026-03-15 14:30:00"));
+        // tip transakcije je masinski enum — ostaje engleski
         assertTrue(text.contains("PAYMENT"));
-        assertTrue(text.contains("OUTGOING"));
+        assertTrue(text.contains("Odlazna"));
         assertTrue(text.contains("265-0000000012345-78"));
         assertTrue(text.contains("265-0000000098765-43"));
         assertTrue(text.contains("15000.5"));
         assertTrue(text.contains("RSD"));
         assertTrue(text.contains("Uplata za racun 2025-03"));
+        // engleske labele vise ne smeju da se pojave
+        assertFalse(text.contains("Transaction Receipt"));
+        assertFalse(text.contains("OUTGOING"));
     }
 
     // ================================================================
@@ -84,7 +89,7 @@ class PaymentReceiptPdfGeneratorTest {
         byte[] pdf = generator.generate(dto);
         String text = extractPdfText(pdf);
 
-        assertTrue(text.contains("INCOMING"));
+        assertTrue(text.contains("Dolazna"));
         assertTrue(text.contains("TRANSFER"));
         assertTrue(text.contains("500"));
         assertTrue(text.contains("EUR"));
@@ -140,11 +145,11 @@ class PaymentReceiptPdfGeneratorTest {
 
         String text = extractPdfText(pdf);
         // Null fields should produce "-" placeholders
-        assertTrue(text.contains("Transaction Receipt"));
+        assertTrue(text.contains("Potvrda o transakciji"));
         assertTrue(text.contains("404"));
         // Date, type, account, toAccount, currency, description should all be "-"
-        // Direction: debit is null -> not positive -> "INCOMING"
-        assertTrue(text.contains("INCOMING"));
+        // Direction: debit is null -> not positive -> "Dolazna"
+        assertTrue(text.contains("Dolazna"));
         // Amount: debit not positive, credit is null -> "0"
         assertTrue(text.contains("0"));
     }
@@ -173,7 +178,7 @@ class PaymentReceiptPdfGeneratorTest {
         // From account, to account, currency, description should all be "-"
         assertTrue(text.contains("-"));
         assertTrue(text.contains("505"));
-        assertTrue(text.contains("OUTGOING"));
+        assertTrue(text.contains("Odlazna"));
     }
 
     // ================================================================
@@ -244,7 +249,7 @@ class PaymentReceiptPdfGeneratorTest {
         byte[] pdf = generator.generate(dto);
         String text = extractPdfText(pdf);
 
-        assertTrue(text.contains("INCOMING"));
+        assertTrue(text.contains("Dolazna"));
         assertTrue(text.contains("9999.99"));
     }
 
@@ -270,5 +275,49 @@ class PaymentReceiptPdfGeneratorTest {
 
         // stripTrailingZeros on 1000.0000 -> "1E+3" toPlainString -> "1000"
         assertTrue(text.contains("1000"));
+    }
+
+    // ================================================================
+    // 10. [P1-i18n-1 / 1855] Srpske labele renderuju (sa dijakritikom);
+    //     nijedan engleski label se ne pojavljuje u potvrdi.
+    // ================================================================
+    @Test
+    void generate_labelsAreSerbian_noEnglishLabels() throws Exception {
+        TransactionResponseDto dto = TransactionResponseDto.builder()
+                .id(1010L)
+                .accountNumber("265-0000000000001-01")
+                .toAccountNumber("265-0000000000002-02")
+                .currencyCode("RSD")
+                .description("Račun za struju")
+                .type(TransactionType.PAYMENT)
+                .debit(new BigDecimal("1234.56"))
+                .credit(BigDecimal.ZERO)
+                .createdAt(LocalDateTime.of(2026, 4, 1, 10, 0, 0))
+                .build();
+
+        byte[] pdf = generator.generate(dto);
+        String text = extractPdfText(pdf);
+
+        // Srpske labele (sa dijakritikom — embedovan Open Sans ih renderuje)
+        assertTrue(text.contains("Potvrda o transakciji"));
+        assertTrue(text.contains("Broj transakcije"));
+        assertTrue(text.contains("Datum"));
+        assertTrue(text.contains("Smer"));
+        assertTrue(text.contains("Sa računa"));
+        assertTrue(text.contains("Na račun"));
+        assertTrue(text.contains("Iznos"));
+        assertTrue(text.contains("Valuta"));
+        assertTrue(text.contains("Opis"));
+        // korisnicki opis sa dijakritikom takodje renderuje (ne '?')
+        assertTrue(text.contains("Račun za struju"));
+
+        // engleske labele ne smeju vise da postoje
+        assertFalse(text.contains("Transaction Receipt"));
+        assertFalse(text.contains("Transaction ID"));
+        assertFalse(text.contains("From account"));
+        assertFalse(text.contains("To Account"));
+        assertFalse(text.contains("Direction"));
+        assertFalse(text.contains("OUTGOING"));
+        assertFalse(text.contains("INCOMING"));
     }
 }

@@ -19,6 +19,8 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Servis za automatsko generisanje opcija za sve STOCK listinge.
@@ -84,6 +86,60 @@ public class OptionGeneratorService {
     private static final DateTimeFormatter TICKER_DATE_FORMAT = DateTimeFormatter.ofPattern("yyMMdd");
 
     /**
+     * Ask spread multiplikator (+5%) — ask = price × 1.05. Centralizovan ovde
+     * (R1 761) i deljen sa {@link OptionMaintenanceService#recalculatePrices()}
+     * kroz {@link #askFrom(BigDecimal)} / {@link #bidFrom(BigDecimal)}, da se ista
+     * magic vrednost ne duplira na dva mesta.
+     */
+    public static final BigDecimal ASK_SPREAD_MULTIPLIER = BigDecimal.valueOf(1.05);
+
+    /** Bid spread multiplikator (−5%) — bid = price × 0.95 (vidi {@link #ASK_SPREAD_MULTIPLIER}). */
+    public static final BigDecimal BID_SPREAD_MULTIPLIER = BigDecimal.valueOf(0.95);
+
+    /** Donja granica nasumicnog volumena (broj ugovora) pri generisanju opcije. */
+    private static final long VOLUME_MIN = 100L;
+
+    /** Raspon nasumicnog volumena iznad {@link #VOLUME_MIN} (100..10000). */
+    private static final long VOLUME_SPAN = 9900L;
+
+    /** Donja granica nasumicne implied volatility-ja (15%). */
+    private static final double IV_MIN = 0.15;
+
+    /** Raspon nasumicne implied volatility-ja iznad {@link #IV_MIN} (0.15..0.60). */
+    private static final double IV_SPAN = 0.45;
+
+    /**
+     * R1 760: izvor nasumicnosti za IV/volume. Default {@code null} → prod koristi
+     * {@link ThreadLocalRandom} (kao i pre, ne-deterministicki). Testovi mogu da
+     * postave seedovani {@link Random} preko {@link #setRandom(Random)} da bi
+     * generisanje opcija bilo REPRODUCIBILNO (npr. snapshot/property test).
+     */
+    private Random random;
+
+    /**
+     * R1 760: postavlja seedovani RNG za reproducibilno generisanje (samo test).
+     * Prod ne poziva ovo → {@code random} ostaje {@code null} → {@link #nextDouble()}
+     * pada na {@link ThreadLocalRandom}.
+     */
+    public void setRandom(Random random) {
+        this.random = random;
+    }
+
+    private double nextDouble() {
+        return random != null ? random.nextDouble() : ThreadLocalRandom.current().nextDouble();
+    }
+
+    /** Ask cena iz teorijske cene: {@code price × 1.05}, scale 4 HALF_UP. */
+    public static BigDecimal askFrom(BigDecimal price) {
+        return price.multiply(ASK_SPREAD_MULTIPLIER).setScale(4, RoundingMode.HALF_UP);
+    }
+
+    /** Bid cena iz teorijske cene: {@code price × 0.95}, scale 4 HALF_UP. */
+    public static BigDecimal bidFrom(BigDecimal price) {
+        return price.multiply(BID_SPREAD_MULTIPLIER).setScale(4, RoundingMode.HALF_UP);
+    }
+
+    /**
      * Generise opcije za jednu akciju.
      *
      * @param stock Listing entitet za koji se generisu opcije (mora biti STOCK tip)
@@ -105,7 +161,7 @@ public class OptionGeneratorService {
             if (optionRepository.existsByStockListingIdAndSettlementDate(stock.getId(), date)) continue;
             for (BigDecimal strike : strikes) {
                 double T = ChronoUnit.DAYS.between(LocalDate.now(), date) / 365.0;
-                double sigma = 0.15 + Math.random() * 0.45;
+                double sigma = IV_MIN + nextDouble() * IV_SPAN;
                 double S = currentPrice.doubleValue();
                 double K = strike.doubleValue();
 
@@ -147,9 +203,9 @@ public class OptionGeneratorService {
         option.setSettlementDate(date);
         option.setImpliedVolatility(sigma);
         option.setPrice(price);
-        option.setAsk(price.multiply(BigDecimal.valueOf(1.05)).setScale(4, RoundingMode.HALF_UP));
-        option.setBid(price.multiply(BigDecimal.valueOf(0.95)).setScale(4, RoundingMode.HALF_UP));
-        option.setVolume((long) (100 + Math.random() * 9900));
+        option.setAsk(askFrom(price));
+        option.setBid(bidFrom(price));
+        option.setVolume((long) (VOLUME_MIN + nextDouble() * VOLUME_SPAN));
         option.setOpenInterest(0);
         option.setContractSize(CONTRACT_SIZE);
         option.setMaintenanceMargin(computeMaintenanceMargin(stock.getPrice()));
@@ -171,10 +227,29 @@ public class OptionGeneratorService {
      * @return maintenance margin, zaokruzeno na 4 decimale (HALF_UP)
      */
     protected BigDecimal computeMaintenanceMargin(BigDecimal stockPrice) {
+        return computeMaintenanceMargin(CONTRACT_SIZE, stockPrice);
+    }
+
+    /**
+     * P2-state-machine-1 (R1 458 / R3 1615): javni overload koji postuje STVARNI
+     * {@code contractSize} opcije (ne hardkodiran 100). Koristi ga
+     * {@link OptionMaintenanceService#recalculatePrices()} da, kad se cena akcije
+     * promeni, OSVEZI i maintenance margin (= {@code ContractSize × 50% × StockPrice})
+     * zajedno sa Black-Scholes cenom. Ranije je dnevni recalc menjao samo
+     * {@code price/ask/bid} a margin je ostajao na vrednosti od dana generisanja —
+     * uz volatilnu akciju stale margin je mogao biti do ~2× pogresan (under-collateral
+     * za prikaz/buduce user-side writing-e).
+     *
+     * @param contractSize broj akcija po ugovoru (>= 1)
+     * @param stockPrice   trenutna cena osnovne akcije
+     * @return maintenance margin, zaokruzeno na 4 decimale (HALF_UP)
+     */
+    public BigDecimal computeMaintenanceMargin(int contractSize, BigDecimal stockPrice) {
         if (stockPrice == null) {
             return BigDecimal.ZERO.setScale(4, RoundingMode.HALF_UP);
         }
-        return BigDecimal.valueOf(CONTRACT_SIZE)
+        int effectiveSize = contractSize > 0 ? contractSize : CONTRACT_SIZE;
+        return BigDecimal.valueOf(effectiveSize)
                 .multiply(MAINTENANCE_MARGIN_FACTOR)
                 .multiply(stockPrice)
                 .setScale(4, RoundingMode.HALF_UP);

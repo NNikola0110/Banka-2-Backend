@@ -14,7 +14,6 @@ import rs.raf.banka2_bek.otp.service.OtpService;
 import rs.raf.banka2_bek.transfers.dto.*;
 import rs.raf.banka2_bek.transfers.service.TransferService;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -75,8 +74,11 @@ public class TransferController {
             @RequestParam(required = false) @org.springframework.format.annotation.DateTimeFormat(iso = org.springframework.format.annotation.DateTimeFormat.ISO.DATE) java.time.LocalDate fromDate,
             @RequestParam(required = false) @org.springframework.format.annotation.DateTimeFormat(iso = org.springframework.format.annotation.DateTimeFormat.ISO.DATE) java.time.LocalDate toDate
     ) {
+        // R1-652 (error-contract): kad nema autentifikovanog klijenta (anon ili
+        // ne-CLIENT principal) vrati 401, NE prazan 200 — prazan-200 je krio "nisi
+        // prijavljen" kao "nemas transfere". /transfers je client-only resurs.
         Client client = getOptionalClient();
-        if (client == null) return ResponseEntity.ok(Collections.emptyList());
+        if (client == null) return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         return ResponseEntity.ok(transferService.getAllTransfers(client, accountNumber, fromDate, toDate));
     }
 

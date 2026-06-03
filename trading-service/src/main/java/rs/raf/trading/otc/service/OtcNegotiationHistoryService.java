@@ -12,7 +12,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import rs.raf.trading.otc.dto.OtcNegotiationHistoryDto;
 import rs.raf.trading.otc.model.OtcNegotiationHistory;
+import rs.raf.trading.otc.model.OtcOffer;
 import rs.raf.trading.otc.repository.OtcNegotiationHistoryRepository;
+import rs.raf.trading.otc.repository.OtcOfferRepository;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -33,6 +35,12 @@ import java.util.List;
 public class OtcNegotiationHistoryService {
 
     private final OtcNegotiationHistoryRepository historyRepository;
+
+    // P1-authz-idor-1 (R1 208): single-ID istorija je bila samo authenticated() →
+    // svaki CLIENT je enumeracijom citao tudje cene/premije. Razresava ucesnika
+    // preko izvorne ponude (negotiationId == OtcOffer.id) + admin/supervisor oversight.
+    private final OtcOfferRepository offerRepository;
+    private final OtcAccessGuard accessGuard;
 
     /**
      * Kreira i cuva novi {@link OtcNegotiationHistory} zapis. Pozivati unutar
@@ -67,6 +75,23 @@ public class OtcNegotiationHistoryService {
                 historyRepository.findByNegotiationIdOrderByCreatedAtAsc(negotiationId);
         if (entries.isEmpty()) {
             throw new IllegalArgumentException("Pregovor nije pronadjen");
+        }
+        // P1-authz-idor-1 (R1 208): IDOR guard — samo ucesnik pregovora (buyer/seller
+        // izvorne ponude) ili admin/supervizor sme da cita istoriju cena/premija.
+        // negotiationId je logicki FK ka OtcOffer.id. Ako je izvorna ponuda vec
+        // obrisana (istorija prezivljava brisanje), oversight (admin/supervisor)
+        // jos uvek prolazi; obican korisnik bez ponude za proveru → 403.
+        OtcOffer offer = offerRepository.findById(negotiationId).orElse(null);
+        if (offer == null) {
+            if (!accessGuard.isAdminOrSupervisor()) {
+                throw new AccessDeniedException(
+                        "Niste ucesnik ovog OTC pregovora (istorije pregovora).");
+            }
+        } else {
+            accessGuard.ensureParticipantOrOversight(
+                    offer.getBuyerId(), offer.getBuyerRole(),
+                    offer.getSellerId(), offer.getSellerRole(),
+                    "istorije pregovora");
         }
         return entries.stream().map(this::toDto).toList();
     }

@@ -76,4 +76,45 @@ class InAppGenericEmailTemplateTest {
         // Naslov treba da bude i u <title> i u <h1> headeru
         assertThat(body.indexOf("Obaveštenje o plaćanju")).isLessThan(body.lastIndexOf("Obaveštenje o plaćanju"));
     }
+
+    // ── [P1-notif-svc-1 / 1528 / 1742] HTML injection ──────────────────────
+
+    @Test
+    void buildBody_escapesHtmlInBody_noScriptInjection() {
+        String body = template.buildBody("Ana", "Naslov",
+                "<script>alert('xss')</script><img src=x onerror=alert(1)>");
+        assertThat(body).doesNotContain("<script>");
+        assertThat(body).doesNotContain("<img src=x");
+        assertThat(body).contains("&lt;script&gt;");
+        assertThat(body).contains("&lt;img");
+    }
+
+    @Test
+    void buildBody_escapesHtmlInTitle() {
+        String body = template.buildBody("Ana", "<b>injected</b>", "Sadrzaj");
+        assertThat(body).doesNotContain("<b>injected</b>");
+        assertThat(body).contains("&lt;b&gt;injected&lt;/b&gt;");
+    }
+
+    @Test
+    void buildBody_escapesHtmlInFirstName() {
+        String body = template.buildBody("<a href='evil'>Marko</a>", "Naslov", "Sadrzaj");
+        assertThat(body).doesNotContain("<a href='evil'>");
+        assertThat(body).contains("&lt;a href=");
+    }
+
+    @Test
+    void buildBody_escapesAmpersandCompanyName() {
+        // Naziv firme "A&B <Co>" sme da prolazi (citljiv) ali kao tekst, ne markup
+        String body = template.buildBody("A&B <Co>", "Naslov", "Sadrzaj");
+        assertThat(body).contains("A&amp;B &lt;Co&gt;");
+    }
+
+    @Test
+    void buildBody_preservesSerbianLatinCharacters() {
+        // HtmlUtils ne dira ne-ASCII — srpska latinica/dijakritici ostaju citljivi
+        String body = template.buildBody("Đorđe", "Obaveštenje", "Vaš nalog je ažuriran čćšđž.");
+        assertThat(body).contains("Đorđe");
+        assertThat(body).contains("ažuriran čćšđž");
+    }
 }

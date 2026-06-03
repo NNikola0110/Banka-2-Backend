@@ -576,7 +576,72 @@ class InternalFundsControllerIntegrationTest {
         assertThat(reloadedTo.getBalance()).isEqualByComparingTo("0.00");
     }
 
+    // ─── N4: idempotency-status read-back (consumed?) ────────────────────────
+
+    /**
+     * <b>N4 (P0-T2):</b> posle uspesnog idempotentnog poziva (credit), GET
+     * /internal/funds/idempotency/{key} mora vratiti {@code consumed=true} — autoritativan
+     * read-back banka-core dedup store-a koji OTC SAGA recovery koristi za C3 odluku.
+     */
+    @Test
+    void idempotencyStatus_afterConsumed_returnsTrue() throws Exception {
+        Account account = persistAccount("222000000000000050", "RSD", new BigDecimal("1000.00"));
+        String idempotencyKey = "it-idemstatus-consumed-001";
+        String body = """
+                { "accountId": %d, "amount": 100.00, "commission": 0,
+                  "currencyCode": "RSD", "description": "credit za idem-status test" }
+                """.formatted(account.getId());
+        ResponseEntity<String> credit = restTemplate.postForEntity(
+                url("/internal/funds/credit"),
+                new HttpEntity<>(body, internalHeaders(idempotencyKey)), String.class);
+        assertThat(credit.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                url("/internal/funds/idempotency/" + idempotencyKey),
+                HttpMethod.GET, new HttpEntity<>(internalGetHeaders()), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode json = objectMapper.readTree(resp.getBody());
+        assertThat(json.path("idempotencyKey").asText()).isEqualTo(idempotencyKey);
+        assertThat(json.path("consumed").asBoolean()).isTrue();
+    }
+
+    /**
+     * <b>N4 (P0-T2):</b> za NEPOZNAT (nekonzumiran) kljuc GET vraca {@code consumed=false}
+     * BEZ izvrsavanja ikakve operacije — recovery time bira commit-only refund (prodavac NETAKNUT).
+     */
+    @Test
+    void idempotencyStatus_unknownKey_returnsFalse() throws Exception {
+        ResponseEntity<String> resp = restTemplate.exchange(
+                url("/internal/funds/idempotency/it-idemstatus-unknown-999"),
+                HttpMethod.GET, new HttpEntity<>(internalGetHeaders()), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode json = objectMapper.readTree(resp.getBody());
+        assertThat(json.path("idempotencyKey").asText()).isEqualTo("it-idemstatus-unknown-999");
+        assertThat(json.path("consumed").asBoolean()).isFalse();
+    }
+
+    /**
+     * <b>N4 (P0-T2):</b> idempotency-status endpoint je INTERNI (X-Internal-Key zasticen) —
+     * bez kljuca vraca 401 (InternalAuthFilter pokriva i nove /internal/funds/** GET rute).
+     */
+    @Test
+    void idempotencyStatus_missingInternalKey_returns401() {
+        HttpHeaders headers = new HttpHeaders();
+        ResponseEntity<String> resp = restTemplate.exchange(
+                url("/internal/funds/idempotency/whatever"),
+                HttpMethod.GET, new HttpEntity<>(headers), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
     // ─── Helpers ──────────────────────────────────────────────────────────────
+
+    private HttpHeaders internalGetHeaders() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Internal-Key", internalKey);
+        return headers;
+    }
 
     private HttpHeaders internalHeaders(String idempotencyKey) {
         HttpHeaders headers = new HttpHeaders();
@@ -676,8 +741,8 @@ class InternalFundsControllerIntegrationTest {
 
     /**
      * Persistuje bankin BANK_TRADING racun (company-owned) u datoj valuti.
-     * creditBankCommission ga razresava preko
-     * findFirstByAccountCategoryAndCurrency_Code(BANK_TRADING, ...).
+     * creditBankCommission ga razresava preko (P0-B3) PESSIMISTIC_WRITE
+     * findByAccountCategoryAndCurrencyCodeForUpdate(BANK_TRADING, ...).
      */
     private Account persistBankTradingAccount(String currencyCode, BigDecimal balance) {
         long currencyId = findOrCreateCurrency(currencyCode);

@@ -17,16 +17,24 @@ import rs.raf.banka2_bek.account.repository.AccountRepository;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.currency.model.Currency;
 import rs.raf.banka2_bek.exchange.ExchangeService;
-import rs.raf.banka2_bek.exchange.dto.CalculateExchangeResponseDto;
 import rs.raf.banka2_bek.exchange.dto.ExchangeRateDto;
 import rs.raf.banka2_bek.payment.dto.CreatePaymentRequestDto;
 import rs.raf.banka2_bek.payment.dto.PaymentResponseDto;
 import rs.raf.banka2_bek.payment.model.PaymentCode;
 import rs.raf.banka2_bek.payment.model.Payment;
 import rs.raf.banka2_bek.payment.model.PaymentStatus;
+import rs.raf.banka2_bek.payment.exception.OtpInvalidException;
+import rs.raf.banka2_bek.payment.exception.OtpLockedException;
+import rs.raf.banka2_bek.payment.exception.PaymentAlreadyFinalizedException;
+import rs.raf.banka2_bek.payment.exception.PaymentNotFoundException;
+import rs.raf.banka2_bek.payment.exception.PaymentNotOwnedException;
+import rs.raf.banka2_bek.payment.exception.PaymentTimeoutException;
+import rs.raf.banka2_bek.payment.exception.QuickApproveSettlementNotWiredException;
 import rs.raf.banka2_bek.payment.repository.PaymentAccountRepository;
 import rs.raf.banka2_bek.payment.repository.PaymentRepository;
 import rs.raf.banka2_bek.payment.service.implementation.PaymentServiceImpl;
+import rs.raf.banka2_bek.otp.service.OtpService;
+import org.springframework.test.util.ReflectionTestUtils;
 import rs.raf.banka2_bek.notification.NotificationPublisher;
 import rs.raf.banka2_bek.notification.service.NotificationService;
 import rs.raf.banka2_bek.interbank.service.BankRoutingService;
@@ -82,6 +90,8 @@ class PaymentServiceImplTest {
     private NotificationService notificationService;
     @Mock
     private rs.raf.banka2_bek.audit.service.AuditLogService auditLogService;
+    @Mock
+    private OtpService otpService;
 
     private PaymentServiceImpl paymentService;
 
@@ -100,6 +110,9 @@ class PaymentServiceImplTest {
                 bankRoutingService, transactionExecutorService,
                 interbankPaymentAsyncService, interbankTransactionRepository,
                 "22200022", notificationService, auditLogService);
+
+        // OtpService je @Autowired private field (ne ide kroz ctor) — inject mock preko reflection.
+        ReflectionTestUtils.setField(paymentService, "otpService", otpService);
 
         lenient().when(bankRoutingService.isLocalAccount(any())).thenReturn(true);
 
@@ -194,8 +207,8 @@ class PaymentServiceImplTest {
                 .thenReturn(Optional.of(bankEurAccount));
         when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD"))
                 .thenReturn(Optional.of(bankUsdAccount));
-        when(exchangeService.calculateCross(100.0, "EUR", "USD"))
-                .thenReturn(new CalculateExchangeResponseDto(108.01843318, 1.0801843318, "EUR", "USD"));
+        when(exchangeService.calculateCrossExact(new BigDecimal("100.00"), "EUR", "USD"))
+                .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("108.02"), new BigDecimal("1.080184")));
 
         when(paymentRepository.saveAndFlush(any(Payment.class))).thenAnswer(inv -> {
             Payment p = inv.getArgument(0);
@@ -213,9 +226,9 @@ class PaymentServiceImplTest {
         assertThat(fromAccount.getBalance()).isEqualByComparingTo("899.50000");
         assertThat(fromAccount.getAvailableBalance()).isEqualByComparingTo("899.50000");
 
-        // credited amount = 108.01843318
-        assertThat(toAccount.getBalance()).isEqualByComparingTo("608.01843318");
-        assertThat(toAccount.getAvailableBalance()).isEqualByComparingTo("608.01843318");
+        // credited amount = 108.02 (BigDecimal money scale 2, bez sub-cent repa)
+        assertThat(toAccount.getBalance()).isEqualByComparingTo("608.02");
+        assertThat(toAccount.getAvailableBalance()).isEqualByComparingTo("608.02");
 
         ArgumentCaptor<Payment> paymentCaptor = ArgumentCaptor.forClass(Payment.class);
         verify(paymentRepository).saveAndFlush(paymentCaptor.capture());
@@ -225,7 +238,7 @@ class PaymentServiceImplTest {
                 any(Payment.class),
                 eq(toAccount),
                 eq(client),
-                argThat(credited -> credited.compareTo(new BigDecimal("108.01843318")) == 0)
+                argThat(credited -> credited.compareTo(new BigDecimal("108.02")) == 0)
         );
     }
 
@@ -313,8 +326,11 @@ class PaymentServiceImplTest {
 
     @Test
     void createPayment_throwsWhenFromAccountInactive() {
+        // P2-concurrency-locks-1 (R3-1581): lokalni flow sada zakljucava OBA racuna
+        // kanonski PRE posiljalac-validacije → primalac mora biti stub-ovan.
         fromAccount.setStatus(AccountStatus.INACTIVE);
         when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
+        when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
 
         assertThatThrownBy(() -> paymentService.createPayment(request))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -345,11 +361,14 @@ class PaymentServiceImplTest {
 
     @Test
     void createPayment_throwsWhenFromAccountNotOwnedByAuthenticatedUser() {
+        // P2-concurrency-locks-1 (R3-1581): lokalni flow zakljucava OBA racuna kanonski
+        // PRE vlasnistvo-provere → primalac mora biti stub-ovan.
         Client other = new Client();
         other.setId(777L);
         fromAccount.setClient(other);
 
         when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
+        when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
 
         assertThatThrownBy(() -> paymentService.createPayment(request))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -441,7 +460,10 @@ class PaymentServiceImplTest {
     void createPayment_throwsWhenAuthenticationMissing() {
         SecurityContextHolder.clearContext();
 
+        // P2-concurrency-locks-1 (R3-1581): lokalni flow zakljucava OBA racuna kanonski
+        // PRE auth-provere → primalac mora biti stub-ovan da se auth grana dosegne.
         when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
+        when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
 
         assertThatThrownBy(() -> paymentService.createPayment(request))
                 .isInstanceOf(IllegalArgumentException.class);
@@ -478,36 +500,145 @@ class PaymentServiceImplTest {
                 .hasMessageContaining("Transaction with ID 55 not found");
     }
 
-//    @Test
-//    void createPayment_throwsWhenPrincipalIsNotUserDetails() {
-//        SecurityContextHolder.getContext().setAuthentication(
-//                new UsernamePasswordAuthenticationToken(
-//                        "rawPrincipal",
-//                        null,
-//                        List.of(new SimpleGrantedAuthority("ROLE_CLIENT"))
-//                )
-//        );
-//
-//        when(accountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
-//        when(accountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
-//
-//        assertThatThrownBy(() -> paymentService.createPayment(request))
-//                .isInstanceOf(IllegalArgumentException.class)
-//                .hasMessageContaining("Authenticated user is required");
-//    }
-//
-//    @Test
-//    void createPayment_throwsWhenAuthenticatedUserNotFoundInDb() {
-//        authenticateAs("missing@test.com");
-//        when(userRepository.findByEmail("missing@test.com")).thenReturn(Optional.empty());
-//
-//        when(accountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
-//        when(accountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
-//
-//        assertThatThrownBy(() -> paymentService.createPayment(request))
-//                .isInstanceOf(IllegalArgumentException.class)
-//                .hasMessageContaining("Authenticated client does not exist");
-//    }
+    // ========== getPaymentById — P2-1 IDOR ownership guard ==========
+
+    @Test
+    void getPaymentById_returnsPaymentWhenClientIsPayer() {
+        // fromAccount pripada autentifikovanom klijentu -> sme da vidi placanje.
+        Payment payment = Payment.builder()
+                .id(42L)
+                .orderNumber("PAY-ABC")
+                .fromAccount(fromAccount)
+                .toAccountNumber(request.getToAccount())
+                .amount(new BigDecimal("100.00"))
+                .fee(BigDecimal.ZERO)
+                .currency(eur)
+                .status(PaymentStatus.COMPLETED)
+                .createdBy(client)
+                .createdAt(LocalDateTime.now())
+                .build();
+        when(paymentRepository.findById(42L)).thenReturn(Optional.of(payment));
+
+        PaymentResponseDto response = paymentService.getPaymentById(42L);
+
+        assertThat(response.getId()).isEqualTo(42L);
+        assertThat(response.getDirection().name()).isEqualTo("OUTGOING");
+    }
+
+    @Test
+    void getPaymentById_returnsPaymentWhenClientIsRecipient() {
+        // fromAccount pripada drugom klijentu, ali toAccountNumber je lokalni
+        // racun autentifikovanog klijenta -> primalac sme da vidi placanje.
+        Client other = new Client();
+        other.setId(777L);
+        Account otherFrom = baseAccount(5L, "555555555555555555", other, eur, new BigDecimal("1000.00"));
+        Account myRecipient = baseAccount(6L, "666666666666666666", client, eur, new BigDecimal("200.00"));
+
+        Payment payment = Payment.builder()
+                .id(43L)
+                .orderNumber("PAY-DEF")
+                .fromAccount(otherFrom)
+                .toAccountNumber(myRecipient.getAccountNumber())
+                .amount(new BigDecimal("50.00"))
+                .fee(BigDecimal.ZERO)
+                .currency(eur)
+                .status(PaymentStatus.COMPLETED)
+                .createdBy(other)
+                .createdAt(LocalDateTime.now())
+                .build();
+        when(paymentRepository.findById(43L)).thenReturn(Optional.of(payment));
+        when(accountRepository.findByAccountNumber(myRecipient.getAccountNumber()))
+                .thenReturn(Optional.of(myRecipient));
+
+        PaymentResponseDto response = paymentService.getPaymentById(43L);
+
+        assertThat(response.getId()).isEqualTo(43L);
+        assertThat(response.getDirection().name()).isEqualTo("INCOMING");
+    }
+
+    @Test
+    void getPaymentById_throwsWhenClientIsNotParty() {
+        // P2-1 IDOR: placanje izmedju dva DRUGA klijenta — autentifikovani klijent
+        // nije ni platilac ni primalac -> PaymentNotOwnedException (HTTP 403),
+        // ne sme da vidi tudje podatke (iznos, racuni, primalac, svrha).
+        Client other = new Client();
+        other.setId(777L);
+        Account otherFrom = baseAccount(7L, "777777777777777777", other, eur, new BigDecimal("1000.00"));
+
+        Payment payment = Payment.builder()
+                .id(44L)
+                .orderNumber("PAY-GHI")
+                .fromAccount(otherFrom)
+                .toAccountNumber("888888888888888888")
+                .amount(new BigDecimal("999.00"))
+                .fee(BigDecimal.ZERO)
+                .currency(eur)
+                .status(PaymentStatus.COMPLETED)
+                .createdBy(other)
+                .createdAt(LocalDateTime.now())
+                .build();
+        when(paymentRepository.findById(44L)).thenReturn(Optional.of(payment));
+        // toAccountNumber nije lokalni racun klijenta (ili je u drugoj banci)
+        when(accountRepository.findByAccountNumber("888888888888888888"))
+                .thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> paymentService.getPaymentById(44L))
+                .isInstanceOf(rs.raf.banka2_bek.payment.exception.PaymentNotOwnedException.class)
+                .hasMessageContaining("ne pripada korisniku");
+    }
+
+    @Test
+    void getPaymentById_throwsNotFoundWhenPaymentMissing() {
+        // R1 330: nepostojece placanje je 404 (PaymentNotFoundException), ne 400.
+        when(paymentRepository.findById(404L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> paymentService.getPaymentById(404L))
+                .isInstanceOf(rs.raf.banka2_bek.payment.exception.PaymentNotFoundException.class)
+                .hasMessageContaining("nije pronadjeno");
+    }
+
+    @Test
+    void createPayment_throwsWhenPrincipalIsNotUserDetails() {
+        // Edge case: principal nije UserDetails (npr. anonimni/raw string token).
+        // getAuthenticatedUsername() odbije takav principal, pa getAuthenticatedClient()
+        // ne uspe da razresi klijenta -> IllegalArgumentException("Klijent nije pronadjen.").
+        SecurityContextHolder.getContext().setAuthentication(
+                new UsernamePasswordAuthenticationToken(
+                        "rawPrincipal",
+                        null,
+                        List.of(new SimpleGrantedAuthority("ROLE_CLIENT"))
+                )
+        );
+
+        // P2-concurrency-locks-1 (R3-1581): lokalni flow zakljucava OBA racuna kanonski
+        // PRE auth-provere → primalac mora biti stub-ovan da se klijent-grana dosegne.
+        when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount()))
+                .thenReturn(Optional.of(fromAccount));
+        when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount()))
+                .thenReturn(Optional.of(toAccount));
+
+        assertThatThrownBy(() -> paymentService.createPayment(request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Klijent nije pronadjen");
+    }
+
+    @Test
+    void createPayment_throwsWhenAuthenticatedUserNotFoundInDb() {
+        // Edge case: autentifikovan korisnik (validan UserDetails) ali bez Client zapisa u bazi.
+        // getAuthenticatedClient() vrati null -> IllegalArgumentException("Klijent nije pronadjen.").
+        authenticateAs("missing@test.com");
+        when(clientRepository.findByEmail("missing@test.com")).thenReturn(Optional.empty());
+
+        // P2-concurrency-locks-1 (R3-1581): lokalni flow zakljucava OBA racuna kanonski PRE auth.
+        when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount()))
+                .thenReturn(Optional.of(fromAccount));
+        when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount()))
+                .thenReturn(Optional.of(toAccount));
+
+        assertThatThrownBy(() -> paymentService.createPayment(request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Klijent nije pronadjen");
+    }
 
 
     // ========== validatePayment ==========
@@ -636,6 +767,44 @@ class PaymentServiceImplTest {
         when(accountRepository.findByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
         when(accountRepository.findByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
         paymentService.validatePayment(request); // no exception
+    }
+
+    // ── TEST-interbank-4: validatePayment preflight za INTERBANK toAccount ──
+    // Za medjubankarsko placanje (toAccount na udaljenoj banci) primalacev racun
+    // NE postoji u nasoj lokalnoj bazi, pa preflight (/request-otp) NE sme da padne
+    // na "Racun primaoca ne postoji" — inace klijent nikad ne dobije OTP za
+    // interbank uplatu. Validira se SAMO posiljalac + sredstva (bez source-side
+    // provizije; FX/proviziju radi Banka B).
+
+    @Test
+    void validatePayment_interbankToAccount_doesNotThrowAccountNotExists_TEST_interbank_4() {
+        // toAccount je na udaljenoj banci → isLocalAccount(toAccount)=false → interbank.
+        when(bankRoutingService.isLocalAccount(request.getToAccount())).thenReturn(false);
+        when(accountRepository.findByAccountNumber(request.getFromAccount()))
+                .thenReturn(Optional.of(fromAccount));
+        // toAccount NIJE u lokalnoj bazi (vraca empty) — pre fix-a bi ovo bacilo
+        // "Racun primaoca ne postoji".
+        lenient().when(accountRepository.findByAccountNumber(request.getToAccount()))
+                .thenReturn(Optional.empty());
+
+        // KLJUCNA invarijanta: preflight NE baca za nepostojeci-lokalno interbank racun.
+        paymentService.validatePayment(request);
+
+        // Lokalni toAccount lookup se ne sme ni izvrsiti (interbank grana ga preskace).
+        verify(accountRepository, never()).findByAccountNumber(request.getToAccount());
+    }
+
+    @Test
+    void validatePayment_interbankToAccount_stillEnforcesSenderFunds_TEST_interbank_4() {
+        // Interbank grana ne sme da preskoci proveru sredstava posiljaoca.
+        when(bankRoutingService.isLocalAccount(request.getToAccount())).thenReturn(false);
+        fromAccount.setAvailableBalance(new BigDecimal("5.00"));
+        when(accountRepository.findByAccountNumber(request.getFromAccount()))
+                .thenReturn(Optional.of(fromAccount));
+
+        assertThatThrownBy(() -> paymentService.validatePayment(request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Nedovoljno sredstava");
     }
 
     // ========== recordAbortedPayment ==========
@@ -772,6 +941,150 @@ class PaymentServiceImplTest {
 
         // Payment se i dalje uspesno cuva
         assertThat(id).isEqualTo(456L);
+    }
+
+    // ===================================================================
+    // Quick Approve (Mobile bonus #7) — defensive money-safety guard.
+    // ===================================================================
+
+    private Payment buildOwnedPayment(PaymentStatus status) {
+        return Payment.builder()
+                .id(77L)
+                .orderNumber("ORD-77")
+                .fromAccount(fromAccount)          // fromAccount.client == client (owner)
+                .toAccountNumber("999999999999999999")
+                .amount(new BigDecimal("50.00"))
+                .fee(BigDecimal.ZERO)
+                .currency(eur)
+                .paymentCode(PaymentCode.CODE_289.getCode())
+                .referenceNumber("REF-77")
+                .purpose("QA test")
+                .status(status)
+                .createdBy(client)
+                .createdAt(LocalDateTime.now())     // unutar 5min TTL
+                .build();
+    }
+
+    @Test
+    void quickApprove_alreadyCompletedOwnedPayment_isIdempotentSuccessNoSideEffects() {
+        Payment completed = buildOwnedPayment(PaymentStatus.COMPLETED);
+        when(paymentRepository.findById(77L)).thenReturn(Optional.of(completed));
+
+        PaymentResponseDto res = paymentService.quickApprove(77L, client.getEmail(), "123456");
+
+        // Idempotent: vraca postojeci COMPLETED payload bez ikakvog novog dispatch-a.
+        assertThat(res).isNotNull();
+        assertThat(res.getId()).isEqualTo(77L);
+        assertThat(res.getStatus()).isEqualTo(PaymentStatus.COMPLETED);
+        // Nista se ne menja: bez OTP-a, bez save-a, bez notifikacije, bez audit-a.
+        verify(otpService, never()).verify(anyString(), anyString());
+        verify(paymentRepository, never()).save(any());
+        verify(notificationService, never()).notify(any(), any(), any(), any(), any(), any(), any());
+        verifyNoInteractions(auditLogService);
+    }
+
+    @Test
+    void quickApprove_nonCompletedPayment_afterOtpOk_throwsNotWired_neverCompletes() {
+        Payment pending = buildOwnedPayment(PaymentStatus.PROCESSING);
+        when(paymentRepository.findById(77L)).thenReturn(Optional.of(pending));
+        // OTP prolazi -> dolazimo do koraka 7 (defensive guard).
+        when(otpService.verify(client.getEmail(), "123456"))
+                .thenReturn(java.util.Map.of("verified", true, "blocked", false));
+
+        assertThatThrownBy(() -> paymentService.quickApprove(77L, client.getEmail(), "123456"))
+                .isInstanceOf(QuickApproveSettlementNotWiredException.class)
+                .hasMessageContaining("Phase-2 FCM");
+
+        // KRITICNO: payment NIJE markiran COMPLETED, nema lazne completion-e.
+        assertThat(pending.getStatus()).isEqualTo(PaymentStatus.PROCESSING);
+        verify(paymentRepository, never()).save(any());
+        // Nema "placanje odobreno" notifikacije/audita za ne-settle-ovan payment.
+        verify(notificationService, never()).notify(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void quickApprove_processingPayment_afterOtpOk_throwsNotWired_neverCompletes() {
+        // 2PC inter-bank payment je PROCESSING — quickApprove ne sme da ga finalizuje.
+        Payment processing = buildOwnedPayment(PaymentStatus.PROCESSING);
+        when(paymentRepository.findById(77L)).thenReturn(Optional.of(processing));
+        when(otpService.verify(client.getEmail(), "123456"))
+                .thenReturn(java.util.Map.of("verified", true, "blocked", false));
+
+        assertThatThrownBy(() -> paymentService.quickApprove(77L, client.getEmail(), "123456"))
+                .isInstanceOf(QuickApproveSettlementNotWiredException.class);
+
+        assertThat(processing.getStatus()).isEqualTo(PaymentStatus.PROCESSING);
+        verify(paymentRepository, never()).save(any());
+    }
+
+    @Test
+    void quickApprove_paymentNotFound_throws404() {
+        when(paymentRepository.findById(77L)).thenReturn(Optional.empty());
+        assertThatThrownBy(() -> paymentService.quickApprove(77L, client.getEmail(), "123456"))
+                .isInstanceOf(PaymentNotFoundException.class);
+    }
+
+    @Test
+    void quickApprove_notOwnedByUser_throwsNotOwned() {
+        Client other = new Client();
+        other.setId(999L);
+        Account otherAcc = baseAccount(5L, "555555555555555555", other, eur, new BigDecimal("100.00"));
+        Payment notMine = Payment.builder()
+                .id(77L).fromAccount(otherAcc).toAccountNumber("1").amount(new BigDecimal("10.00"))
+                .currency(eur).status(PaymentStatus.PROCESSING).createdBy(other)
+                .createdAt(LocalDateTime.now()).build();
+        when(paymentRepository.findById(77L)).thenReturn(Optional.of(notMine));
+
+        assertThatThrownBy(() -> paymentService.quickApprove(77L, client.getEmail(), "123456"))
+                .isInstanceOf(PaymentNotOwnedException.class);
+        verify(otpService, never()).verify(anyString(), anyString());
+    }
+
+    @Test
+    void quickApprove_alreadyAborted_throwsFinalized409() {
+        Payment aborted = buildOwnedPayment(PaymentStatus.ABORTED);
+        when(paymentRepository.findById(77L)).thenReturn(Optional.of(aborted));
+
+        assertThatThrownBy(() -> paymentService.quickApprove(77L, client.getEmail(), "123456"))
+                .isInstanceOf(PaymentAlreadyFinalizedException.class);
+        verify(otpService, never()).verify(anyString(), anyString());
+    }
+
+    @Test
+    void quickApprove_ttlExpired_throwsTimeout() {
+        Payment stale = buildOwnedPayment(PaymentStatus.PROCESSING);
+        stale.setCreatedAt(LocalDateTime.now().minusMinutes(10)); // van 5min TTL-a
+        when(paymentRepository.findById(77L)).thenReturn(Optional.of(stale));
+
+        assertThatThrownBy(() -> paymentService.quickApprove(77L, client.getEmail(), "123456"))
+                .isInstanceOf(PaymentTimeoutException.class);
+        verify(otpService, never()).verify(anyString(), anyString());
+    }
+
+    @Test
+    void quickApprove_wrongOtp_throwsOtpInvalid_neverReachesGuard() {
+        Payment pending = buildOwnedPayment(PaymentStatus.PROCESSING);
+        when(paymentRepository.findById(77L)).thenReturn(Optional.of(pending));
+        when(otpService.verify(client.getEmail(), "000000"))
+                .thenReturn(java.util.Map.of("verified", false, "blocked", false, "message", "Pogresan kod."));
+
+        assertThatThrownBy(() -> paymentService.quickApprove(77L, client.getEmail(), "000000"))
+                .isInstanceOf(OtpInvalidException.class);
+        assertThat(pending.getStatus()).isEqualTo(PaymentStatus.PROCESSING);
+        verify(paymentRepository, never()).save(any());
+    }
+
+    @Test
+    void quickApprove_otpBlocked_throwsOtpLocked() {
+        Payment pending = buildOwnedPayment(PaymentStatus.PROCESSING);
+        when(paymentRepository.findById(77L)).thenReturn(Optional.of(pending));
+        when(otpService.verify(client.getEmail(), "000000"))
+                .thenReturn(java.util.Map.of("verified", false, "blocked", true, "message", "Zakljucano."));
+
+        assertThatThrownBy(() -> paymentService.quickApprove(77L, client.getEmail(), "000000"))
+                .isInstanceOf(OtpLockedException.class);
+        assertThat(pending.getStatus()).isEqualTo(PaymentStatus.PROCESSING);
+        verify(paymentRepository, never()).save(any());
     }
 
     private void authenticateAs(String email) {

@@ -131,6 +131,11 @@ services:
       # host 8081 ostaje samo za direktan debug pristup monolitu.
       - "${BACKEND_HOST_PORT:-8081}:8080"
     environment:
+      # [P1-i18n-1 / 1858] TZ + JVM locale — bez ovoga JVM radi u UTC + root locale:
+      # money grouping/decimal separator nedeterministicki (1,234.56 umesto srpskog
+      # 1.234,56) i LocalDateTime wall-clock pomeren 1-2h (DST) u prikazu/potvrdama.
+      TZ: Europe/Belgrade
+      JAVA_TOOL_OPTIONS: "-Duser.language=sr -Duser.country=RS"
       # Primary (read-write) — DDL + INSERT/UPDATE/DELETE + bilo sta van readOnly transakcija.
       SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/banka2
       SPRING_DATASOURCE_USERNAME: banka2user
@@ -152,6 +157,13 @@ services:
       SPRING_JPA_SHOW_SQL: "false"
       SPRING_JPA_PROPERTIES_HIBERNATE_DIALECT: org.hibernate.dialect.PostgreSQLDialect
       SPRING_JPA_PROPERTIES_HIBERNATE_TYPE_PREFERRED_BOOLEAN_JDBC_TYPE: INTEGER
+      # N4 (SEC): JWT signing key — banka-core sada FAIL-FAST-uje bez njega
+      # (application.properties: ${JWT_SECRET:?...}, javni hardkodovan default
+      # uklonjen). `${JWT_SECRET:?...}` ovde cini da i `docker compose up`
+      # padne odmah ako env nije postavljen (cp .env.example .env, pa edit).
+      # T4 coupling: MORA biti isti string kao na trading-service-u (linija ~364)
+      # — tokeni se cross-verifikuju izmedju banka-core i trading-service.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required - cp .env.example .env then edit (mora biti isti kao trading-service)}
       # Auth rate limit (Bucket4j) — production radi 10 req/min/IP, ali za
       # E2E test sesije (Cypress live) capacity se podize na 100k da test
       # suite ne hituje 429. NAPOMENA: enabled MORA biti `true` jer
@@ -159,6 +171,16 @@ services:
       # bean-a (nije Optional). Sa capacity=100k filter je no-op u praksi.
       AUTH_RATE_LIMIT_ENABLED: ${AUTH_RATE_LIMIT_ENABLED:-true}
       AUTH_RATE_LIMIT_CAPACITY: ${AUTH_RATE_LIMIT_CAPACITY:-100000}
+      # P1-auth-2 (R1 105): GET /payments/my-otp plaintext-uje 2FA kod, pa je
+      # default ISKLJUCEN (404) — application.properties default je false. Lokalni
+      # dev/docker ga moze ukljuciti za mobilni mock OTP flow; u produkciji NIKAD
+      # ne smije biti true (rate-limit + dev-mock surface).
+      PAYMENTS_EXPOSE_ACTIVE_OTP: ${PAYMENTS_EXPOSE_ACTIVE_OTP:-true}
+      # P1-auth-2 (R2 1367): rate-limit bucket veruje X-Forwarded-For SAMO ako je
+      # BE iza poznatog reverse proxy-ja (api-gateway nginx). Direktan port (8081)
+      # je izlozen bez proxy-ja, pa default je false -> XFF se ignorise (remoteAddr).
+      # Docker stack ide kroz nginx gateway -> true (XFF nosi pravi client IP).
+      AUTH_RATE_LIMIT_TRUST_XFF: ${AUTH_RATE_LIMIT_TRUST_XFF:-true}
       # Inter-bank protokol — Banka 1 (Tim 1) base URL. Tim 1 izlaze
       # nginx gateway na host portu 80. Iz nasi backend container-a
       # pristupamo preko host.docker.internal alias-a (extra_hosts).
@@ -357,11 +379,18 @@ services:
     ports:
       - "8082:8082"
     environment:
+      # [P1-i18n-1 / 1858] TZ + JVM locale (vidi backend) — deterministicki
+      # money format + lokalni wall-clock za scheduler/timestamp.
+      TZ: Europe/Belgrade
+      JAVA_TOOL_OPTIONS: "-Duser.language=sr -Duser.country=RS"
       TRADING_DB_URL: jdbc:postgresql://trading_db:5432/trading
       TRADING_DB_USER: tradinguser
       # SEC-02: trading-service cita istu lozinku kao trading_db servis.
       TRADING_DB_PASSWORD: ${POSTGRES_TRADING_PASSWORD:?POSTGRES_TRADING_PASSWORD required - cp .env.example .env then edit}
-      JWT_SECRET: ${JWT_SECRET:-dev-only-jwt-secret-do-not-use-in-prod-rotate-via-env-var-on-each-deploy}
+      # N4-a/N4-b (SEC): FAIL-FAST — shell fallback na javni default uklonjen.
+      # `${JWT_SECRET:?...}` cini da `docker compose up` padne odmah ako env nije
+      # postavljen. MORA biti isti string kao banka-core (tokeni se cross-verifikuju).
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required - cp .env.example .env then edit (mora biti isti kao banka-core)}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-key-rotate-in-prod}
       BANKACORE_BASE_URL: http://backend:8080
       # RabbitMQ — pod-faza 2f-5a: trading-service publish-uje
@@ -405,14 +434,21 @@ services:
     ports:
       - "8083:8083"
     environment:
+      # [P1-i18n-1 / 1858] TZ + JVM locale (vidi backend) — mejlovi su srpski
+      # (<html lang="sr">); ovo cini money format (TransactionEmailTemplate)
+      # i datume deterministicki srpskim nezavisno od base-image lokala.
+      TZ: Europe/Belgrade
+      JAVA_TOOL_OPTIONS: "-Duser.language=sr -Duser.country=RS"
       SPRING_RABBITMQ_HOST: rabbitmq
       SPRING_RABBITMQ_PORT: "5672"
       SPRING_RABBITMQ_USERNAME: guest
       SPRING_RABBITMQ_PASSWORD: guest
       MAIL_USERNAME: ${MAIL_USERNAME:-banka2.notifications@gmail.com}
       MAIL_PASSWORD: ${MAIL_PASSWORD:-}
-      NOTIFICATION_ACTIVATION_URL_BASE: http://localhost:3000
-      NOTIFICATION_PASSWORD_RESET_URL_BASE: http://localhost:3000
+      # R2 1407 config-drift fix: parametrizovano (default localhost za dev) — bez ovoga
+      # non-localhost deploy salje aktivacioni/reset email link na localhost:3000.
+      NOTIFICATION_ACTIVATION_URL_BASE: ${FRONTEND_PUBLIC_URL:-http://localhost:3000}
+      NOTIFICATION_PASSWORD_RESET_URL_BASE: ${FRONTEND_PUBLIC_URL:-http://localhost:3000}
     depends_on:
       rabbitmq:
         condition: service_healthy

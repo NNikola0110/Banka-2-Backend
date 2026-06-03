@@ -12,7 +12,14 @@ import java.time.LocalDateTime;
  * i baza-po-servisu; banka-core i trading-service svaki ima svoju kopiju).
  */
 @Entity
-@Table(name = "audit_logs")
+// R5 1971: findFiltered filtrira po action_type + actor_id, findByTargetTypeAndTargetId
+// po (target_type, target_id). Bez indeksa su to seq-scan-ovi nad rastucom audit
+// tabelom. Mirror banka-core AuditLog indeksa (oba servisa imaju svoju audit_logs).
+@Table(name = "audit_logs", indexes = {
+        @Index(name = "idx_audit_actor_id", columnList = "actor_id"),
+        @Index(name = "idx_audit_action_type", columnList = "action_type"),
+        @Index(name = "idx_audit_target", columnList = "target_type, target_id")
+})
 @Getter
 @Setter
 @NoArgsConstructor

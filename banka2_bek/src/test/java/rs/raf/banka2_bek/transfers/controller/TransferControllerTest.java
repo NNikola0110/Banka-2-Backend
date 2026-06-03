@@ -274,29 +274,30 @@ class TransferControllerTest {
                 .andExpect(jsonPath("$[0].fromAccountNumber").value("111111111111111111"));
     }
 
+    // R1-652 (P3-bc-transfer-exchange-loan-savings-1): nepostojeci/anoniman klijent
+    // dobija 401, NE prazan 200 — /transfers je client-only resurs i prazan-200 je
+    // krio "nisi prijavljen" kao "nemas transfere".
     @Test
-    @DisplayName("GET /transfers - 200 OK empty when client not found")
-    void getAllTransfers_clientNotFound_returnsEmpty() throws Exception {
+    @DisplayName("GET /transfers - 401 when client not found")
+    void getAllTransfers_clientNotFound_returns401() throws Exception {
         setupSecurityContext("unknown@banka.rs");
         when(clientRepository.findByEmail("unknown@banka.rs")).thenReturn(Optional.empty());
 
         mockMvc.perform(get("/transfers")
                         .contentType(MediaType.APPLICATION_JSON))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$", hasSize(0)));
+                .andExpect(status().isUnauthorized());
     }
 
     @Test
-    @DisplayName("GET /transfers - 200 OK empty when no authentication")
-    void getAllTransfers_noAuth_returnsEmpty() throws Exception {
+    @DisplayName("GET /transfers - 401 when no authentication")
+    void getAllTransfers_noAuth_returns401() throws Exception {
         SecurityContext secCtx = mock(SecurityContext.class);
         when(secCtx.getAuthentication()).thenReturn(null);
         SecurityContextHolder.setContext(secCtx);
 
         mockMvc.perform(get("/transfers")
                         .contentType(MediaType.APPLICATION_JSON))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$", hasSize(0)));
+                .andExpect(status().isUnauthorized());
     }
 
     // ══════════════════════════════════════════════════════════════════

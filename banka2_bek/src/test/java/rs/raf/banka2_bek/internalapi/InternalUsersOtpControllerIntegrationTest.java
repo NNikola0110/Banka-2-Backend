@@ -166,6 +166,56 @@ class InternalUsersOtpControllerIntegrationTest {
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
     }
 
+    // ─── OT-1061: getSupervisorIds (real H2 + JPQL ElementCollection join) ────
+
+    @Test
+    void getSupervisorIds_returnsOnlyActiveSupervisorIds_OT1061() throws Exception {
+        Employee supervisorActive = persistEmployeeWithPermissions(
+                "sup-active@test.com", true, Set.of("SUPERVISOR", "TRADE_STOCKS"));
+        Employee supervisorActive2 = persistEmployeeWithPermissions(
+                "sup-active2@test.com", true, Set.of("SUPERVISOR"));
+        // Neaktivan supervizor → NE sme da se vrati.
+        persistEmployeeWithPermissions("sup-inactive@test.com", false, Set.of("SUPERVISOR"));
+        // Agent bez SUPERVISOR permisije → NE sme da se vrati.
+        persistEmployeeWithPermissions("agent@test.com", true, Set.of("AGENT", "TRADE_STOCKS"));
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                url("/internal/users/supervisors"),
+                HttpMethod.GET, new HttpEntity<>(internalHeaders()), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode json = objectMapper.readTree(resp.getBody());
+        assertThat(json.isArray()).isTrue();
+        java.util.List<Long> ids = new java.util.ArrayList<>();
+        json.forEach(n -> ids.add(n.asLong()));
+        assertThat(ids).containsExactlyInAnyOrder(
+                supervisorActive.getId(), supervisorActive2.getId());
+    }
+
+    @Test
+    void getSupervisorIds_noSupervisors_returnsEmptyArray_OT1061() throws Exception {
+        // Samo jedan agent, nijedan supervizor.
+        persistEmployeeWithPermissions("only-agent@test.com", true, Set.of("AGENT"));
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                url("/internal/users/supervisors"),
+                HttpMethod.GET, new HttpEntity<>(internalHeaders()), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode json = objectMapper.readTree(resp.getBody());
+        assertThat(json.isArray()).isTrue();
+        assertThat(json.size()).isZero();
+    }
+
+    @Test
+    void getSupervisorIds_missingInternalKey_returns401_OT1061() {
+        ResponseEntity<String> resp = restTemplate.exchange(
+                url("/internal/users/supervisors"),
+                HttpMethod.GET, new HttpEntity<>(new HttpHeaders()), String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
     // ─── missing X-Internal-Key → 401 ────────────────────────────────────────
 
     @Test
@@ -278,6 +328,24 @@ class InternalUsersOtpControllerIntegrationTest {
                 .department("IT")
                 .active(true)
                 .permissions(Set.of())
+                .build());
+    }
+
+    private Employee persistEmployeeWithPermissions(String email, boolean active, Set<String> permissions) {
+        return employeeRepository.save(Employee.builder()
+                .firstName("Sup").lastName("Ervisor")
+                .dateOfBirth(LocalDate.of(1985, 1, 1))
+                .gender("F")
+                .email(email)
+                .phone("+381600000002")
+                .address("Test")
+                .username("emp-perm-" + email)
+                .password("x")
+                .saltPassword("salt")
+                .position("Direktor")
+                .department("IT")
+                .active(active)
+                .permissions(permissions)
                 .build());
     }
 

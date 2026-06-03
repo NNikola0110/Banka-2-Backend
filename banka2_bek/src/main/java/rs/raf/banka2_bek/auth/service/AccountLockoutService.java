@@ -7,13 +7,13 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import rs.raf.banka2_bek.auth.model.User;
 import rs.raf.banka2_bek.auth.repository.UserRepository;
+import rs.raf.banka2_bek.auth.util.EmailMasker;
 import rs.raf.banka2_bek.employee.model.Employee;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.notification.NotificationPublisher;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
-import java.util.Locale;
 import java.util.Optional;
 
 /**
@@ -49,7 +49,8 @@ public class AccountLockoutService {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void assertNotLocked(String email) {
         if (email == null) return;
-        LockableAccount account = findAccount(email).orElse(null);
+        // R1-618: mutira (clearLockExpiry kad lock istekne) → pessimistic-lock read.
+        LockableAccount account = findAccountForUpdate(email).orElse(null);
         if (account == null) return;
 
         if (isLockActive(account.getLockedUntil())) {
@@ -69,7 +70,9 @@ public class AccountLockoutService {
     @Transactional(propagation = Propagation.REQUIRES_NEW, noRollbackFor = AccountLockedException.class)
     public void recordFailure(String email) {
         if (email == null) return;
-        LockableAccount account = findAccount(email).orElse(null);
+        // R1-618: read-modify-write brojaca → pessimistic-lock read serijalizuje
+        // paralelne neuspele login-e (bez ovoga oba mogu da inkrementiraju na N+1).
+        LockableAccount account = findAccountForUpdate(email).orElse(null);
         if (account == null) return;
 
         if (isLockActive(account.getLockedUntil())) {
@@ -84,11 +87,13 @@ public class AccountLockoutService {
             LocalDateTime lockUntil = LocalDateTime.now().plusMinutes(lockDurationMinutes);
             account.setLockedUntil(lockUntil);
             account.save();
-            log.warn("Account locked: {} ({} failed attempts)", normalize(email), attempts);
+            // [P2-input-validation-1 / R4 1781] maskiraj email u logu (PII).
+            log.warn("Account locked: {} ({} failed attempts)", EmailMasker.mask(email), attempts);
             try {
                 notificationPublisher.sendAccountLockedMail(account.getEmail(), lockDurationMinutes);
             } catch (Exception e) {
-                log.error("Failed to publish account locked notification for {}", account.getEmail(), e);
+                log.error("Failed to publish account locked notification for {}",
+                        EmailMasker.mask(account.getEmail()), e);
             }
             long secondsRemaining = secondsUntil(lockUntil);
             throw new AccountLockedException(formatLockoutMessage(secondsRemaining), secondsRemaining);
@@ -103,7 +108,8 @@ public class AccountLockoutService {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void recordSuccess(String email) {
         if (email == null) return;
-        LockableAccount account = findAccount(email).orElse(null);
+        // R1-618: reset brojaca je takodje write → pessimistic-lock read.
+        LockableAccount account = findAccountForUpdate(email).orElse(null);
         if (account == null) return;
 
         account.setFailedAttempts(0);
@@ -111,7 +117,13 @@ public class AccountLockoutService {
         account.save();
     }
 
-    /** Vraca trenutni broj neuspesnih pokusaja; 0 ako nalog ne postoji. */
+    /**
+     * Vraca trenutni broj neuspesnih pokusaja; 0 ako nalog ne postoji.
+     * R1-621: VISIBLE-FOR-TESTING — produkcioni kod ne cita brojac direktno
+     * (login putanja koristi {@code recordFailure}/{@code recordSuccess}); jedini
+     * pozivalac je {@code AccountLockoutServiceTest}. Ne uklanjamo jer je koristan
+     * read-only inspektor za testove i moguci future admin/audit endpoint.
+     */
     @Transactional(readOnly = true)
     public int getFailureCount(String email) {
         if (email == null) return 0;
@@ -120,7 +132,11 @@ public class AccountLockoutService {
                 .orElse(0);
     }
 
-    /** Vraca true ako je email trenutno lock-ovan. */
+    /**
+     * Vraca true ako je email trenutno lock-ovan.
+     * R1-621: VISIBLE-FOR-TESTING — vidi {@link #getFailureCount}; produkcija
+     * koristi {@code assertNotLocked} (koja baca), ne ovaj boolean helper.
+     */
     @Transactional(readOnly = true)
     public boolean isLocked(String email) {
         if (email == null) return false;
@@ -129,20 +145,35 @@ public class AccountLockoutService {
                 .orElse(false);
     }
 
+    /** Read-only lookup (getFailureCount/isLocked) — bez pessimistic lock-a. */
     private Optional<LockableAccount> findAccount(String email) {
-        String normalized = normalize(email);
-        Optional<Employee> employee = employeeRepository.findByEmail(normalized);
-        if (employee.isEmpty()) {
-            employee = employeeRepository.findByEmail(email.trim());
-        }
+        return resolveAccount(email, false);
+    }
+
+    /**
+     * R1-618: locking lookup za mutirajuce putanje — koristi
+     * {@code findByEmailIgnoreCaseForUpdate} (PESSIMISTIC_WRITE) da serijalizuje
+     * read-modify-write na {@code failedLoginAttempts} brojacu.
+     */
+    private Optional<LockableAccount> findAccountForUpdate(String email) {
+        return resolveAccount(email, true);
+    }
+
+    private Optional<LockableAccount> resolveAccount(String email, boolean forUpdate) {
+        // P1-auth-2 (R2 1365): case-insensitive lookup poravnat sa AuthService.login
+        // (oba sad koriste findByEmailIgnoreCase) — lockout brojac i login lookup
+        // razresavaju ISTI nalog bez obzira na case (npr. "User@x" vs "user@x").
+        String trimmed = email.trim();
+        Optional<Employee> employee = forUpdate
+                ? employeeRepository.findByEmailIgnoreCaseForUpdate(trimmed)
+                : employeeRepository.findByEmailIgnoreCase(trimmed);
         if (employee.isPresent()) {
             return Optional.of(new EmployeeLockable(employee.get(), employeeRepository));
         }
 
-        Optional<User> user = userRepository.findByEmail(normalized);
-        if (user.isEmpty()) {
-            user = userRepository.findByEmail(email.trim());
-        }
+        Optional<User> user = forUpdate
+                ? userRepository.findByEmailIgnoreCaseForUpdate(trimmed)
+                : userRepository.findByEmailIgnoreCase(trimmed);
         return user.map(u -> new UserLockable(u, userRepository));
     }
 
@@ -158,10 +189,6 @@ public class AccountLockoutService {
         long minutes = Math.max(1, secondsRemaining / 60 + (secondsRemaining % 60 > 0 ? 1 : 0));
         return "Nalog je privremeno zakljucan zbog previse neuspesnih pokusaja. "
                 + "Pokusajte ponovo za " + minutes + " min.";
-    }
-
-    private String normalize(String email) {
-        return email.trim().toLowerCase(Locale.ROOT);
     }
 
     private interface LockableAccount {

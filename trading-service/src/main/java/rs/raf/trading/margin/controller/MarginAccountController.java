@@ -12,6 +12,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
+import rs.raf.trading.margin.dto.CreateCompanyMarginAccountDto;
 import rs.raf.trading.margin.dto.CreateMarginAccountDto;
 import rs.raf.trading.margin.dto.MarginAccountDto;
 import rs.raf.trading.margin.dto.MarginTransactionDto;
@@ -24,7 +25,9 @@ import java.util.Map;
 /**
  * REST kontroler za margin racune.
  * Endpointovi:
- *   POST /margin-accounts                     - kreiranje margin racuna
+ *   POST /margin-accounts                     - kreiranje margin racuna (klijent)
+ *   POST /margin-accounts/company              - kreiranje marznog racuna kompanije (zaposleni)
+ *   GET  /margin-accounts/company/{companyId}  - marzni racun kompanije (zaposleni)
  *   GET  /margin-accounts/my                   - moji margin racuni
  *   GET  /margin-accounts/{id}                 - detalji margin racuna
  *   POST /margin-accounts/{id}/deposit         - uplata na margin racun
@@ -60,6 +63,48 @@ public class MarginAccountController {
             @Valid @RequestBody CreateMarginAccountDto dto,
             Authentication authentication) {
         return ResponseEntity.ok(marginAccountService.createForUser(dto));
+    }
+
+    /**
+     * POST /margin-accounts/company
+     * BE-STK-06: kreira marzni racun za kompaniju (Marzni_Racuni.txt §43-55).
+     * Samo zaposleni (supervizor/admin); identitet zaposlenog je iz JWT-a
+     * (telo {@code employeeId} se ne prihvata).
+     */
+    @Operation(summary = "Create company margin account",
+            description = "Creates a margin account owned by a company. Employee-only. "
+                    + "The employee supplies explicit InitialMargin/MaintenanceMargin/BankParticipation. "
+                    + "One margin account per company.")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Company margin account created"),
+            @ApiResponse(responseCode = "400", description = "Validation failure, base account not RSD/active, "
+                    + "insufficient funds, or company already has a margin account"),
+            @ApiResponse(responseCode = "403", description = "Not authenticated or caller is not an employee")
+    })
+    @PostMapping("/company")
+    public ResponseEntity<MarginAccountDto> createForCompany(
+            @Valid @RequestBody CreateCompanyMarginAccountDto dto,
+            Authentication authentication) {
+        return ResponseEntity.ok(marginAccountService.createForCompany(dto));
+    }
+
+    /**
+     * GET /margin-accounts/company/{companyId}
+     * BE-STK-06: vraca marzni racun kompanije (Marzni_Racuni.txt §61). Zaposleni-only.
+     */
+    @Operation(summary = "Get company margin account",
+            description = "Returns the margin account for a company by companyId. Employee-only.")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Company margin account",
+                    content = @Content(schema = @Schema(implementation = MarginAccountDto.class))),
+            @ApiResponse(responseCode = "403", description = "Not authenticated or caller is not an employee"),
+            @ApiResponse(responseCode = "404", description = "Company has no margin account")
+    })
+    @GetMapping("/company/{companyId}")
+    public ResponseEntity<MarginAccountDto> getCompanyMarginAccount(
+            @Parameter(description = "Company ID") @PathVariable Long companyId,
+            Authentication authentication) {
+        return ResponseEntity.ok(marginAccountService.getCompanyMarginAccount(companyId));
     }
 
     /**

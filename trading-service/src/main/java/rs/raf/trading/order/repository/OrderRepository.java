@@ -28,8 +28,6 @@ public interface OrderRepository extends JpaRepository<Order, Long>, JpaSpecific
     @Query("SELECT o FROM Order o WHERE o.id = :id")
     Optional<Order> findByIdForUpdate(@Param("id") Long id);
 
-    Page<Order> findByUserId(Long userId, Pageable pageable);
-
     List<Order> findByStatusAndIsDoneFalse(OrderStatus status);
 
     List<Order> findByUserIdAndUserRole(Long userId, String userRole);
@@ -37,11 +35,6 @@ public interface OrderRepository extends JpaRepository<Order, Long>, JpaSpecific
            "AND o.status IN (rs.raf.trading.order.model.OrderStatus.PENDING, " +
            "rs.raf.trading.order.model.OrderStatus.APPROVED)")
     List<Order> findActiveNonDone();
-
-    @Query("SELECT COALESCE(SUM(CASE WHEN o.direction = rs.raf.trading.order.model.OrderDirection.BUY " +
-           "THEN o.quantity ELSE -o.quantity END), 0) FROM Order o " +
-           "WHERE o.userId = :userId AND o.listing.id = :listingId AND o.isDone = true")
-    int getNetPortfolioQuantity(@Param("userId") Long userId, @Param("listingId") Long listingId);
 
     List<Order> findByIsDoneTrue();
 }

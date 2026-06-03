@@ -10,7 +10,12 @@ public class ActivationEmailTemplate {
     }
 
     public String buildBody(String activationLink, String firstName) {
-        String greeting = (firstName != null && !firstName.isBlank()) ? firstName : "there";
+        // [P2-input-validation-1 / R1 385] escape user-controlled firstName pre
+        // interpolacije u HTML telo. activationLink je sistemski-generisan (token
+        // URL iz banka-core), ne user-controlled — ne escape-uje se da se ne bi
+        // izoblicili query parametri.
+        String greeting = EmailHtml.escape(
+                (firstName != null && !firstName.isBlank()) ? firstName : "there");
         return """
                 <!DOCTYPE html>
                 <html lang="sr">

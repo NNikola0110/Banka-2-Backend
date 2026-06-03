@@ -7,6 +7,7 @@ import org.springframework.data.domain.Sort;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import rs.raf.banka2_bek.auth.exception.EmailAlreadyExistsException;
 import rs.raf.banka2_bek.auth.model.User;
 import rs.raf.banka2_bek.auth.repository.UserRepository;
 import rs.raf.banka2_bek.client.dto.ClientResponseDto;
@@ -29,8 +30,12 @@ public class ClientServiceImpl implements ClientService {
     @Override
     @Transactional
     public ClientResponseDto createClient(CreateClientRequestDto request) {
-        if (clientRepository.findByEmail(request.getEmail()).isPresent()) {
-            throw new RuntimeException("Klijent sa ovim emailom vec postoji");
+        // R5 1884: duplikat email = 409 Conflict (ne bare RuntimeException→400).
+        // Pre-check je best-effort UX; pravi TOCTOU guard je DB unique constraint na
+        // email (User/Client) → globalni DataIntegrityViolationException→409 handler.
+        if (clientRepository.findByEmail(request.getEmail()).isPresent()
+                || userRepository.existsByEmail(request.getEmail())) {
+            throw new EmailAlreadyExistsException("Klijent sa ovim emailom vec postoji");
         }
 
         String password = (request.getPassword() != null && !request.getPassword().isBlank())
@@ -112,6 +117,30 @@ public class ClientServiceImpl implements ClientService {
         Client client = clientRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Klijent sa ID " + id + " nije pronadjen"));
 
+        // C2 Sc40 (§433): "Prilikom menjanja mejla treba proveriti da je mejl i dalje
+        // unique u bazi." Email se ranije TIHO ignorisao (DTO polje postojalo, ali se
+        // nikad nije citalo). Sada: ako stigne nov email koji se RAZLIKUJE od trenutnog,
+        // proveravamo jedinstvenost preko OBE tabele (clients + users), i sinhronizujemo
+        // promenu na povezani User. Duplikat → EmailAlreadyExistsException → 409 Conflict.
+        String oldEmail = client.getEmail();
+        boolean emailChanged = false;
+        String newEmail = request.getEmail() != null ? request.getEmail().trim() : null;
+        if (newEmail != null && !newEmail.isBlank() && !newEmail.equalsIgnoreCase(oldEmail)) {
+            // Uniqueness provera — drugi klijent ili bilo koji user sa tim email-om.
+            final Long thisClientId = client.getId();
+            boolean takenByClient = clientRepository.findByEmail(newEmail)
+                    .filter(c -> !c.getId().equals(thisClientId))
+                    .isPresent();
+            boolean takenByUser = userRepository.findByEmail(newEmail)
+                    .filter(u -> !u.getEmail().equalsIgnoreCase(oldEmail))
+                    .isPresent();
+            if (takenByClient || takenByUser) {
+                throw new EmailAlreadyExistsException("Email " + newEmail + " je vec u upotrebi.");
+            }
+            client.setEmail(newEmail);
+            emailChanged = true;
+        }
+
         if (request.getFirstName() != null) client.setFirstName(request.getFirstName());
         if (request.getLastName() != null) client.setLastName(request.getLastName());
         if (request.getGender() != null) client.setGender(request.getGender());
@@ -121,12 +150,18 @@ public class ClientServiceImpl implements ClientService {
 
         client = clientRepository.save(client);
 
-        // Sync with users table
-        userRepository.findByEmail(client.getEmail()).ifPresent(user -> {
+        // Sync with users table. Linkovani User se nalazi po STAROM email-u (single
+        // source of truth za login). Ako se email menjao, azuriramo i User.email da
+        // login ostane konzistentan; DB unique constraint na users.email je
+        // konacni TOCTOU guard (DataIntegrityViolationException → 409 globalni handler).
+        final boolean emailChangedFinal = emailChanged;
+        final String newEmailFinal = newEmail;
+        userRepository.findByEmail(oldEmail).ifPresent(user -> {
             if (request.getFirstName() != null) user.setFirstName(request.getFirstName());
             if (request.getLastName() != null) user.setLastName(request.getLastName());
             if (request.getPhone() != null) user.setPhone(request.getPhone());
             if (request.getAddress() != null) user.setAddress(request.getAddress());
+            if (emailChangedFinal) user.setEmail(newEmailFinal);
             userRepository.save(user);
         });
 

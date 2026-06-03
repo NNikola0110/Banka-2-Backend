@@ -151,4 +151,40 @@ class FraudAlertControllerTest {
                         .content(body))
                 .andExpect(status().isBadRequest());
     }
+
+    // ── [P2-input-validation-1 / R1 539] paginacija validacija ──────────────
+
+    @Test
+    @DisplayName("GET /admin/fraud-alerts sa negativnim page -> 400 (ne 500)")
+    void list_negativePage_returns400() throws Exception {
+        mockMvc.perform(get("/admin/fraud-alerts").param("page", "-1"))
+                .andExpect(status().isBadRequest());
+        verify(service, org.mockito.Mockito.never())
+                .findAlerts(any(), any(), org.mockito.ArgumentMatchers.anyBoolean(), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("GET /admin/fraud-alerts sa size<1 -> 400")
+    void list_zeroSize_returns400() throws Exception {
+        mockMvc.perform(get("/admin/fraud-alerts").param("size", "0"))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("GET /admin/fraud-alerts sa ogromnim size -> capped na MAX (nije 500)")
+    void list_hugeSize_cappedNotError() throws Exception {
+        FraudAlertPageDto page = pageOf(sample(1L, null));
+        when(service.findAlerts(isNull(), isNull(), eq(true), any(Pageable.class)))
+                .thenReturn(page);
+
+        org.mockito.ArgumentCaptor<Pageable> captor =
+                org.mockito.ArgumentCaptor.forClass(Pageable.class);
+
+        mockMvc.perform(get("/admin/fraud-alerts").param("size", "1000000"))
+                .andExpect(status().isOk());
+
+        verify(service).findAlerts(isNull(), isNull(), eq(true), captor.capture());
+        org.assertj.core.api.Assertions.assertThat(captor.getValue().getPageSize())
+                .isLessThanOrEqualTo(200);
+    }
 }

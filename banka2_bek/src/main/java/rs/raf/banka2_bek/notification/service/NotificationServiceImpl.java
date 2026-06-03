@@ -9,6 +9,8 @@ import org.springframework.data.domain.Sort;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import rs.raf.banka2.contracts.internal.InternalNotificationRequest;
 import rs.raf.banka2_bek.auth.util.UserRole;
 import rs.raf.banka2_bek.client.model.Client;
@@ -41,6 +43,11 @@ import rs.raf.banka2_bek.notification.repository.NotificationRepository;
  * in-app record is already persisted and must not be rolled back due to an
  * SMTP or broker problem. Any failure during contact resolution (unknown user
  * id / type) is also logged and swallowed here for the same reason.
+ *
+ * <p><b>OT-1819:</b> when invoked inside a transaction, the actual broker publish
+ * is deferred to {@code afterCommit} (see {@link #queueEmail}) so an email is sent
+ * only if the business transaction commits — a rollback never leaves an email sent
+ * for a notification that does not exist in the DB.
  */
 @Slf4j
 @Service
@@ -66,7 +73,9 @@ public class NotificationServiceImpl implements NotificationService {
         // Tipovi koji su samo email (npr. eventualno: marketing) ne pune
         // notification bell. Trenutno svi tipovi imaju sendsInApp=true (cuva
         // backward-compat), ali infra je tu za per-type suppression.
-        if (notificationType.isSendsInApp()) {
+        if (notificationType.isSendsInApp()
+                && !isDuplicateInApp(recipientId, recipientType, notificationType,
+                        referenceType, referenceId)) {
             Notification notification = Notification.builder()
                     .recipientId(recipientId)
                     .recipientType(recipientType)
@@ -86,6 +95,25 @@ public class NotificationServiceImpl implements NotificationService {
     }
 
     /**
+     * <b>P2-notif-reliability-2 (R4 1791): in-app dedup.</b> Vraca {@code true}
+     * ako vec postoji in-app notifikacija za isti dogadjaj — kljuc je
+     * {@code (recipientId, recipientType, type, referenceType, referenceId)}.
+     * Primenjuje se SAMO kad postoji reference (oba referenceType/referenceId
+     * != null); ad-hoc notifikacije bez reference se ne dedupuju (ne mozemo
+     * razlikovati dva razlicita ad-hoc eventa).
+     */
+    private boolean isDuplicateInApp(Long recipientId, String recipientType,
+                                     NotificationType type, String referenceType,
+                                     Long referenceId) {
+        if (referenceType == null || referenceId == null) {
+            return false;
+        }
+        return notificationRepository
+                .existsByRecipientIdAndRecipientTypeAndNotificationTypeAndReferenceTypeAndReferenceId(
+                        recipientId, recipientType, type, referenceType, referenceId);
+    }
+
+    /**
      * Cross-DB ulaz za trading-service in-app notifikacije. Mapira string
      * {@code type} u {@link NotificationType}; ako vrednost ne postoji u
      * banka-core enum-u, koristi {@link NotificationType#GENERAL} kao fallback
@@ -102,6 +130,16 @@ public class NotificationServiceImpl implements NotificationService {
             log.warn("Unknown NotificationType '{}' from trading-service, falling back to GENERAL",
                     request.type());
             type = NotificationType.GENERAL;
+        }
+
+        // R4 1791: in-app dedup i na cross-DB putanji (dodatna odbrana uz
+        // controller-level idempotency-key dedup).
+        if (isDuplicateInApp(request.recipientId(), request.recipientType(), type,
+                request.referenceType(), request.referenceId())) {
+            log.debug("In-app notifikacija je duplikat (recipient={} {}, type={}, ref={}:{}) — preskacem",
+                    request.recipientType(), request.recipientId(), type,
+                    request.referenceType(), request.referenceId());
+            return;
         }
 
         Notification notification = Notification.builder()
@@ -124,7 +162,12 @@ public class NotificationServiceImpl implements NotificationService {
                                                     boolean onlyUnread,
                                                     int page,
                                                     int size) {
-        Pageable pageable = PageRequest.of(page, size, Sort.by("createdAt").descending());
+        // R4 1791: stabilan ordering — createdAt.desc, pa id.desc kao tie-breaker.
+        // Bez id tie-breaker-a, notifikacije sa identicnim createdAt (isti
+        // milisekund, npr. batch insert) imaju nedeterministican redosled izmedju
+        // stranica → ista notifikacija moze da se pojavi/nestane pri paginaciji.
+        Pageable pageable = PageRequest.of(page, size,
+                Sort.by(Sort.Order.desc("createdAt"), Sort.Order.desc("id")));
         Page<Notification> result = onlyUnread
                 ? notificationRepository.findByRecipientIdAndRecipientTypeAndRead(
                         recipientId, recipientType, false, pageable)
@@ -164,26 +207,73 @@ public class NotificationServiceImpl implements NotificationService {
     }
 
     /**
-     * Resolves the recipient's contact details and publishes an
-     * {@code IN_APP_GENERIC} message on RabbitMQ via {@link NotificationPublisher}.
-     * The {@code notification-service} consumer renders the branded generic
-     * email template using the {@code title} and {@code body}.
+     * Resolves the recipient's contact details (inside the current transaction so
+     * the DB reads are valid) and publishes an {@code IN_APP_GENERIC} message on
+     * RabbitMQ via {@link NotificationPublisher}. The {@code notification-service}
+     * consumer renders the branded generic email template using the {@code title}
+     * and {@code body}.
      *
-     * <p>Any failure (unresolvable recipient, broker error inside the publisher)
-     * is logged at WARN level and swallowed — the notification is already
-     * persisted and must not be rolled back due to an email problem.
+     * <p><b>OT-1819 (✅ FIXED 02.06):</b> the broker publish now runs in a
+     * {@link TransactionSynchronization#afterCommit()} callback (same pattern as the
+     * trading-audit / interbank dispatch), so the email is sent ONLY if the surrounding
+     * business transaction commits. Previously the publish happened synchronously
+     * inside the {@code @Transactional notify(...)} method (publish-before-commit) —
+     * a later rollback in the same tx would leave an email sent for a notification
+     * that no longer exists in the DB. When there is no active transaction (e.g. a
+     * non-transactional caller or a unit test) we publish immediately (best-effort).
+     *
+     * <p>Any failure (unresolvable recipient, broker error inside the publisher) is
+     * logged at WARN level and swallowed — the notification is already persisted and
+     * must not be rolled back due to an email problem; a broker error in the
+     * afterCommit callback likewise cannot affect the already-committed business op.
      */
     private void queueEmail(Long recipientId,
                             String recipientType,
                             NotificationType notificationType,
                             String title,
                             String body) {
+        // Resolve contact eagerly (inside the tx — valid DB reads); only the broker
+        // send is deferred to afterCommit.
+        final RecipientContact contact;
         try {
-            RecipientContact contact = resolveContact(recipientId, recipientType);
+            contact = resolveContact(recipientId, recipientType);
+        } catch (Exception e) {
+            log.warn("Could not resolve notification e-mail recipient recipientId={}, type={}",
+                    recipientId, notificationType, e);
+            return;
+        }
+
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            // OT-1819: publish only if the business tx commits (no email for a
+            // notification that gets rolled back).
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    publishEmailSafely(contact, notificationType, title, body, recipientId);
+                }
+            });
+        } else {
+            // No active transaction (best-effort) — publish immediately.
+            publishEmailSafely(contact, notificationType, title, body, recipientId);
+        }
+    }
+
+    /**
+     * OT-1819: wraps the broker publish so a RabbitMQ failure can never break the
+     * already-committed business operation (afterCommit callbacks run outside the
+     * transaction). The publisher itself also swallows broker errors, but this is
+     * defense-in-depth for the afterCommit path.
+     */
+    private void publishEmailSafely(RecipientContact contact,
+                                    NotificationType notificationType,
+                                    String title,
+                                    String body,
+                                    Long recipientId) {
+        try {
             notificationPublisher.sendInAppGenericMail(
                     contact.email(), contact.firstName(), title, body);
         } catch (Exception e) {
-            log.warn("Could not queue notification e-mail for recipientId={}, type={}",
+            log.warn("Could not publish notification e-mail for recipientId={}, type={}",
                     recipientId, notificationType, e);
         }
     }

@@ -31,10 +31,12 @@ import rs.raf.banka2_bek.card.repository.CardRequestRepository;
 import rs.raf.banka2_bek.card.service.CardService;
 import rs.raf.banka2_bek.client.model.Client;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
+import rs.raf.banka2_bek.card.controller.exception_handler.CardExceptionHandler;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.Collections;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.mockito.ArgumentMatchers.*;
@@ -78,7 +80,7 @@ class CardControllerCoverageTest {
         mockMvc = MockMvcBuilders
                 .standaloneSetup(cardController)
                 .setMessageConverters(converter)
-                .setControllerAdvice(new GlobalExceptionHandler())
+                .setControllerAdvice(new CardExceptionHandler(), new GlobalExceptionHandler())
                 .build();
 
         SecurityContextHolder.getContext().setAuthentication(
@@ -116,11 +118,13 @@ class CardControllerCoverageTest {
     @DisplayName("POST /cards/requests - 201 sa validnim cardType MASTERCARD")
     void submitCardRequest_validMastercard() throws Exception {
         Client client = new Client();
+        client.setId(5L);
         client.setFirstName("Marko");
         client.setLastName("Markovic");
         when(clientRepository.findByEmail("employee@banka.rs")).thenReturn(Optional.of(client));
 
-        Account account = Account.builder().id(1L).accountNumber("222000112345678910").build();
+        // P1-authz-idor-1 (R1 114): racun mora pripadati ulogovanom klijentu.
+        Account account = Account.builder().id(1L).accountNumber("222000112345678910").client(client).build();
         when(accountRepository.findById(1L)).thenReturn(Optional.of(account));
 
         when(cardRequestRepository.save(any(CardRequest.class))).thenAnswer(inv -> {
@@ -129,7 +133,7 @@ class CardControllerCoverageTest {
             r.setCreatedAt(LocalDateTime.now());
             return r;
         });
-
+        // ACCEPTED-DEVIATION (user-directed 03.06): zahtev za karticu bez OTP/koda.
         String payload = """
                 {
                   "accountId": 1,

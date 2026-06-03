@@ -14,9 +14,11 @@ Svi u jednom compose-u, port mapped na host:
   Korisnik dobija LLM odmah, bez 5-15min pull-a pri prvom startu.
 - **`banka2_wikipedia_tool`** (port 8090) — FastAPI + wikipedia 1.4 + cachetools TTL 1h
 - **`banka2_rag_tool`** (port 8091) — FastAPI + sentence-transformers + ChromaDB,
-  auto-indeksira 236 spec dokumenata pri prvom startu
+  auto-indeksira spec dokumente pri prvom startu
 - **`banka2_kokoro_tts`** (port 8092) — Kokoro TTS (model `hexgrad/Kokoro-82M`,
   9 podrzanih jezika, voice `af_bella`)
+- **`banka2_whisper_stt`** (host port 8094 → container 8093) — faster-whisper "tiny"
+  STT za voice input (vidi `whisper-stt/README.md`)
 
 ## Quick start (idiot-proof)
 
@@ -120,12 +122,15 @@ curl -X POST http://localhost:8091/search \
 # 4. Kokoro TTS
 curl http://localhost:8092/health
 
-# 5. End-to-end preko BE-a (BE compose mora biti up)
+# 5. Whisper STT
+curl http://localhost:8094/health
+
+# 6. End-to-end preko BE-a (BE compose mora biti up)
 TOKEN=$(curl -s -X POST -H "Content-Type: application/json" \
   -d '{"email":"marko.petrovic@banka.rs","password":"Admin12345"}' \
   http://localhost:8080/auth/login | grep -o '"accessToken":"[^"]*"' | cut -d'"' -f4)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/assistant/health
-# → svi 4 reachable=true posle Ollama pull-a
+# → reachable=true za sidecare posle starta
 ```
 
 ## Lokalni dev bez Docker-a
@@ -161,16 +166,14 @@ docker exec banka2_rag_tool rm /app/chroma_db/.indexed
 docker compose restart rag-tool
 ```
 
-## Arbitro funkcionalnosti (Phase 1-5 KOMPLET)
+## Arbitro funkcionalnosti
 
-- **32 write tools + 8 read = 40 alata** (full backend coverage)
+- **Write + read alati** nad backend domenom (kreiranje placanja, ordera, OTC, fondova, itd.)
 - **Action preview → OTP gate → BE izvrsi → SSE javi confirmed** flow
-- **Interactive wizard (Phase 4.5)**: 15 najvaznijih write akcija sa multi-step izborom
-  opcija (CHOICE/TEXT/NUMBER/CONFIRM) preko SSE `agent_choice` event-a
-- **LLM intent classification (Phase 4.6)**: Gemma 4 E2B sa `tool_choice="required"`
-  + 15 minimal tool schemas — agentic mode bira pravi tool iz prirodnog jezika
-- **Voice IN/OUT**: Gemma 4 native ASR + Kokoro TTS sidecar
-- **Multi-step plan + RAG cache + cross-encoder rerank + multimodal-ready**
+- **Interactive wizard**: multi-step izbor opcija (CHOICE/TEXT/NUMBER/CONFIRM) preko SSE `agent_choice` event-a
+- **LLM intent classification**: Gemma 4 E2B sa `tool_choice="required"` — agentic mode bira tool iz prirodnog jezika
+- **Voice IN/OUT**: Whisper STT + Gemma native ASR (in) + Kokoro TTS (out)
+- **RAG**: ChromaDB embeddings + cross-encoder rerank
 
 ## Cypress test-ovi (lokalno only)
 
@@ -180,11 +183,10 @@ docker compose restart rag-tool
 Ova dva spec fajla **NISU u GH CI** — Arbitro je opcioni Celina 6 i trazi
 LLM + sidecar-e koje GH runner nema.
 
-## Image sizes (multi-stage build optimizacija 03.05.2026)
+## Image sizes (priblizno)
 
-- `banka2_rag_tool`: ~3GB (sa Python venv + sentence-transformers + ChromaDB)
+- `banka2_rag_tool`: ~3GB (Python venv + sentence-transformers + ChromaDB)
 - `banka2_wikipedia_tool`: ~250MB
-- `banka2_kokoro_tts`: ~1.5GB (sa torch + Kokoro model)
-- `banka2_ollama`: ~600MB (base) + 3.5GB Gemma model u volume-u
-
-Reference: `Info o predmetu/LLM_Asistent_Plan.txt` v3.3 §10.3-10.4 i §11.
+- `banka2_kokoro_tts`: ~1.5GB (torch + Kokoro model)
+- `banka2_whisper_stt`: ~1GB (faster-whisper tiny pre-baked)
+- `banka2_ollama`: base + ~7.2GB Gemma 4 E2B model pre-baked u image layer-u

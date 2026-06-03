@@ -31,7 +31,7 @@ To je sve. Posle ~30s sve servise su healthy. Otvori Grafana na <http://localhos
 
 ## Arhitektura
 
-```
+```text
 BE expose-uje  →  Prometheus skrejpuje  →  AlertManager evaluira  →  alert-router  →  Discord webhook
 /actuator/         banka-2-monitoring-     pravila iz                 (Python Flask)
 prometheus         prometheus              alertmanager.yml
@@ -104,11 +104,15 @@ command:
 
 ## Scrape targets
 
-`prometheus/prometheus.yml` skrejpuje:
+`prometheus/prometheus.yml` skrejpuje `/actuator/prometheus` na sva tri Spring
+servisa (HTTP request latency, JVM heap, GC, Hikari pool, custom Micrometer counters):
 
-- **`banka2_backend:8080/actuator/prometheus`** — Spring Boot metrike (HTTP request latency, JVM heap, GC, Hikari connection pool, custom Micrometer counter-i)
+- `banka2_backend:8080` (banka-core)
+- `banka2_trading:8082` (trading-service)
+- `banka2_notification:8083` (notification-service)
 
-Cilj target je dostupan kroz interno docker network ime `banka2_backend` (oba stack-a su u istoj `banka-2-backend_default` mrezi).
+Plus self-scrape prometheus/alertmanager/grafana. Targeti su dostupni kroz interno
+docker network ime (oba stack-a su u istoj `banka-2-backend_default` mrezi).
 
 ## Smoke testovi
 

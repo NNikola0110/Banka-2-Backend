@@ -19,7 +19,6 @@ import rs.raf.banka2_bek.client.model.Client;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.currency.model.Currency;
 import rs.raf.banka2_bek.exchange.ExchangeService;
-import rs.raf.banka2_bek.exchange.dto.CalculateExchangeResponseDto;
 import rs.raf.banka2_bek.exchange.dto.ExchangeRateDto;
 import rs.raf.banka2_bek.payment.dto.CreatePaymentRequestDto;
 import rs.raf.banka2_bek.payment.dto.PaymentDirection;
@@ -163,8 +162,8 @@ class PaymentServiceImplExtendedTest {
             when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
             when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD")).thenReturn(Optional.of(bankUsd));
-            when(exchangeService.calculateCross(100.0, "EUR", "USD"))
-                    .thenReturn(new CalculateExchangeResponseDto(108.0, 1.08, "EUR", "USD"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("100.00"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("108.00"), new BigDecimal("1.08")));
 
             assertThatThrownBy(() -> paymentService.createPayment(request))
                     .isInstanceOf(RuntimeException.class)
@@ -181,8 +180,8 @@ class PaymentServiceImplExtendedTest {
             when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
             when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD")).thenReturn(Optional.empty());
-            when(exchangeService.calculateCross(100.0, "EUR", "USD"))
-                    .thenReturn(new CalculateExchangeResponseDto(108.0, 1.08, "EUR", "USD"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("100.00"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("108.00"), new BigDecimal("1.08")));
 
             assertThatThrownBy(() -> paymentService.createPayment(request))
                     .isInstanceOf(RuntimeException.class)
@@ -202,8 +201,8 @@ class PaymentServiceImplExtendedTest {
             when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD")).thenReturn(Optional.of(bankUsd));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.empty());
-            when(exchangeService.calculateCross(100.0, "EUR", "USD"))
-                    .thenReturn(new CalculateExchangeResponseDto(108.0, 1.08, "EUR", "USD"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("100.00"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("108.00"), new BigDecimal("1.08")));
 
             assertThatThrownBy(() -> paymentService.createPayment(request))
                     .isInstanceOf(RuntimeException.class)
@@ -231,8 +230,8 @@ class PaymentServiceImplExtendedTest {
             when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.of(bankEur));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD")).thenReturn(Optional.of(bankUsd));
-            when(exchangeService.calculateCross(200.0, "EUR", "USD"))
-                    .thenReturn(new CalculateExchangeResponseDto(216.0, 1.08, "EUR", "USD"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("200.00"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("216.00"), new BigDecimal("1.08")));
             when(paymentRepository.saveAndFlush(any(Payment.class))).thenAnswer(inv -> {
                 Payment p = inv.getArgument(0);
                 p.setId(1L);
@@ -341,6 +340,62 @@ class PaymentServiceImplExtendedTest {
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageContaining("mesecni limit");
         }
+
+        @Test
+        @DisplayName("R2 1428: cross-currency provizija ULAZI u dnevnu/mesecnu potrosnju (amount+fee)")
+        void crossCurrencyFeeCountsTowardSpending() {
+            // EUR->USD 200.00, provizija 0.5% = 1.00 -> klijent trosi 201.00.
+            // Spec: potrosnja = "ukupan iznos POTROSEN" = sav novac skinut sa racuna = amount+fee.
+            toAccount.setCurrency(usd);
+            fromAccount.setDailySpending(new BigDecimal("100.00"));
+            fromAccount.setMonthlySpending(new BigDecimal("1000.00"));
+
+            Account bankEur = baseAccount(100L, "BANK-EUR", null, eur, new BigDecimal("1000000"));
+            Account bankUsd = baseAccount(101L, "BANK-USD", null, usd, new BigDecimal("1000000"));
+            CreatePaymentRequestDto request = buildRequest("200.00");
+
+            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
+            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
+            when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.of(bankEur));
+            when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD")).thenReturn(Optional.of(bankUsd));
+            when(exchangeService.calculateCrossExact(new BigDecimal("200.00"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("216.00"), new BigDecimal("1.08")));
+            when(paymentRepository.saveAndFlush(any(Payment.class))).thenAnswer(inv -> {
+                Payment p = inv.getArgument(0);
+                p.setId(1L);
+                p.setCreatedAt(LocalDateTime.now());
+                return p;
+            });
+
+            paymentService.createPayment(request);
+
+            // potrosnja += amount+fee = 201.00 (NE samo 200.00)
+            assertThat(fromAccount.getDailySpending())
+                    .as("dnevna potrosnja mora ukljuciti proviziju (100 + 201)")
+                    .isEqualByComparingTo("301.00");
+            assertThat(fromAccount.getMonthlySpending())
+                    .as("mesecna potrosnja mora ukljuciti proviziju (1000 + 201)")
+                    .isEqualByComparingTo("1201.00");
+        }
+
+        @Test
+        @DisplayName("R2 1428: dnevni limit racuna amount+fee (provizija gura preko limita)")
+        void crossCurrencyFeePushesOverDailyLimit() {
+            // EUR->USD 200.00, fee 1.00 -> total 201.00. Limit 500, vec potroseno 300 -> ostalo 200.
+            // amount(200) sam staje (200<=200), ali amount+fee(201) NE staje -> mora pasti.
+            toAccount.setCurrency(usd);
+            fromAccount.setDailyLimit(new BigDecimal("500.00"));
+            fromAccount.setDailySpending(new BigDecimal("300.00")); // ostalo tacno 200
+
+            CreatePaymentRequestDto request = buildRequest("200.00");
+
+            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
+            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
+
+            assertThatThrownBy(() -> paymentService.createPayment(request))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("dnevni limit");
+        }
     }
 
     // ===== Limit edge cases: zero limit =====
@@ -417,6 +472,74 @@ class PaymentServiceImplExtendedTest {
         }
     }
 
+    // ===== 1374: Interbank synchronous balance check =====
+
+    @Nested
+    @DisplayName("Interbank outbound balance check (1374)")
+    class InterbankBalanceCheck {
+
+        @Test
+        @DisplayName("1374: interbank payment with insufficient available balance → "
+                + "IllegalArgumentException (NOT 200 PREPARING + async REJECTED)")
+        void interbankInsufficientBalance_throwsSynchronously() {
+            // 1374 — pre fix-a interbank flow je proveravao samo limite, ne i stanje.
+            // Klijent bez sredstava bi dobio PREPARING pa tek async 2PC REJECTED.
+            // Sad se odbija sinhrono (mirror same-bank/validatePayment).
+            fromAccount.setAvailableBalance(new BigDecimal("50.00"));
+            fromAccount.setBalance(new BigDecimal("50.00"));
+
+            CreatePaymentRequestDto request = buildRequest("100.00"); // 100 > 50 available
+            when(bankRoutingService.isLocalAccount(request.getToAccount())).thenReturn(false);
+            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount()))
+                    .thenReturn(Optional.of(fromAccount));
+
+            assertThatThrownBy(() -> paymentService.createPayment(request))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("Nedovoljno sredstava");
+
+            // Nista nije perzistovano niti je 2PC pokrenut.
+            verify(paymentRepository, never()).saveAndFlush(any(Payment.class));
+            verifyNoInteractions(interbankPaymentAsyncService);
+        }
+
+        @Test
+        @DisplayName("1374: interbank payment with sufficient balance → PROCESSING saved + PREPARING returned")
+        void interbankSufficientBalance_savesProcessing() {
+            fromAccount.setAvailableBalance(new BigDecimal("5000.00"));
+            fromAccount.setBalance(new BigDecimal("5000.00"));
+
+            CreatePaymentRequestDto request = buildRequest("100.00");
+            when(bankRoutingService.isLocalAccount(request.getToAccount())).thenReturn(false);
+            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount()))
+                    .thenReturn(Optional.of(fromAccount));
+            when(transactionExecutorService.formTransaction(any(), any(), any(), any(), any()))
+                    .thenReturn(new rs.raf.banka2_bek.interbank.protocol.Transaction(
+                            List.of(),
+                            new rs.raf.banka2_bek.interbank.protocol.ForeignBankId(222, "tx-ib-1"),
+                            null, null, null, null));
+            when(paymentRepository.saveAndFlush(any(Payment.class))).thenAnswer(inv -> {
+                Payment p = inv.getArgument(0);
+                p.setId(77L);
+                p.setCreatedAt(LocalDateTime.now());
+                return p;
+            });
+
+            // createInterbankPayment registruje afterCommit hook preko
+            // TransactionSynchronizationManager — mora postojati aktivna sinhronizacija.
+            org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
+            try {
+                PaymentResponseDto response = paymentService.createPayment(request);
+
+                assertThat(response.getStatus().name()).isEqualTo("PROCESSING");
+                ArgumentCaptor<Payment> cap = ArgumentCaptor.forClass(Payment.class);
+                verify(paymentRepository).saveAndFlush(cap.capture());
+                assertThat(cap.getValue().getStatus()).isEqualTo(PaymentStatus.PROCESSING);
+            } finally {
+                org.springframework.transaction.support.TransactionSynchronizationManager.clearSynchronization();
+            }
+        }
+    }
+
     // ===== Payment order number generation =====
 
     @Nested
@@ -480,10 +603,11 @@ class PaymentServiceImplExtendedTest {
         @Test
         @DisplayName("throws when payment not found")
         void notFound() {
+            // R1 330: nepostojece placanje je 404 (PaymentNotFoundException), ne 400.
             when(paymentRepository.findById(999L)).thenReturn(Optional.empty());
 
             assertThatThrownBy(() -> paymentService.getPaymentById(999L))
-                    .isInstanceOf(IllegalArgumentException.class)
+                    .isInstanceOf(rs.raf.banka2_bek.payment.exception.PaymentNotFoundException.class)
                     .hasMessageContaining("nije pronadjeno");
         }
 
@@ -612,8 +736,8 @@ class PaymentServiceImplExtendedTest {
             when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD")).thenReturn(Optional.of(bankUsd));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.of(bankEur));
-            when(exchangeService.calculateCross(1000.0, "EUR", "USD"))
-                    .thenReturn(new CalculateExchangeResponseDto(1080.0, 1.08, "EUR", "USD"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("1000.00"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("1080.00"), new BigDecimal("1.08")));
             when(paymentRepository.saveAndFlush(any(Payment.class))).thenAnswer(inv -> {
                 Payment p = inv.getArgument(0);
                 p.setId(1L);
@@ -626,8 +750,9 @@ class PaymentServiceImplExtendedTest {
             assertThat(response.getStatus()).isEqualTo(PaymentStatus.COMPLETED);
             // fee = 0.5% of 1000 = 5.00, total from client = 1005.00
             assertThat(fromAccount.getBalance()).isEqualByComparingTo("3995.00");
-            assertThat(fromAccount.getDailySpending()).isEqualByComparingTo("1100.00");
-            assertThat(fromAccount.getMonthlySpending()).isEqualByComparingTo("1500.00");
+            // R2 1428: potrosnja prati STVARNO skinut iznos (amount+fee=1005), ne samo amount.
+            assertThat(fromAccount.getDailySpending()).isEqualByComparingTo("1105.00");
+            assertThat(fromAccount.getMonthlySpending()).isEqualByComparingTo("1505.00");
             // Bank EUR account gets amount+fee from client
             assertThat(bankEur.getBalance()).isEqualByComparingTo("1001005.00");
             // Bank USD account pays converted amount to recipient
@@ -671,7 +796,10 @@ class PaymentServiceImplExtendedTest {
         void fromAccountNotActive() {
             fromAccount.setStatus(AccountStatus.BLOCKED);
             CreatePaymentRequestDto request = buildRequest("100.00");
+            // P2-concurrency-locks-1 (R3-1581): lokalni flow zakljucava OBA racuna kanonski
+            // PRE posiljalac-validacije → primalac mora biti stub-ovan.
             when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
+            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
 
             assertThatThrownBy(() -> paymentService.createPayment(request))
                     .isInstanceOf(IllegalArgumentException.class)
@@ -696,8 +824,8 @@ class PaymentServiceImplExtendedTest {
         void sameAccount() {
             CreatePaymentRequestDto request = buildRequest("100.00");
             request.setToAccount(fromAccount.getAccountNumber());
-            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
-            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(fromAccount));
+            // P2-concurrency-locks-1 (R3-1581): same-account zahtev se odbija PRE lock-a
+            // (u lokalnom flow-u) → nema findForUpdate stub-ova.
 
             assertThatThrownBy(() -> paymentService.createPayment(request))
                     .isInstanceOf(IllegalArgumentException.class)
@@ -709,7 +837,9 @@ class PaymentServiceImplExtendedTest {
         void fromAccountNoClient() {
             fromAccount.setClient(null);
             CreatePaymentRequestDto request = buildRequest("100.00");
+            // P2-concurrency-locks-1 (R3-1581): lokalni flow zakljucava OBA racuna kanonski PRE validacije.
             when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
+            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
 
             assertThatThrownBy(() -> paymentService.createPayment(request))
                     .isInstanceOf(IllegalArgumentException.class)
@@ -723,7 +853,9 @@ class PaymentServiceImplExtendedTest {
             other.setId(99L);
             fromAccount.setClient(other);
             CreatePaymentRequestDto request = buildRequest("100.00");
+            // P2-concurrency-locks-1 (R3-1581): lokalni flow zakljucava OBA racuna kanonski PRE vlasnistva.
             when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount())).thenReturn(Optional.of(fromAccount));
+            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getToAccount())).thenReturn(Optional.of(toAccount));
 
             assertThatThrownBy(() -> paymentService.createPayment(request))
                     .isInstanceOf(IllegalArgumentException.class)
@@ -912,6 +1044,8 @@ class PaymentServiceImplExtendedTest {
         @DisplayName("payment with null fromAccount client resolves to INCOMING")
         void nullFromAccountClient() {
             Account noClientAccount = baseAccount(50L, "333333333333333333", null, eur, new BigDecimal("1000"));
+            // P2-1: autentifikovani klijent je PRIMALAC (toAccount mu pripada) — sme da vidi placanje.
+            Account recipientAccount = baseAccount(70L, "222222222222222222", client, eur, new BigDecimal("2000"));
             Payment payment = Payment.builder()
                     .id(1L).orderNumber("PAY-1234567890123456")
                     .fromAccount(noClientAccount).toAccountNumber("222222222222222222")
@@ -921,6 +1055,7 @@ class PaymentServiceImplExtendedTest {
                     .build();
 
             when(paymentRepository.findById(1L)).thenReturn(Optional.of(payment));
+            when(accountRepository.findByAccountNumber("222222222222222222")).thenReturn(Optional.of(recipientAccount));
 
             PaymentResponseDto response = paymentService.getPaymentById(1L);
             assertThat(response.getDirection()).isEqualTo(PaymentDirection.INCOMING);
@@ -929,6 +1064,8 @@ class PaymentServiceImplExtendedTest {
         @Test
         @DisplayName("payment with null fromAccount resolves to INCOMING")
         void nullFromAccount() {
+            // P2-1: autentifikovani klijent je PRIMALAC (toAccount mu pripada) — sme da vidi placanje.
+            Account recipientAccount = baseAccount(71L, "222222222222222222", client, eur, new BigDecimal("2000"));
             Payment payment = Payment.builder()
                     .id(2L).orderNumber("PAY-9876543210123456")
                     .fromAccount(null).toAccountNumber("222222222222222222")
@@ -938,6 +1075,7 @@ class PaymentServiceImplExtendedTest {
                     .build();
 
             when(paymentRepository.findById(2L)).thenReturn(Optional.of(payment));
+            when(accountRepository.findByAccountNumber("222222222222222222")).thenReturn(Optional.of(recipientAccount));
 
             PaymentResponseDto response = paymentService.getPaymentById(2L);
             assertThat(response.getDirection()).isEqualTo(PaymentDirection.INCOMING);
@@ -966,6 +1104,9 @@ class PaymentServiceImplExtendedTest {
             Client other = new Client();
             other.setId(99L);
             Account otherAccount = baseAccount(60L, "444444444444444444", other, eur, new BigDecimal("5000"));
+            // P2-1: platilac je drugi klijent, ali autentifikovani klijent je PRIMALAC
+            // (toAccount mu pripada) — sme da vidi placanje, smer je INCOMING.
+            Account recipientAccount = baseAccount(72L, "222222222222222222", client, eur, new BigDecimal("2000"));
 
             Payment payment = Payment.builder()
                     .id(4L).orderNumber("PAY-XXXXXX1234567890")
@@ -976,6 +1117,7 @@ class PaymentServiceImplExtendedTest {
                     .build();
 
             when(paymentRepository.findById(4L)).thenReturn(Optional.of(payment));
+            when(accountRepository.findByAccountNumber("222222222222222222")).thenReturn(Optional.of(recipientAccount));
 
             PaymentResponseDto response = paymentService.getPaymentById(4L);
             assertThat(response.getDirection()).isEqualTo(PaymentDirection.INCOMING);

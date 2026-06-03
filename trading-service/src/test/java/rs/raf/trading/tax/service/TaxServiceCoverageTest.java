@@ -68,6 +68,7 @@ class TaxServiceCoverageTest {
     @Mock private OrderRepository orderRepository;
     @Mock private CurrencyConversionService currencyConversionService;
     @Mock private OtcContractRepository otcContractRepository;
+    @Mock private rs.raf.trading.stock.repository.ListingRepository listingRepository;
     @Mock private BankaCoreClient bankaCoreClient;
 
     @InjectMocks
@@ -75,11 +76,15 @@ class TaxServiceCoverageTest {
 
     /**
      * Idempotency key koji {@code collectTaxFromUser} koristi: ukljucuje userId,
-     * tekuci mesec I iznos naplate ({@code unpaidTax.toPlainString()}) — vidi
-     * holisticki review fix I-2 (kljuc bez iznosa se sudara pri intra-mesecnom re-run-u).
+     * settlement {@code period} I iznos naplate ({@code unpaidTax.toPlainString()}).
+     * B-1: key se vezuje za settlement {@code period} (NE run-mesec) — koristimo
+     * istu {@code settlementPeriod} heuristiku kao produkcija da izbegnemo flaky
+     * mismatch na granici meseca (cron 1. u mesecu naplacuje prethodni mesec).
      */
     private static String taxKey(long userId, String unpaidAmount) {
-        return "tax-" + userId + "-" + YearMonth.now() + "-" + unpaidAmount;
+        YearMonth period = rs.raf.trading.tax.util.TaxRealizedGainCalculator
+                .settlementPeriod(java.time.LocalDateTime.now());
+        return "tax-" + userId + "-" + period + "-" + unpaidAmount;
     }
 
     @BeforeEach
@@ -238,11 +243,19 @@ class TaxServiceCoverageTest {
         Order buy = order(1L, "CLIENT", l, OrderDirection.BUY, "100", 1);
         Order sell = order(1L, "CLIENT", l, OrderDirection.SELL, "1100", 1);
 
+        // B-1: incremental charge je smislen SAMO unutar istog meseca — pa record
+        // nosi mesecni paid bucket (taxPaidPeriod = tekuci mesec, taxPaidInPeriod=75).
+        // Bez ovih polja (legacy semantika) 75 bi se tretiralo kao "placeno bilo kad"
+        // i mesalo bi lifetime sa mesecnim (upravo B-1 bug).
+        YearMonth currentPeriod = YearMonth.now();
         TaxRecord existing = TaxRecord.builder()
                 .id(7L).userId(1L).userType("CLIENT")
                 .totalProfit(new BigDecimal("500"))
                 .taxOwed(new BigDecimal("75"))
-                .taxPaid(new BigDecimal("75")) // already paid
+                .taxPaid(new BigDecimal("75")) // godisnji kumulativ
+                .taxPaidYear(currentPeriod.getYear())
+                .taxPaidPeriod(currentPeriod.toString())
+                .taxPaidInPeriod(new BigDecimal("75")) // placeno u tekucem mesecu
                 .currency("RSD")
                 .build();
 
@@ -286,12 +299,18 @@ class TaxServiceCoverageTest {
                 .thenReturn(List.of(buy1, sell1))
                 .thenReturn(List.of(buy1, sell1, sell2));
 
-        // Run 1: nema postojeceg record-a. Run 2: record sa taxPaid=150 (placeno u run 1).
+        // Run 1: nema postojeceg record-a. Run 2: record sa mesecnim paid bucket-om
+        // (taxPaidInPeriod=150 u tekucem mesecu) — B-1: drugi run u ISTOM mesecu
+        // racuna unpaidTax = mesecni owed (450) − mesecni paid (150) = 300.
+        YearMonth run1Period = YearMonth.now();
         TaxRecord afterRun1 = TaxRecord.builder()
                 .id(1L).userId(1L).userType("CLIENT")
                 .totalProfit(new BigDecimal("1000"))
                 .taxOwed(new BigDecimal("150.0000"))
                 .taxPaid(new BigDecimal("150.0000"))
+                .taxPaidYear(run1Period.getYear())
+                .taxPaidPeriod(run1Period.toString())
+                .taxPaidInPeriod(new BigDecimal("150.0000"))
                 .currency("RSD")
                 .build();
         when(taxRecordRepository.findByUserIdAndUserType(1L, "CLIENT"))

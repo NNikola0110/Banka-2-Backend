@@ -217,6 +217,11 @@ class EmployeeServiceImplMoreTest {
 
         assertThat(e.getActive()).isFalse();
         verify(employeeRepository).save(e);
+        // R5 1890: deaktivacija zaposlenog je sad audit-ovana (EMPLOYEE_DEACTIVATED).
+        verify(auditLogService).record(
+                any(), eq("EMPLOYEE"),
+                eq(rs.raf.banka2_bek.audit.model.AuditActionType.EMPLOYEE_DEACTIVATED),
+                any(), eq("EMPLOYEE"), eq(8L), eq("active=true"), eq("active=false"));
     }
 
     @Test

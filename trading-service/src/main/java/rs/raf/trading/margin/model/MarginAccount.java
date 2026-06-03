@@ -31,7 +31,13 @@ import java.time.LocalDateTime;
  * legacy seed redove (backwards-compat).
  */
 @Entity
-@Table(name = "margin_accounts")
+// R1-469: Marzni_Racuni.txt §57 — najvise JEDAN marzni racun po baznom racunu.
+// Do sada je invarijanta bila branjena samo aplikativno (findByAccountId().isEmpty()
+// pre save-a), pa su dva paralelna createForUser/createForCompany sa istim account_id
+// oba prosla TOCTOU proveru i kreirala duplikat. DB unique constraint na account_id
+// to eliminise (account_id je distinktan i u seed-u: 1/4/7/10).
+@Table(name = "margin_accounts",
+        uniqueConstraints = @UniqueConstraint(name = "uk_margin_account_base", columnNames = "account_id"))
 @Inheritance(strategy = InheritanceType.SINGLE_TABLE)
 @DiscriminatorColumn(name = "dtype", discriminatorType = DiscriminatorType.STRING, length = 31)
 @DiscriminatorValue("MARGIN")

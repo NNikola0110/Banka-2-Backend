@@ -16,10 +16,6 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
-import rs.raf.banka2.contracts.internal.CommitFundsRequest;
-import rs.raf.banka2.contracts.internal.CommitFundsResponse;
-import rs.raf.banka2.contracts.internal.CreditFundsRequest;
-import rs.raf.banka2.contracts.internal.CreditFundsResponse;
 import rs.raf.banka2.contracts.internal.InternalAccountDto;
 import rs.raf.banka2.contracts.internal.ReleaseFundsRequest;
 import rs.raf.banka2.contracts.internal.ReleaseFundsResponse;
@@ -112,8 +108,23 @@ class OtcServiceTest {
 
     // ── fixtures ─────────────────────────────────────────────────────────────
 
-    /** Postavlja SecurityContext kao CLIENT (OTC dozvoljen klijentima). */
+    /**
+     * Postavlja SecurityContext kao CLIENT KOJI SME da trguje (OTC dozvoljen
+     * klijentima sa permisijom). P1-6: klijent mora imati {@code TRADE_STOCKS}
+     * autoritet — mirror {@code OrderServiceImplTest.asClient()}.
+     */
     private void authClient() {
+        SecurityContextHolder.getContext().setAuthentication(
+                new UsernamePasswordAuthenticationToken("client@x.rs", "n",
+                        List.of(new SimpleGrantedAuthority("ROLE_CLIENT"),
+                                new SimpleGrantedAuthority("TRADE_STOCKS"))));
+    }
+
+    /**
+     * P1-6: klijent BEZ {@code TRADE_STOCKS} permisije — OTC mu mora biti zabranjen
+     * (Celina 4: OTC je za "klijente sa permisijama za trgovinu").
+     */
+    private void authClientWithoutTradeStocks() {
         SecurityContextHolder.getContext().setAuthentication(
                 new UsernamePasswordAuthenticationToken("client@x.rs", "n",
                         List.of(new SimpleGrantedAuthority("ROLE_CLIENT"))));
@@ -225,8 +236,10 @@ class OtcServiceTest {
             when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
             Listing listing = stockListing(100L, "AAPL", "USD");
             Portfolio other = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 0);
-            when(portfolioRepository.findAll()).thenReturn(List.of(other));
-            when(listingRepository.findById(100L)).thenReturn(Optional.of(listing));
+            // P2-perf-nplus1-1 (R5 1898): discovery sad koristi DB-side filter
+            // findAllWithPublicQuantity() + batch findAllById (ne findAll()+findById).
+            when(portfolioRepository.findAllWithPublicQuantity()).thenReturn(List.of(other));
+            when(listingRepository.findAllById(List.of(100L))).thenReturn(List.of(listing));
             when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(0);
             when(userResolver.resolveRole(2L)).thenReturn(UserRole.CLIENT);
             when(userResolver.resolveName(2L, UserRole.CLIENT)).thenReturn("Seller Name");
@@ -236,6 +249,9 @@ class OtcServiceTest {
             assertThat(result).hasSize(1);
             assertThat(result.get(0).getListingTicker()).isEqualTo("AAPL");
             assertThat(result.get(0).getAvailablePublicQuantity()).isEqualTo(10);
+            // Strukturalno: batch resolve — TACNO JEDAN findAllById, nikad per-row findById.
+            verify(listingRepository, times(1)).findAllById(List.of(100L));
+            verify(listingRepository, never()).findById(any());
         }
 
         @Test
@@ -244,7 +260,7 @@ class OtcServiceTest {
             authClient();
             when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
             Portfolio mine = sellerPortfolio(5L, 1L, UserRole.CLIENT, 100L, 20, 10, 0);
-            when(portfolioRepository.findAll()).thenReturn(List.of(mine));
+            when(portfolioRepository.findAllWithPublicQuantity()).thenReturn(List.of(mine));
 
             List<OtcListingDto> result = service.listDiscoveryListings();
 
@@ -267,7 +283,74 @@ class OtcServiceTest {
         void access_supervisorAllowed() {
             authSupervisor();
             when(userResolver.resolveCurrent()).thenReturn(new UserContext(7L, UserRole.EMPLOYEE));
-            when(portfolioRepository.findAll()).thenReturn(List.of());
+            when(portfolioRepository.findAllWithPublicQuantity()).thenReturn(List.of());
+
+            assertThat(service.listDiscoveryListings()).isEmpty();
+        }
+
+        @Test
+        @DisplayName("P1-6: klijent BEZ TRADE_STOCKS dobija AccessDenied na discovery")
+        void access_clientWithoutTradeStocksDenied() {
+            authClientWithoutTradeStocks();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+
+            assertThatThrownBy(() -> service.listDiscoveryListings())
+                    .isInstanceOf(AccessDeniedException.class)
+                    .hasMessageContaining("TRADE_STOCKS");
+        }
+
+        @Test
+        @DisplayName("P1-6: klijent BEZ TRADE_STOCKS dobija AccessDenied na createOffer")
+        void access_clientWithoutTradeStocksDeniedOnCreateOffer() {
+            authClientWithoutTradeStocks();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+
+            CreateOtcOfferDto dto = new CreateOtcOfferDto();
+            dto.setListingId(100L);
+            dto.setSellerId(2L);
+            dto.setQuantity(5);
+            dto.setPricePerStock(new BigDecimal("160.00"));
+            dto.setPremium(new BigDecimal("50.00"));
+            dto.setSettlementDate(LocalDate.now().plusDays(30));
+
+            assertThatThrownBy(() -> service.createOffer(dto))
+                    .isInstanceOf(AccessDeniedException.class)
+                    .hasMessageContaining("TRADE_STOCKS");
+        }
+
+        @Test
+        @DisplayName("P1-6: klijent BEZ TRADE_STOCKS dobija AccessDenied na acceptOffer")
+        void access_clientWithoutTradeStocksDeniedOnAcceptOffer() {
+            authClientWithoutTradeStocks();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+
+            assertThatThrownBy(() -> service.acceptOffer(1L, 10L))
+                    .isInstanceOf(AccessDeniedException.class)
+                    .hasMessageContaining("TRADE_STOCKS");
+        }
+
+        @Test
+        @DisplayName("P1-6: klijent BEZ TRADE_STOCKS dobija AccessDenied na counterOffer")
+        void access_clientWithoutTradeStocksDeniedOnCounterOffer() {
+            authClientWithoutTradeStocks();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+
+            CounterOtcOfferDto dto = new CounterOtcOfferDto();
+            dto.setPricePerStock(new BigDecimal("170.00"));
+            dto.setPremium(new BigDecimal("60.00"));
+            dto.setSettlementDate(LocalDate.now().plusDays(30));
+
+            assertThatThrownBy(() -> service.counterOffer(1L, dto))
+                    .isInstanceOf(AccessDeniedException.class)
+                    .hasMessageContaining("TRADE_STOCKS");
+        }
+
+        @Test
+        @DisplayName("P1-6: klijent SA TRADE_STOCKS prolazi OTC gate")
+        void access_clientWithTradeStocksAllowed() {
+            authClient();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+            when(portfolioRepository.findAllWithPublicQuantity()).thenReturn(List.of());
 
             assertThat(service.listDiscoveryListings()).isEmpty();
         }
@@ -290,6 +373,53 @@ class OtcServiceTest {
 
             assertThat(result).hasSize(1);
             assertThat(result.get(0).getPublicQuantity()).isEqualTo(10);
+        }
+
+        @Test
+        @DisplayName("OT-1115: availablePublicQuantity = publicQuantity − sumActiveReservedByListing "
+                + "(NEZERO rezervacija stvarno umanjuje raspolozivo)")
+        void discovery_activeReservationReducesAvailable() {
+            // Svi postojeci discovery testovi stub-uju sumActiveReservedByListing→0,
+            // pa NIKAD ne provere oduzimanje. Ovde prodavac javno nudi 20, ali ima
+            // 12 akcija zarobljeno na aktivnim OTC ugovorima (npr. 3+7+2) → raspolozivo
+            // = 20 − 12 = 8. Pinuje da rezervacija ulazi u availablePublicQty racun.
+            authClient();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            Portfolio other = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 50, 20, 0);
+            when(portfolioRepository.findAllWithPublicQuantity()).thenReturn(List.of(other));
+            when(listingRepository.findAllById(List.of(100L))).thenReturn(List.of(listing));
+            when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(12);
+            when(userResolver.resolveRole(2L)).thenReturn(UserRole.CLIENT);
+            when(userResolver.resolveName(2L, UserRole.CLIENT)).thenReturn("Seller");
+
+            List<OtcListingDto> result = service.listDiscoveryListings();
+
+            assertThat(result).hasSize(1);
+            assertThat(result.get(0).getPublicQuantity()).isEqualTo(20);
+            assertThat(result.get(0).getAvailablePublicQuantity()).isEqualTo(8);
+        }
+
+        @Test
+        @DisplayName("OT-1115: rezervacija >= publicQuantity → availablePublicQuantity klampovan na 0 "
+                + "→ listing izbacen iz discovery-ja (filter availablePublicQuantity > 0)")
+        void discovery_reservationAtOrAbovePublic_excludedFromDiscovery() {
+            // publicQuantity=10, ali rezervisano 10 (sve zarobljeno na aktivnim ugovorima)
+            // → raspolozivo = max(0, 10 − 10) = 0 → dto.getAvailablePublicQuantity()==0
+            // → filter (availablePublicQuantity > 0) izbacuje listing iz discovery rezultata.
+            authClient();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            Portfolio other = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 50, 10, 0);
+            when(portfolioRepository.findAllWithPublicQuantity()).thenReturn(List.of(other));
+            when(listingRepository.findAllById(List.of(100L))).thenReturn(List.of(listing));
+            when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(10);
+            when(userResolver.resolveRole(2L)).thenReturn(UserRole.CLIENT);
+            when(userResolver.resolveName(2L, UserRole.CLIENT)).thenReturn("Seller");
+
+            List<OtcListingDto> result = service.listDiscoveryListings();
+
+            assertThat(result).isEmpty();
         }
     }
 
@@ -425,6 +555,125 @@ class OtcServiceTest {
         }
 
         @Test
+        @DisplayName("OT-1116: createOffer — supervizor (EMPLOYEE) ka KLIJENTU odbijen "
+                + "(ensureSameRoleParticipants: samo klijent-klijent ili supervizor-supervizor)")
+        void createOffer_crossRoleSupervisorToClient_rejected() {
+            // Spec Celina 4 (Nova) §822-826: "Komuniciraju 2 klijenta ili 2 supervizora".
+            // Supervizor (me=EMPLOYEE) ne sme da napravi OTC ponudu KLIJENTU (sellerRole=CLIENT).
+            authSupervisor();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(7L, UserRole.EMPLOYEE));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            when(listingRepository.findById(100L)).thenReturn(Optional.of(listing));
+            // seller (id=2) je KLIJENT — razlicita rola od supervizora.
+            when(userResolver.resolveRole(2L)).thenReturn(UserRole.CLIENT);
+
+            CreateOtcOfferDto dto = new CreateOtcOfferDto();
+            dto.setListingId(100L);
+            dto.setSellerId(2L);
+            dto.setQuantity(5);
+            dto.setPricePerStock(new BigDecimal("160.00"));
+            dto.setPremium(new BigDecimal("50.00"));
+            dto.setSettlementDate(LocalDate.now().plusDays(30));
+
+            assertThatThrownBy(() -> service.createOffer(dto))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("iste role");
+            // ensureSameRoleParticipants puca PRE portfolio lookup-a → nista se ne cuva.
+            verify(offerRepository, never()).save(any(OtcOffer.class));
+            verify(portfolioRepository, never()).findByUserIdAndUserRole(anyLong(), anyString());
+        }
+
+        @Test
+        @DisplayName("OT-1116: createOffer — klijent ka SUPERVIZORU (EMPLOYEE) odbijen "
+                + "(obrnut smer iste cross-role brane)")
+        void createOffer_crossRoleClientToEmployee_rejected() {
+            authClient();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            when(listingRepository.findById(100L)).thenReturn(Optional.of(listing));
+            // seller (id=9) je ZAPOSLENI (supervizor) — razlicita rola od klijenta.
+            when(userResolver.resolveRole(9L)).thenReturn(UserRole.EMPLOYEE);
+
+            CreateOtcOfferDto dto = new CreateOtcOfferDto();
+            dto.setListingId(100L);
+            dto.setSellerId(9L);
+            dto.setQuantity(5);
+            dto.setPricePerStock(new BigDecimal("160.00"));
+            dto.setPremium(new BigDecimal("50.00"));
+            dto.setSettlementDate(LocalDate.now().plusDays(30));
+
+            assertThatThrownBy(() -> service.createOffer(dto))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("iste role");
+            verify(offerRepository, never()).save(any(OtcOffer.class));
+        }
+
+        @Test
+        @DisplayName("OT-1117: counterOffer — re-validacija raspolozivih akcija: ako prodavac vise "
+                + "NE nudi dovoljno javnih akcija za novu kolicinu → IllegalArgumentException, ponuda se ne menja")
+        void counterOffer_sellerNoLongerHasEnoughPublicShares_rejected() {
+            // OtcService.counterOffer (linije 284-296): pri kontraponudi se PONOVO
+            // proverava da prodavac javno nudi >= dto.getQuantity(). Kupac (id=1) pravi
+            // kontraponudu (njemu je red — waitingOn=1), ali seller (id=2) je u
+            // medjuvremenu povukao akcije: publicQuantity=4 (counter trazi 10).
+            authClient();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            // waitingOn=1 → kupcu (1) je red da odgovori.
+            OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 5, "160.00", "50.00", 1L);
+            when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
+            // Seller javno nudi samo 4 (publicQty=4), rezervisano 0 → raspolozivo 4.
+            Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 4, 0);
+            when(portfolioRepository.findByUserIdAndUserRole(2L, UserRole.CLIENT))
+                    .thenReturn(List.of(sellerPf));
+            when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(0);
+
+            CounterOtcOfferDto dto = new CounterOtcOfferDto();
+            dto.setQuantity(10); // trazi 10, a raspolozivo 4
+            dto.setPricePerStock(new BigDecimal("155.00"));
+            dto.setPremium(new BigDecimal("45.00"));
+            dto.setSettlementDate(LocalDate.now().plusDays(20));
+
+            assertThatThrownBy(() -> service.counterOffer(1L, dto))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("javno nudi samo 4");
+            verify(offerRepository, never()).save(any(OtcOffer.class));
+        }
+
+        @Test
+        @DisplayName("OT-1117: counterOffer — re-validacija prolazi kad prodavac jos ima dovoljno "
+                + "javnih akcija (counter <= dostupno) → ponuda se cuva")
+        void counterOffer_sellerStillHasEnoughPublicShares_succeeds() {
+            authClient();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            // waitingOn=1 → kupcu je red.
+            OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 5, "160.00", "50.00", 1L);
+            when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
+            // Seller javno nudi 15, rezervisano 3 → raspolozivo 12 (counter trazi 8 ≤ 12).
+            Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 30, 15, 0);
+            when(portfolioRepository.findByUserIdAndUserRole(2L, UserRole.CLIENT))
+                    .thenReturn(List.of(sellerPf));
+            when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(3);
+            when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
+            when(offerRepository.save(any(OtcOffer.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            CounterOtcOfferDto dto = new CounterOtcOfferDto();
+            dto.setQuantity(8); // raspolozivo 12 → prolazi
+            dto.setPricePerStock(new BigDecimal("155.00"));
+            dto.setPremium(new BigDecimal("45.00"));
+            dto.setSettlementDate(LocalDate.now().plusDays(20));
+
+            service.counterOffer(1L, dto);
+
+            ArgumentCaptor<OtcOffer> captor = ArgumentCaptor.forClass(OtcOffer.class);
+            verify(offerRepository).save(captor.capture());
+            assertThat(captor.getValue().getQuantity()).isEqualTo(8);
+            // red se prebacuje na seller-a (2).
+            assertThat(captor.getValue().getWaitingOnUserId()).isEqualTo(2L);
+        }
+
+        @Test
         @DisplayName("counterOffer — azurira ponudu i prebacuje red na drugu stranu")
         void counterOffer_flipsTurn() {
             authClient();
@@ -451,6 +700,13 @@ class OtcServiceTest {
             verify(offerRepository).save(captor.capture());
             assertThat(captor.getValue().getQuantity()).isEqualTo(4);
             assertThat(captor.getValue().getWaitingOnUserId()).isEqualTo(1L);
+
+            // Sc60 (TODO_testovi): druga strana (red sad na 1L) dobija OTC_COUNTER_OFFER
+            // notifikaciju (sad email + in-app). Tacno jedan poziv (diskretan event).
+            verify(notificationService, org.mockito.Mockito.times(1)).notify(
+                    eq(1L), anyString(),
+                    eq(rs.raf.trading.notification.model.NotificationType.OTC_COUNTER_OFFER),
+                    anyString(), anyString(), eq("OTC_OFFER"), eq(1L));
         }
 
         @Test
@@ -470,6 +726,94 @@ class OtcServiceTest {
 
             assertThatThrownBy(() -> service.counterOffer(1L, dto))
                     .isInstanceOf(AccessDeniedException.class);
+        }
+
+        @Test
+        @DisplayName("R2-1338: counterOffer — strana kojoj NIJE red dobija IllegalState (turn-order)")
+        void counterOffer_notMyTurn_rejected() {
+            authClient();
+            // Buyer (1) je upravo poslao ponudu seller-u (2) → waitingOn=2 (red je na 2).
+            // Buyer (1) NE sme odmah da posalje jos jednu kontraponudu — nije mu red.
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 5, "160.00", "50.00", 2L);
+            when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
+
+            CounterOtcOfferDto dto = new CounterOtcOfferDto();
+            dto.setQuantity(4);
+            dto.setPricePerStock(new BigDecimal("155.00"));
+            dto.setPremium(new BigDecimal("45.00"));
+            dto.setSettlementDate(LocalDate.now().plusDays(20));
+
+            assertThatThrownBy(() -> service.counterOffer(1L, dto))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("red");
+            verify(offerRepository, never()).save(any(OtcOffer.class));
+        }
+
+        @Test
+        @DisplayName("R2-1339: counterOffer — qty<1 odbijen (defense-in-depth)")
+        void counterOffer_zeroQuantity_rejected() {
+            authClient();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(2L, UserRole.CLIENT));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 5, "160.00", "50.00", 2L);
+            when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
+
+            CounterOtcOfferDto dto = new CounterOtcOfferDto();
+            dto.setQuantity(0); // korumpirana kolicina
+            dto.setPricePerStock(new BigDecimal("155.00"));
+            dto.setPremium(new BigDecimal("45.00"));
+            dto.setSettlementDate(LocalDate.now().plusDays(20));
+
+            assertThatThrownBy(() -> service.counterOffer(1L, dto))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("Kolicina");
+            verify(offerRepository, never()).save(any(OtcOffer.class));
+        }
+
+        @Test
+        @DisplayName("R2-1339: counterOffer — negativna premija odbijena")
+        void counterOffer_negativePremium_rejected() {
+            authClient();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(2L, UserRole.CLIENT));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 5, "160.00", "50.00", 2L);
+            when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
+
+            CounterOtcOfferDto dto = new CounterOtcOfferDto();
+            dto.setQuantity(4);
+            dto.setPricePerStock(new BigDecimal("155.00"));
+            dto.setPremium(new BigDecimal("-1.00")); // negativna premija
+            dto.setSettlementDate(LocalDate.now().plusDays(20));
+
+            assertThatThrownBy(() -> service.counterOffer(1L, dto))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("Premija");
+            verify(offerRepository, never()).save(any(OtcOffer.class));
+        }
+
+        @Test
+        @DisplayName("R2-1339: counterOffer — q==0 ponuda ne dozvoljava ne-ucesniku bypass participant check")
+        void counterOffer_zeroQtyOffer_nonParticipantStillDenied() {
+            authClient();
+            // Ne-ucesnik (99) nad korumpiranom (qty=0) ponudom: stara verzija je
+            // PRESKAKALA participant check zbog `offer.getQuantity() > 0` guard-a.
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(99L, UserRole.CLIENT));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 0, "160.00", "50.00", 2L);
+            when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
+
+            CounterOtcOfferDto dto = new CounterOtcOfferDto();
+            dto.setQuantity(4);
+            dto.setPricePerStock(new BigDecimal("155.00"));
+            dto.setPremium(new BigDecimal("45.00"));
+            dto.setSettlementDate(LocalDate.now().plusDays(20));
+
+            // loadActiveOfferForParticipant vec odbija ne-ucesnika (AccessDenied)
+            assertThatThrownBy(() -> service.counterOffer(1L, dto))
+                    .isInstanceOf(AccessDeniedException.class);
+            verify(offerRepository, never()).save(any(OtcOffer.class));
         }
 
         @Test
@@ -508,8 +852,10 @@ class OtcServiceTest {
             OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 5, "160.00", "50.00", 2L);
             when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
             Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 0);
-            when(portfolioRepository.findByUserIdAndUserRole(2L, UserRole.CLIENT))
-                    .thenReturn(List.of(sellerPf));
+            // P2-authz-method-1 (R1 474): acceptOffer cita seller portfolio pod
+            // pessimistic lock-om (findByUserIdAndUserRoleAndListingIdForUpdate).
+            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(2L, UserRole.CLIENT, 100L))
+                    .thenReturn(Optional.of(sellerPf));
             when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(0);
             when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
 
@@ -571,6 +917,40 @@ class OtcServiceTest {
         }
 
         @Test
+        @DisplayName("R1 474 (P2-authz-method-1): acceptOffer cita seller portfolio "
+                + "POD PESSIMISTIC LOCK-om (findByUserIdAndUserRoleAndListingIdForUpdate), "
+                + "NE plain findByUserIdAndUserRole — sprecava over-commit dva paralelna accept-a")
+        void acceptOffer_readsSellerPortfolioUnderPessimisticLock() {
+            authClient();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(2L, UserRole.CLIENT));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 5, "160.00", "50.00", 2L);
+            when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
+            Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 0);
+            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(2L, UserRole.CLIENT, 100L))
+                    .thenReturn(Optional.of(sellerPf));
+            when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(0);
+            when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
+            when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
+            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
+                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
+            when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
+                    .thenReturn(new TransferFundsResponse(10L, 88L, new BigDecimal("50.00"),
+                            BigDecimal.ZERO, BigDecimal.ZERO));
+            when(bankaCoreClient.reserveFunds(anyString(), any(ReserveFundsRequest.class)))
+                    .thenReturn(new ReserveFundsResponse("RES-77", 10L,
+                            new BigDecimal("800.00"), BigDecimal.ZERO));
+            when(offerRepository.save(any(OtcOffer.class))).thenAnswer(inv -> inv.getArgument(0));
+            when(contractRepository.save(any(OtcContract.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            service.acceptOffer(1L, 10L);
+
+            // KLJUC: seller portfolio se cita pod lockom (ForUpdate), NIKAD plain.
+            verify(portfolioRepository).findByUserIdAndUserRoleAndListingIdForUpdate(2L, UserRole.CLIENT, 100L);
+            verify(portfolioRepository, never()).findByUserIdAndUserRole(2L, UserRole.CLIENT);
+        }
+
+        @Test
         @DisplayName("acceptOffer — seller je ZAPOSLENI → seller racun je bankin "
                 + "(getPreferredAccount EMPLOYEE)")
         void acceptOffer_employeeSeller_resolvesBankAccount() {
@@ -583,8 +963,9 @@ class OtcServiceTest {
             offer.setSellerRole(UserRole.EMPLOYEE);
             when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
             Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.EMPLOYEE, 100L, 20, 10, 0);
-            when(portfolioRepository.findByUserIdAndUserRole(2L, UserRole.EMPLOYEE))
-                    .thenReturn(List.of(sellerPf));
+            // P2-authz-method-1 (R1 474): pessimistic lock na seller portfolio.
+            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(2L, UserRole.EMPLOYEE, 100L))
+                    .thenReturn(Optional.of(sellerPf));
             when(contractRepository.sumActiveReservedByListing(2L, UserRole.EMPLOYEE, 100L))
                     .thenReturn(0);
             when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
@@ -616,7 +997,8 @@ class OtcServiceTest {
         }
 
         @Test
-        @DisplayName("acceptOffer — banka-core 409 na rezervaciji → InsufficientFundsException")
+        @DisplayName("acceptOffer — banka-core 409 na rezervaciji → InsufficientFundsException; "
+                + "premija NIJE premestena (P0-B6 Nalaz 2 — conservation)")
         void acceptOffer_reserveConflictMapsToInsufficientFunds() {
             authClient();
             when(userResolver.resolveCurrent()).thenReturn(new UserContext(2L, UserRole.CLIENT));
@@ -624,22 +1006,71 @@ class OtcServiceTest {
             OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 5, "160.00", "50.00", 2L);
             when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
             Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 0);
-            when(portfolioRepository.findByUserIdAndUserRole(2L, UserRole.CLIENT))
-                    .thenReturn(List.of(sellerPf));
+            // P2-authz-method-1 (R1 474): pessimistic lock na seller portfolio.
+            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(2L, UserRole.CLIENT, 100L))
+                    .thenReturn(Optional.of(sellerPf));
             when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(0);
             when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
             when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
             when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
                     .thenReturn(account(88L, "222", "Seller", "USD", 2L));
-            when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
-                    .thenReturn(new TransferFundsResponse(10L, 88L, new BigDecimal("50.00"),
-                            BigDecimal.ZERO, BigDecimal.ZERO));
+            // P0-B6: rezervacija sad ide PRVA i pada (409). Premija ne sme krenuti.
             when(bankaCoreClient.reserveFunds(anyString(), any(ReserveFundsRequest.class)))
                     .thenThrow(new BankaCoreClientException(409, "nedovoljno"));
 
             assertThatThrownBy(() -> service.acceptOffer(1L, 10L))
                     .isInstanceOf(InsufficientFundsException.class)
                     .hasMessageContaining("rezervaciju");
+
+            // CONSERVATION (Nalaz 2): premija se NIKAD nije premestila kupac->prodavac,
+            // i nista nije ostalo rezervisano (release nije ni potreban jer reserve nije
+            // uspeo) → nula novcanog kretanja. Pre fix-a je transferFunds isao PRVI pa
+            // bi premija bila trajno premestena.
+            verify(bankaCoreClient, never()).transferFunds(anyString(), any(TransferFundsRequest.class));
+            verify(bankaCoreClient, never()).releaseFunds(anyString(), anyString(),
+                    any(ReleaseFundsRequest.class));
+            verify(contractRepository, never()).save(any(OtcContract.class));
+        }
+
+        @Test
+        @DisplayName("acceptOffer — transfer premije padne POSLE uspesne rezervacije → "
+                + "rezervacija se oslobadja (releaseFunds) i greska propagira (P0-B6 Nalaz 2 — conservation)")
+        void acceptOffer_premiumFailsAfterReserve_releasesReservation() {
+            authClient();
+            when(userResolver.resolveCurrent()).thenReturn(new UserContext(2L, UserRole.CLIENT));
+            Listing listing = stockListing(100L, "AAPL", "USD");
+            OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 5, "160.00", "50.00", 2L);
+            when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
+            Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 0);
+            // P2-authz-method-1 (R1 474): pessimistic lock na seller portfolio.
+            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(2L, UserRole.CLIENT, 100L))
+                    .thenReturn(Optional.of(sellerPf));
+            when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(0);
+            when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
+            when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
+            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
+                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
+            // Rezervacija uspeva (RES-77), ali premija padne (409 — nedovoljno za premiju
+            // posle hold-a) → mora se osloboditi RES-77 i baciti greska.
+            when(bankaCoreClient.reserveFunds(anyString(), any(ReserveFundsRequest.class)))
+                    .thenReturn(new ReserveFundsResponse("RES-77", 10L,
+                            new BigDecimal("800.00"), BigDecimal.ZERO));
+            when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
+                    .thenThrow(new BankaCoreClientException(409, "nedovoljno za premiju"));
+            when(bankaCoreClient.releaseFunds(anyString(), anyString(), any(ReleaseFundsRequest.class)))
+                    .thenReturn(new ReleaseFundsResponse("RES-77", new BigDecimal("800.00"),
+                            new BigDecimal("800.00")));
+
+            assertThatThrownBy(() -> service.acceptOffer(1L, 10L))
+                    .isInstanceOf(InsufficientFundsException.class);
+
+            // CONSERVATION (obrnuti leak): rezervacija RES-77 MORA biti oslobodjena, i
+            // ugovor NE sme nastati → nijedan korak ne ostaje delimicno primenjen.
+            ArgumentCaptor<String> releaseResId = ArgumentCaptor.forClass(String.class);
+            verify(bankaCoreClient).releaseFunds(releaseResId.capture(), anyString(),
+                    any(ReleaseFundsRequest.class));
+            assertThat(releaseResId.getValue()).isEqualTo("RES-77");
+            verify(contractRepository, never()).save(any(OtcContract.class));
         }
 
         @Test
@@ -666,8 +1097,9 @@ class OtcServiceTest {
             OtcOffer offer = activeOffer(1L, 1L, 2L, listing, 5, "160.00", "50.00", 2L);
             when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
             Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 0);
-            when(portfolioRepository.findByUserIdAndUserRole(2L, UserRole.CLIENT))
-                    .thenReturn(List.of(sellerPf));
+            // P2-authz-method-1 (R1 474): pessimistic lock na seller portfolio.
+            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(2L, UserRole.CLIENT, 100L))
+                    .thenReturn(Optional.of(sellerPf));
             when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(0);
             // buyer is client id=1, but account 10 belongs to ownerClientId=999
             when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "X", "USD", 999L));
@@ -675,132 +1107,6 @@ class OtcServiceTest {
             assertThatThrownBy(() -> service.acceptOffer(1L, 10L))
                     .isInstanceOf(AccessDeniedException.class)
                     .hasMessageContaining("ne pripada korisniku");
-        }
-    }
-
-    // ── exerciseContract — money seam: commitFunds + creditFunds ────────────
-
-    @Nested
-    @DisplayName("exerciseContract — money seam (commitFunds buyer rezervacija + creditFunds seller)")
-    class ExerciseContract {
-
-        @Test
-        @DisplayName("exerciseContract — commitFunds buyer rezervacija + creditFunds seller; "
-                + "portfolio prebacen")
-        void exercise_commitAndCredit() {
-            authClient();
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
-            Listing listing = stockListing(100L, "AAPL", "USD");
-            OtcContract contract = activeContract(7L, 1L, 2L, listing, 5, "160.00", "RES-77");
-            when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
-            when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            // seller (klijent #2) → njegov licni preferiran racun (id=88, USD)
-            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
-                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
-            when(bankaCoreClient.commitFunds(anyString(), anyString(), any(CommitFundsRequest.class)))
-                    .thenReturn(new CommitFundsResponse("RES-77", new BigDecimal("800.00"),
-                            BigDecimal.ZERO, BigDecimal.ZERO));
-            when(bankaCoreClient.creditFunds(anyString(), any(CreditFundsRequest.class)))
-                    .thenReturn(new CreditFundsResponse(88L, new BigDecimal("800.00"),
-                            new BigDecimal("100800.00")));
-            Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 5);
-            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                    2L, UserRole.CLIENT, 100L)).thenReturn(Optional.of(sellerPf));
-            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                    1L, UserRole.CLIENT, 100L)).thenReturn(Optional.empty());
-            when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
-            when(contractRepository.save(any(OtcContract.class))).thenAnswer(inv -> inv.getArgument(0));
-
-            service.exerciseContract(7L, 10L);
-
-            // 1. commitFunds buyer rezervacija (RES-77, 800, bez beneficiary-ja)
-            ArgumentCaptor<String> commitResId = ArgumentCaptor.forClass(String.class);
-            ArgumentCaptor<String> commitKey = ArgumentCaptor.forClass(String.class);
-            ArgumentCaptor<CommitFundsRequest> commitReq =
-                    ArgumentCaptor.forClass(CommitFundsRequest.class);
-            verify(bankaCoreClient).commitFunds(commitResId.capture(), commitKey.capture(),
-                    commitReq.capture());
-            assertThat(commitResId.getValue()).isEqualTo("RES-77");
-            assertThat(commitKey.getValue()).isEqualTo("otc-exercise-7-commit");
-            assertThat(commitReq.getValue().amount()).isEqualByComparingTo("800.00");
-            assertThat(commitReq.getValue().beneficiaryAccountId()).isNull();
-
-            // 2. creditFunds seller (njegov licni racun 88, 800)
-            ArgumentCaptor<String> creditKey = ArgumentCaptor.forClass(String.class);
-            ArgumentCaptor<CreditFundsRequest> creditReq =
-                    ArgumentCaptor.forClass(CreditFundsRequest.class);
-            verify(bankaCoreClient).creditFunds(creditKey.capture(), creditReq.capture());
-            assertThat(creditKey.getValue()).isEqualTo("otc-exercise-7-credit");
-            assertThat(creditReq.getValue().accountId()).isEqualTo(88L);
-            assertThat(creditReq.getValue().amount()).isEqualByComparingTo("800.00");
-
-            // contract postaje EXERCISED
-            ArgumentCaptor<OtcContract> contractCaptor = ArgumentCaptor.forClass(OtcContract.class);
-            verify(contractRepository).save(contractCaptor.capture());
-            assertThat(contractCaptor.getValue().getStatus()).isEqualTo(OtcContractStatus.EXERCISED);
-            assertThat(contractCaptor.getValue().getExercisedAt()).isNotNull();
-        }
-
-        @Test
-        @DisplayName("exerciseContract — legacy ugovor bez rezervacije → fallback transferFunds")
-        void exercise_legacyContractUsesTransfer() {
-            authClient();
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
-            Listing listing = stockListing(100L, "AAPL", "USD");
-            OtcContract contract = activeContract(7L, 1L, 2L, listing, 5, "160.00", null);
-            contract.setBuyerReservedAmount(null); // legacy — bez rezervacije
-            when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
-            when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            // seller (klijent #2) → njegov licni preferiran racun (id=88, USD)
-            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
-                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
-            when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
-                    .thenReturn(new TransferFundsResponse(10L, 88L, new BigDecimal("800.00"),
-                            BigDecimal.ZERO, BigDecimal.ZERO));
-            Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 5);
-            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                    2L, UserRole.CLIENT, 100L)).thenReturn(Optional.of(sellerPf));
-            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                    1L, UserRole.CLIENT, 100L)).thenReturn(Optional.empty());
-            when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
-            when(contractRepository.save(any(OtcContract.class))).thenAnswer(inv -> inv.getArgument(0));
-
-            service.exerciseContract(7L, 10L);
-
-            // legacy: nema commit/credit, fallback transferFunds
-            verify(bankaCoreClient).transferFunds(eq("otc-accept-7-exercise"),
-                    any(TransferFundsRequest.class));
-            verify(bankaCoreClient, never()).commitFunds(anyString(), anyString(),
-                    any(CommitFundsRequest.class));
-        }
-
-        @Test
-        @DisplayName("exerciseContract — ne-kupac dobija AccessDenied")
-        void exercise_nonBuyerDenied() {
-            authClient();
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(2L, UserRole.CLIENT));
-            Listing listing = stockListing(100L, "AAPL", "USD");
-            OtcContract contract = activeContract(7L, 1L, 2L, listing, 5, "160.00", "RES-77");
-            when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
-
-            assertThatThrownBy(() -> service.exerciseContract(7L, 10L))
-                    .isInstanceOf(AccessDeniedException.class)
-                    .hasMessageContaining("Samo kupac");
-        }
-
-        @Test
-        @DisplayName("exerciseContract — neaktivan ugovor → IllegalStateException")
-        void exercise_inactiveContract() {
-            authClient();
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
-            Listing listing = stockListing(100L, "AAPL", "USD");
-            OtcContract contract = activeContract(7L, 1L, 2L, listing, 5, "160.00", "RES-77");
-            contract.setStatus(OtcContractStatus.EXERCISED);
-            when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
-
-            assertThatThrownBy(() -> service.exerciseContract(7L, 10L))
-                    .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("nije aktivan");
         }
     }
 

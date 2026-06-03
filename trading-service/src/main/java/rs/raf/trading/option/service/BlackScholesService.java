@@ -76,15 +76,18 @@ public class BlackScholesService {
                     .setScale(4, java.math.RoundingMode.HALF_UP);
         }
 
-        double d1 = (Math.log(spotPrice / strikePrice)
-                + (riskFreeRate + volatility * volatility / 2.0) * timeToExpiryYears)
-                / (volatility * Math.sqrt(timeToExpiryYears));
-        double d2 = d1 - volatility * Math.sqrt(timeToExpiryYears);
+        double[] d = computeD1D2(spotPrice, strikePrice, timeToExpiryYears, riskFreeRate, volatility);
+        double d1 = d[0];
+        double d2 = d[1];
 
         double callPrice = spotPrice * normalCDF(d1)
                 - strikePrice * Math.exp(-riskFreeRate * timeToExpiryYears) * normalCDF(d2);
 
-        return BigDecimal.valueOf(callPrice).setScale(4, java.math.RoundingMode.HALF_UP);
+        // [P2-input-validation-1 / R1 459] clamp na 0 — za deep-OTM opcije
+        // (ili numericku gresku N(x) aproksimacije) formula moze vratiti
+        // marginalno negativnu cenu; opcija nema negativnu vrednost. Paritet sa
+        // intrinsic-value granom (T<=0) koja vec radi max(0,...).
+        return BigDecimal.valueOf(Math.max(0.0, callPrice)).setScale(4, java.math.RoundingMode.HALF_UP);
     }
 
     /**
@@ -106,15 +109,15 @@ public class BlackScholesService {
                     .setScale(4, java.math.RoundingMode.HALF_UP);
         }
 
-        double d1 = (Math.log(spotPrice / strikePrice)
-                + (riskFreeRate + volatility * volatility / 2.0) * timeToExpiryYears)
-                / (volatility * Math.sqrt(timeToExpiryYears));
-        double d2 = d1 - volatility * Math.sqrt(timeToExpiryYears);
+        double[] d = computeD1D2(spotPrice, strikePrice, timeToExpiryYears, riskFreeRate, volatility);
+        double d1 = d[0];
+        double d2 = d[1];
 
         double putPrice = strikePrice * Math.exp(-riskFreeRate * timeToExpiryYears) * normalCDF(-d2)
                 - spotPrice * normalCDF(-d1);
 
-        return BigDecimal.valueOf(putPrice).setScale(4, java.math.RoundingMode.HALF_UP);
+        // [P2-input-validation-1 / R1 459] clamp na 0 (vidi calculateCallPrice).
+        return BigDecimal.valueOf(Math.max(0.0, putPrice)).setScale(4, java.math.RoundingMode.HALF_UP);
     }
 
     /** Convenience metoda sa default risk-free rate-om. */
@@ -129,6 +132,31 @@ public class BlackScholesService {
                                         double timeToExpiryYears, double volatility) {
         return calculatePutPrice(spotPrice, strikePrice, timeToExpiryYears,
                 DEFAULT_RISK_FREE_RATE, volatility);
+    }
+
+    /**
+     * R1 762: zajednicki proracun Black-Scholes pomocnih promenljivih d1 i d2 —
+     * identican za CALL i PUT cenu (ranije kopiran verbatim u obe metode).
+     *
+     * <pre>
+     *   d1 = [ln(S/K) + (r + sigma^2/2)·T] / (sigma·sqrt(T))
+     *   d2 = d1 − sigma·sqrt(T)
+     * </pre>
+     *
+     * Pretpostavlja {@code timeToExpiryYears > 0} i {@code volatility > 0}
+     * (pozivaoci to vec validiraju pre poziva).
+     *
+     * @return dvoelementni niz {@code {d1, d2}}
+     */
+    protected double[] computeD1D2(double spotPrice, double strikePrice,
+                                   double timeToExpiryYears, double riskFreeRate,
+                                   double volatility) {
+        double sqrtT = Math.sqrt(timeToExpiryYears);
+        double d1 = (Math.log(spotPrice / strikePrice)
+                + (riskFreeRate + volatility * volatility / 2.0) * timeToExpiryYears)
+                / (volatility * sqrtT);
+        double d2 = d1 - volatility * sqrtT;
+        return new double[] {d1, d2};
     }
 
     /**

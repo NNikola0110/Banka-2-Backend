@@ -3,6 +3,7 @@ package rs.raf.banka2_bek.account.service.implementation;
 import rs.raf.banka2_bek.account.dto.AccountResponseDto;
 import rs.raf.banka2_bek.account.dto.CreateAccountDto;
 import rs.raf.banka2_bek.account.model.Account;
+import rs.raf.banka2_bek.account.model.AccountDefaults;
 import rs.raf.banka2_bek.account.model.AccountStatus;
 import rs.raf.banka2_bek.account.model.AccountType;
 import rs.raf.banka2_bek.account.repository.AccountRepository;
@@ -34,6 +35,7 @@ import org.springframework.context.annotation.Lazy;
 import rs.raf.banka2_bek.notification.NotificationPublisher;
 import rs.raf.banka2_bek.audit.model.AuditActionType;
 import rs.raf.banka2_bek.audit.service.AuditLogService;
+import rs.raf.banka2_bek.audit.service.CurrentAuditActorResolver;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
@@ -58,6 +60,8 @@ public class AccountServiceImplementation implements AccountService {
     private final String bankRegistrationNumber;
     // BE-PAY-01: audit hooks za status/limits change
     private final AuditLogService auditLogService;
+    // P2-audit-coverage-1 (R5 1891): aktor = IZVRSILAC (iz SecurityContext), ne vlasnik racuna.
+    private final CurrentAuditActorResolver currentAuditActorResolver;
 
     public AccountServiceImplementation(AccountRepository accountRepository,
                                          ClientRepository clientRepository,
@@ -68,7 +72,8 @@ public class AccountServiceImplementation implements AccountService {
                                          @Lazy CardService cardService,
                                          NotificationPublisher notificationPublisher,
                                          @Value("${bank.registration-number}") String bankRegistrationNumber,
-                                         AuditLogService auditLogService) {
+                                         AuditLogService auditLogService,
+                                         CurrentAuditActorResolver currentAuditActorResolver) {
         this.accountRepository = accountRepository;
         this.clientRepository = clientRepository;
         this.currencyRepository = currencyRepository;
@@ -79,6 +84,7 @@ public class AccountServiceImplementation implements AccountService {
         this.notificationPublisher = notificationPublisher;
         this.bankRegistrationNumber = bankRegistrationNumber;
         this.auditLogService = auditLogService;
+        this.currentAuditActorResolver = currentAuditActorResolver;
     }
 
     @Override
@@ -92,10 +98,25 @@ public class AccountServiceImplementation implements AccountService {
         Currency currency = currencyRepository.findByCode(currCode)
                 .orElseThrow(() -> new RuntimeException("Valuta '" + currCode + "' nije pronadjena"));
 
-        // Find employee from security context (admin moze biti u users ali ne u employees)
+        // P0-B9 N1 (IDOR/authz): kreiranje racuna je zaposlenicka operacija
+        // (URL-level gate u GlobalSecurityConfig: POST /accounts ->
+        // hasAnyRole(ADMIN,EMPLOYEE)). Kreatora racuna resolve-ujemo iz
+        // autentifikovanog principala — NIKAD vise silent-fallback na "prvog
+        // zaposlenog" za proizvoljnog pozivaoca (to je curilo identitet kreatora
+        // i, pre URL gate-a, dozvoljavalo klijentu da kreira racun pod tudjim
+        // employee zapisom). ADMIN je User (nije u `employees`), pa za njega —
+        // i SAMO za autentifikovanog privilegovanog pozivaoca — dozvoljavamo
+        // kontrolisani fallback na aktivnog zaposlenog (admin radi "u ime"
+        // bankarskog tela). CLIENT vise ne moze ni da dodje dovde.
         String email = getAuthenticatedEmail();
         Employee employee = employeeRepository.findByEmail(email).orElse(null);
         if (employee == null) {
+            if (!isPrivilegedCaller()) {
+                throw new org.springframework.security.access.AccessDeniedException(
+                        "Kreiranje racuna je dozvoljeno samo zaposlenima.");
+            }
+            // Privilegovan pozivalac (npr. ADMIN) bez employee zapisa — kontrolisani
+            // fallback na aktivnog zaposlenog kao knjigovodstvenog kreatora.
             employee = employeeRepository.findAll().stream()
                     .filter(e -> Boolean.TRUE.equals(e.getActive()))
                     .findFirst()
@@ -184,7 +205,13 @@ public class AccountServiceImplementation implements AccountService {
             throw new RuntimeException("Licni racun mora imati klijenta (ownerEmail ili clientId)");
         }
 
-        // Generate account number
+        // R1-311: generisanje broja racuna. do/while pre-check (existsByAccountNumber)
+        // smanjuje verovatnocu kolizije na zanemarljivu (9-cifreni SecureRandom =
+        // ~10^9 prostor); PRAVI TOCTOU guard je DB unique constraint na accountNumber
+        // (`@Column(nullable=false, unique=true)`) — dva paralelna createAccount-a koja
+        // istovremeno generisu isti broj oba prodju pre-check, ali DB odbije drugi
+        // insert (data se ne duplira). Standardizacija residualnog DataIntegrityViolation
+        // → 409 cisto telo je u domenu P2-error-contract-2 (global handler), ne ovde.
         String accountNumber;
         do {
             accountNumber = AccountNumberUtils.generate(
@@ -193,8 +220,9 @@ public class AccountServiceImplementation implements AccountService {
                     isBusiness);
         } while (accountRepository.existsByAccountNumber(accountNumber));
 
-        BigDecimal dailyLimit = request.getDailyLimit() != null ? request.getDailyLimit() : BigDecimal.valueOf(250000);
-        BigDecimal monthlyLimit = request.getMonthlyLimit() != null ? request.getMonthlyLimit() : BigDecimal.valueOf(1000000);
+        // R1-626: podrazumevani limiti iz jedinstvenog izvora (AccountDefaults).
+        BigDecimal dailyLimit = request.getDailyLimit() != null ? request.getDailyLimit() : AccountDefaults.DEFAULT_DAILY_LIMIT;
+        BigDecimal monthlyLimit = request.getMonthlyLimit() != null ? request.getMonthlyLimit() : AccountDefaults.DEFAULT_MONTHLY_LIMIT;
 
         Account account = Account.builder()
                 .accountNumber(accountNumber)
@@ -209,7 +237,7 @@ public class AccountServiceImplementation implements AccountService {
                 .availableBalance(request.getResolvedInitialBalance())
                 .dailyLimit(dailyLimit)
                 .monthlyLimit(monthlyLimit)
-                .maintenanceFee(request.getAccountType() == AccountType.FOREIGN ? BigDecimal.ZERO : BigDecimal.valueOf(255))
+                .maintenanceFee(request.getAccountType() == AccountType.FOREIGN ? BigDecimal.ZERO : AccountDefaults.MAINTENANCE_FEE)
                 .status(AccountStatus.ACTIVE)
                 .expirationDate(LocalDate.now().plusYears(5))
                 .createdAt(LocalDateTime.now())
@@ -257,7 +285,8 @@ public class AccountServiceImplementation implements AccountService {
     @Transactional
     public AccountResponseDto changeAccountStatus(Long accountId, String newStatus) {
         Account account = accountRepository.findById(accountId)
-                .orElseThrow(() -> new RuntimeException("Racun sa ID " + accountId + " nije pronadjen"));
+                .orElseThrow(() -> new jakarta.persistence.EntityNotFoundException(
+                        "Racun sa ID " + accountId + " nije pronadjen"));
         AccountStatus oldStatus = account.getStatus();
         try {
             account.setStatus(AccountStatus.valueOf(newStatus.toUpperCase()));
@@ -266,13 +295,15 @@ public class AccountServiceImplementation implements AccountService {
         }
         account = accountRepository.save(account);
 
-        // BE-PAY-01: audit hook za account status change
+        // BE-PAY-01 + P2-audit-coverage-1 (R5 1891): aktor = IZVRSILAC (zaposleni iz
+        // SecurityContext), ne vlasnik racuna. Vlasnik ostaje u targetId/opisu.
         Long ownerId = account.getClient() != null ? account.getClient().getId() : null;
+        CurrentAuditActorResolver.AuditActor actor = resolveActorSafe();
         try {
             auditLogService.record(
-                    ownerId, "EMPLOYEE",
+                    actor.actorId(), actor.actorType(),
                     AuditActionType.ACCOUNT_STATUS_CHANGED,
-                    "Account " + accountId + " status changed",
+                    "Account " + accountId + " status changed (owner client=" + ownerId + ")",
                     "ACCOUNT", accountId,
                     oldStatus != null ? oldStatus.name() : null,
                     account.getStatus() != null ? account.getStatus().name() : null);
@@ -284,9 +315,26 @@ public class AccountServiceImplementation implements AccountService {
         return toResponse(account);
     }
 
+    /**
+     * P2-audit-coverage-1 (R5 1891): razresava izvrsioca iz SecurityContext-a;
+     * null-safe (resolver moze biti null u nekim unit testovima → SYSTEM aktor).
+     */
+    private CurrentAuditActorResolver.AuditActor resolveActorSafe() {
+        try {
+            if (currentAuditActorResolver != null) {
+                return currentAuditActorResolver.resolveCurrentActor();
+            }
+        } catch (Exception ignored) {
+            // pad na SYSTEM ispod
+        }
+        return CurrentAuditActorResolver.SYSTEM;
+    }
+
     private Account checkAuth(Long accountId) throws IllegalStateException {
+        // R1 308: nepostojeci racun je 404, ne 400 (IllegalArgumentException→400 u
+        // AccountExceptionHandler). EntityNotFoundException→404 (global + scoped handler).
         Account account = accountRepository.findById(accountId)
-                .orElseThrow(() -> new IllegalArgumentException(
+                .orElseThrow(() -> new jakarta.persistence.EntityNotFoundException(
                         "Account with ID " + accountId + " not found."
                 ));
 
@@ -344,18 +392,19 @@ public class AccountServiceImplementation implements AccountService {
             );
         }
 
-        // Proveri duplikat imena medju racunima istog vlasnika
-        Client client = getOptionalClient();
-        if (client != null) {
-            List<Account> clientAccounts = accountRepository.findAccessibleAccounts(
-                    client.getId(), AccountStatus.ACTIVE);
-            boolean nameExists = clientAccounts.stream()
-                    .anyMatch(a -> newName.equals(a.getName()) && !a.getId().equals(accountId));
-            if (nameExists) {
-                throw new IllegalStateException(
-                        "Account name '" + newName + "' is already used by another account."
-                );
-            }
+        // R1-307: duplikat imena se proverava medju racunima ISTOG VLASNIKA, preko
+        // SVIH statusa (ACTIVE/INACTIVE/BLOCKED), nezavisno od toga ko renamuje.
+        // Stari kod je (a) gledao samo ACTIVE racune pa je INACTIVE/BLOCKED duplikat
+        // prolazio i (b) preskakao proveru u potpunosti kad renamuje zaposleni
+        // (getOptionalClient()==null) → admin/supervizor je mogao napraviti duplikat.
+        // Vlasnika izvlacimo iz samog racuna (client ili company), ne iz kontekst-korisnika.
+        List<Account> ownerAccounts = findOwnerAccounts(account);
+        boolean nameExists = ownerAccounts.stream()
+                .anyMatch(a -> newName.equals(a.getName()) && !a.getId().equals(accountId));
+        if (nameExists) {
+            throw new IllegalStateException(
+                    "Account name '" + newName + "' is already used by another account."
+            );
         }
 
         account.setName(newName);
@@ -364,19 +413,33 @@ public class AccountServiceImplementation implements AccountService {
         return toResponse(account);
     }
 
+    /**
+     * R1-307: vraca sve racune vlasnika datog racuna (klijent ILI kompanija),
+     * preko SVIH statusa — koristi se za proveru duplikata naziva pri rename-u.
+     * Lazy {@code client}/{@code company} se citaju unutar {@code @Transactional}
+     * (caller updateAccountName je transakcioni).
+     */
+    private List<Account> findOwnerAccounts(Account account) {
+        if (account.getClient() != null) {
+            return accountRepository.findByClientId(account.getClient().getId());
+        }
+        if (account.getCompany() != null) {
+            return accountRepository.findByCompanyId(account.getCompany().getId());
+        }
+        return List.of();
+    }
+
     @Override
     @Transactional
-    public AccountResponseDto updateAccountLimits(Long accountId, BigDecimal dailyLimit, BigDecimal monthlyLimit) {
+    public AccountResponseDto updateAccountLimits(Long accountId, BigDecimal dailyLimit,
+                                                  BigDecimal monthlyLimit) {
         Account account = checkAuth(accountId);
         BigDecimal oldDaily = account.getDailyLimit();
         BigDecimal oldMonthly = account.getMonthlyLimit();
 
-        // Verifikacija promene limita (Celina 2 — "Promena limita (zahteva verifikaciju)").
-        // Mobilni OTP flow je vec implementiran kao VerificationModal komponenta na FE-u
-        // i mobile-side na Banka-2-Mobile aplikaciji; ovde se OTP code prenosi kao
-        // request param u kontroleru i validira pre dolaska u service. Buduci ekstenziton
-        // poslovni flow (npr. push notifikacija + ASR-style biometric approval) ce se
-        // prikljuciti istim verification servisom.
+        // ACCEPTED-DEVIATION (user-directed 03.06): nekadasnji TEST-accounts-2 OTP
+        // gate za promenu limita je UKLONJEN. OTP/verifikacija sada vazi ISKLJUCIVO
+        // za placanja i transfere (money-out). Promena limita se primenjuje direktno.
 
         if (dailyLimit != null) {
             account.setDailyLimit(dailyLimit);
@@ -387,13 +450,15 @@ public class AccountServiceImplementation implements AccountService {
 
         accountRepository.save(account);
 
-        // BE-PAY-01: audit hook za account limits change
+        // BE-PAY-01 + P2-audit-coverage-1 (R5 1891): aktor = IZVRSILAC (klijent-vlasnik
+        // ili zaposleni iz SecurityContext), ne hardkodiran "CLIENT" sa owner-id-em.
         Long ownerId = account.getClient() != null ? account.getClient().getId() : null;
+        CurrentAuditActorResolver.AuditActor limitsActor = resolveActorSafe();
         try {
             auditLogService.record(
-                    ownerId, "CLIENT",
+                    limitsActor.actorId(), limitsActor.actorType(),
                     AuditActionType.ACCOUNT_LIMITS_CHANGED,
-                    "Account " + accountId + " limits changed",
+                    "Account " + accountId + " limits changed (owner client=" + ownerId + ")",
                     "ACCOUNT", accountId,
                     "daily=" + oldDaily + ",monthly=" + oldMonthly,
                     "daily=" + dailyLimit + ",monthly=" + monthlyLimit);
@@ -405,7 +470,6 @@ public class AccountServiceImplementation implements AccountService {
         return toResponse(account);
     }
 
-
     @Override
     @Transactional(readOnly = true)
     public List<AccountResponseDto> getBankAccounts() {
@@ -415,7 +479,14 @@ public class AccountServiceImplementation implements AccountService {
     }
 
     private AccountResponseDto toResponse(Account account) {
-        // rezervisana sredstva = stanje - raspolozivo stanje
+        // R1-627: IZABRAN JEDAN izvor istine za prikazana "rezervisana sredstva" =
+        // (balance - availableBalance). To je gep izmedju ukupnog i raspolozivog
+        // stanja koji korisnik vidi (zadrzano pending/approved orderima, placanjima,
+        // ratama kredita...). Kolona `Account.reservedAmount` je INTERNI tracker
+        // koji odrzavaju samo interbank/internalFunds reservation flow-ovi (2PC,
+        // OTC) i NIJE isti pojam kao prikazani gep — zato ga DTO namerno NE koristi
+        // (vidi javadoc na Account.reservedAmount). Postojeci API kontrakt + FE +
+        // testovi ocekuju balance-availableBalance, pa je to fiksirani izvor.
         BigDecimal reservedFunds = account.getBalance()
                 .subtract(account.getAvailableBalance());
 
@@ -499,5 +570,29 @@ public class AccountServiceImplementation implements AccountService {
             log.warn("Error processing account operation", e);
             return null;
         }
+    }
+
+    /**
+     * P0-B9 N1: vraca {@code true} ako je pozivalac privilegovan (ROLE_ADMIN /
+     * ROLE_EMPLOYEE / SUPERVISOR), ILI ako auth kontekst NIJE postavljen
+     * (interni / no-auth poziv — npr. scheduleri i unit testovi). CLIENT pozivalac
+     * vraca {@code false}. Ovaj helper sluzi SAMO kao defense-in-depth za
+     * employee-fallback granu u {@code createAccount} — HTTP put je vec zatvoren
+     * URL gate-om u {@code GlobalSecurityConfig}.
+     */
+    private boolean isPrivilegedCaller() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || auth.getAuthorities() == null) return true; // interni/no-auth — ne diramo
+        boolean isClient = auth.getAuthorities().stream().anyMatch(a -> {
+            String role = a.getAuthority();
+            return "ROLE_CLIENT".equals(role) || "CLIENT".equals(role);
+        });
+        boolean isEmployeeOrAdmin = auth.getAuthorities().stream().anyMatch(a -> {
+            String role = a.getAuthority();
+            return "ROLE_ADMIN".equals(role) || "ROLE_EMPLOYEE".equals(role)
+                    || "ADMIN".equals(role) || "EMPLOYEE".equals(role) || "SUPERVISOR".equals(role);
+        });
+        if (isEmployeeOrAdmin) return true;
+        return !isClient;
     }
 }

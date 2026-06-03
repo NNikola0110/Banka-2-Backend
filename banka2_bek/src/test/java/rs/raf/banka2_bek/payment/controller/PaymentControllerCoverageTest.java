@@ -365,8 +365,20 @@ class PaymentControllerCoverageTest {
     // ---------- GET /payments/my-otp ----------
 
     @Test
-    @DisplayName("GET /payments/my-otp — 200 vraca active OTP mapu")
+    @DisplayName("P1-auth-2 (105): GET /payments/my-otp — 404 kad je flag iskljucen (prod default)")
+    void getMyOtp_disabledByDefault_returns404() throws Exception {
+        // Default exposeActiveOtp=false (prod-safe) -> endpoint vraca 404 i NIKAD
+        // ne otkriva 2FA kod (ni za autentifikovanog korisnika).
+        mockMvc.perform(get("/payments/my-otp").principal(auth))
+                .andExpect(status().isNotFound());
+
+        verify(otpService, never()).getActiveOtp(anyString());
+    }
+
+    @Test
+    @DisplayName("GET /payments/my-otp — 200 vraca active OTP mapu kad je dev-flag ukljucen")
     void getMyOtp_success() throws Exception {
+        org.springframework.test.util.ReflectionTestUtils.setField(paymentController, "exposeActiveOtp", true);
         when(otpService.getActiveOtp("client@example.com"))
                 .thenReturn(Map.of("code", "123456", "active", true));
 
@@ -376,8 +388,9 @@ class PaymentControllerCoverageTest {
     }
 
     @Test
-    @DisplayName("GET /payments/my-otp — 401 kad nema auth")
+    @DisplayName("GET /payments/my-otp — 401 kad nema auth (dev-flag ukljucen)")
     void getMyOtp_noAuth_returns401() throws Exception {
+        org.springframework.test.util.ReflectionTestUtils.setField(paymentController, "exposeActiveOtp", true);
         SecurityContextHolder.clearContext();
 
         mockMvc.perform(get("/payments/my-otp"))

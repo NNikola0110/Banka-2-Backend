@@ -17,8 +17,6 @@ import java.util.List;
 // ============================================================
 public interface RecurringOrderRepository extends JpaRepository<RecurringOrder, Long> {
 
-    List<RecurringOrder> findByActiveTrue();
-
     List<RecurringOrder> findByOwnerIdAndOwnerTypeOrderByCreatedAtDesc(Long ownerId, String ownerType);
 
     @Query("SELECT r FROM RecurringOrder r WHERE r.active = true AND r.nextRun <= :now")

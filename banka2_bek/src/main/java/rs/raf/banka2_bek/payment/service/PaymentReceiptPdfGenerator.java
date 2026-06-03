@@ -5,29 +5,49 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
-import org.apache.pdfbox.pdmodel.font.PDType1Font;
-import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
+import org.apache.pdfbox.pdmodel.font.PDType0Font;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 import rs.raf.banka2_bek.transaction.dto.TransactionResponseDto;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.math.BigDecimal;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Generise PDF potvrdu transakcije.
+ *
+ * <p>P0-B4 Nalaz 2: koristi embedovan Unicode TTF (Open Sans, {@link PDType0Font})
+ * umesto Standard-14 WinAnsi fonta. WinAnsi {@code showText} baca
+ * {@link IllegalArgumentException} na karaktere van Latin-1 (srpski č/ć/š/ž/đ),
+ * pa je "Stampaj potvrdu" pucao sa 500. Open Sans pokriva Latin Extended-A pa
+ * sve srpske latinicke dijakritike renderuju ispravno.</p>
+ *
+ * <p>P1-i18n-1 / 1855: tekst potvrde je na srpskom (svi mejlovi i ostatak
+ * proizvoda su srpski sa dijakritikom — engleski PDF je kvario kohezivnost).
+ * Open Sans pokriva srpske dijakritike pa labele renderuju ispravno. Masinske
+ * vrednosti (tip transakcije, brojevi, valuta) ostaju nepromenjene.</p>
+ */
 @Service
 @Slf4j
 public class PaymentReceiptPdfGenerator {
 
     private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-    private static final PDType1Font TITLE_FONT = new PDType1Font(Standard14Fonts.FontName.HELVETICA_BOLD);
-    private static final PDType1Font BODY_FONT = new PDType1Font(Standard14Fonts.FontName.HELVETICA);
+
+    private static final String TITLE_FONT_PATH = "fonts/OpenSans-Bold.ttf";
+    private static final String BODY_FONT_PATH = "fonts/OpenSans-Regular.ttf";
 
     public byte[] generate(TransactionResponseDto transaction) {
         try (PDDocument document = new PDDocument();
              ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+
+            // PDType0Font je vezan za PDDocument — ucitavamo ga per-dokument.
+            PDType0Font titleFont = loadFont(document, TITLE_FONT_PATH);
+            PDType0Font bodyFont = loadFont(document, BODY_FONT_PATH);
 
             PDPage page = new PDPage(PDRectangle.A4);
             document.addPage(page);
@@ -36,14 +56,14 @@ public class PaymentReceiptPdfGenerator {
                 List<String> lines = buildLines(transaction);
 
                 contentStream.beginText();
-                contentStream.setFont(TITLE_FONT, 14);
+                contentStream.setFont(titleFont, 14);
                 contentStream.newLineAtOffset(50, 780);
-                contentStream.showText("Transaction Receipt");
+                contentStream.showText(sanitize("Potvrda o transakciji", titleFont));
                 contentStream.newLineAtOffset(0, -24);
 
-                contentStream.setFont(BODY_FONT, 11);
+                contentStream.setFont(bodyFont, 11);
                 for (String line : lines) {
-                    contentStream.showText(line);
+                    contentStream.showText(sanitize(line, bodyFont));
                     contentStream.newLineAtOffset(0, -16);
                 }
                 contentStream.endText();
@@ -57,23 +77,71 @@ public class PaymentReceiptPdfGenerator {
         }
     }
 
+    /**
+     * Ucitava embedovan Unicode TTF iz classpath-a i embeduje ga u dokument.
+     * {@code embedSubset=true} ubacuje samo koriscene glyph-ove (manji PDF).
+     */
+    private PDType0Font loadFont(PDDocument document, String resourcePath) throws IOException {
+        try (InputStream fontStream = new ClassPathResource(resourcePath).getInputStream()) {
+            return PDType0Font.load(document, fontStream, true);
+        }
+    }
+
+    /**
+     * Robusno ciscenje teksta pre {@code showText}: izbacuje kontrolne karaktere
+     * (newline/tab koje PDFBox odbija) i sve codepoint-ove koje embedovan font ne
+     * pokriva, zamenjujuci ih sa '?' da generisanje NIKAD ne pukne na egzoticnom
+     * ulazu (npr. emoji ili cirilica van fonta). Open Sans pokriva ceo latinicki
+     * set + srpske dijakritike pa se za normalan unos nista ne menja.
+     */
+    private String sanitize(String text, PDType0Font font) {
+        if (text == null || text.isEmpty()) {
+            return text == null ? "" : text;
+        }
+        StringBuilder sb = new StringBuilder(text.length());
+        text.codePoints().forEach(cp -> {
+            if (cp == '\n' || cp == '\r' || cp == '\t') {
+                sb.append(' ');
+                return;
+            }
+            if (Character.isISOControl(cp)) {
+                return; // preskoci ostale kontrolne karaktere
+            }
+            if (fontCanRender(font, cp)) {
+                sb.appendCodePoint(cp);
+            } else {
+                sb.append('?');
+            }
+        });
+        return sb.toString();
+    }
+
+    private boolean fontCanRender(PDType0Font font, int codePoint) {
+        try {
+            return font.hasGlyph(codePoint);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     private List<String> buildLines(TransactionResponseDto transaction) {
         List<String> lines = new ArrayList<>();
-        lines.add("Transaction ID: " + transaction.getId());
-        lines.add("Date: " + (transaction.getCreatedAt() == null ? "-" : transaction.getCreatedAt().format(DATE_TIME_FORMATTER)));
-        lines.add("Type: " + (transaction.getType() == null ? "-" : transaction.getType().name()));
-        lines.add("Direction: " + resolveDirection(transaction));
-        lines.add("From account: " + safe(transaction.getAccountNumber()));
-        lines.add("To Account: " + safe(transaction.getToAccountNumber()));
-        lines.add("Amount: " + resolveAmount(transaction));
-        lines.add("Currency: " + safe(transaction.getCurrencyCode()));
+        lines.add("Broj transakcije: " + transaction.getId());
+        lines.add("Datum: " + (transaction.getCreatedAt() == null ? "-" : transaction.getCreatedAt().format(DATE_TIME_FORMATTER)));
+        // Tip transakcije je masinski enum (PAYMENT/TRANSFER...) — ostaje nepromenjen.
+        lines.add("Tip: " + (transaction.getType() == null ? "-" : transaction.getType().name()));
+        lines.add("Smer: " + resolveDirection(transaction));
+        lines.add("Sa računa: " + safe(transaction.getAccountNumber()));
+        lines.add("Na račun: " + safe(transaction.getToAccountNumber()));
+        lines.add("Iznos: " + resolveAmount(transaction));
+        lines.add("Valuta: " + safe(transaction.getCurrencyCode()));
 
-        lines.add("Description: " + safe(transaction.getDescription()));
+        lines.add("Opis: " + safe(transaction.getDescription()));
         return lines;
     }
 
     private String resolveDirection(TransactionResponseDto transaction) {
-        return positive(transaction.getDebit()) ? "OUTGOING" : "INCOMING";
+        return positive(transaction.getDebit()) ? "Odlazna" : "Dolazna";
     }
 
     private String resolveAmount(TransactionResponseDto transaction) {

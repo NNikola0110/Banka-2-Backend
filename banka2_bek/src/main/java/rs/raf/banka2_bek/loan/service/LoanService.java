@@ -27,10 +27,11 @@ public interface LoanService {
     List<InstallmentResponseDto> getInstallments(Long loanId);
 
     /**
-     * BE-PAY-06: earlyRepayment sad zahteva OTP kod (paritet sa payments/savings).
-     * {@code otpCode} mora biti unesen u request header-u {@code X-OTP-Code}.
+     * ACCEPTED-DEVIATION (user-directed 03.06): earlyRepayment vise NE zahteva OTP.
+     * OTP/verifikacija vazi iskljucivo za placanja i transfere (money-out); krediti
+     * nisu placanja.
      */
-    LoanResponseDto earlyRepayment(Long loanId, String clientEmail, String otpCode);
+    LoanResponseDto earlyRepayment(Long loanId, String clientEmail);
 
     List<LoanRequestResponseDto> getMyLoanRequests(String clientEmail);
 }

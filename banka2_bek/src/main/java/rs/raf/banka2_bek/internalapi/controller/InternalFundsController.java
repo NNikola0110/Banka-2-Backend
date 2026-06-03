@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.RestController;
 import rs.raf.banka2.contracts.internal.CommitFundsRequest;
 import rs.raf.banka2.contracts.internal.CreditFundsRequest;
 import rs.raf.banka2.contracts.internal.DebitFundsRequest;
+import rs.raf.banka2.contracts.internal.IdempotencyStatusResponse;
 import rs.raf.banka2.contracts.internal.InternalErrorDto;
 import rs.raf.banka2.contracts.internal.ProvisionFundAccountRequest;
 import rs.raf.banka2.contracts.internal.ReleaseFundsRequest;
@@ -20,6 +21,7 @@ import rs.raf.banka2.contracts.internal.TaxCollectRequest;
 import rs.raf.banka2.contracts.internal.TransferFundsRequest;
 import rs.raf.banka2_bek.internalapi.service.InternalAccountProvisioningService;
 import rs.raf.banka2_bek.internalapi.service.InternalFundsService;
+import rs.raf.banka2_bek.internalapi.service.InternalIdempotencyService;
 import rs.raf.banka2_bek.internalapi.service.InternalLookupService;
 
 /**
@@ -39,13 +41,16 @@ public class InternalFundsController {
     private final InternalFundsService fundsService;
     private final InternalLookupService lookupService;
     private final InternalAccountProvisioningService provisioningService;
+    private final InternalIdempotencyService idempotencyService;
 
     public InternalFundsController(InternalFundsService fundsService,
                                    InternalLookupService lookupService,
-                                   InternalAccountProvisioningService provisioningService) {
+                                   InternalAccountProvisioningService provisioningService,
+                                   InternalIdempotencyService idempotencyService) {
         this.fundsService = fundsService;
         this.lookupService = lookupService;
         this.provisioningService = provisioningService;
+        this.idempotencyService = idempotencyService;
     }
 
     // ── Funds ────────────────────────────────────────────────────────────────
@@ -160,6 +165,24 @@ public class InternalFundsController {
                     .body(new InternalErrorDto("MISSING_IDEMPOTENCY_KEY", "X-Idempotency-Key je obavezan"));
         }
         return ResponseEntity.ok(fundsService.collectTaxIdempotent(idempotencyKey, body));
+    }
+
+    /**
+     * <b>N4 (P0-T2):</b> autoritativan READ-ONLY upit da li je idempotency kljuc VEC
+     * KONZUMIRAN (operacija sa tim kljucem zaista izvrsena i kesirana). NE izvrsava
+     * nikakvu funds operaciju. Koristi ga OTC SAGA recovery (C3) da utvrdi da li je F3
+     * {@code creditFunds} (isplata prodavcu) proslo pre pada koordinatora — pa da odluci
+     * izmedju punog reverznog transfera (consumed) i commit-only refund-a kupcu (ne-consumed),
+     * umesto da pogadja po write-ahead flag-ovima (prozor intent=true/done=false). Kljuc je
+     * deterministicki ({@code otc-saga-<sagaId>-f3-credit}), pa ga recovery rekonstruise iz sagaId.
+     *
+     * <p>Path je {@code /funds/idempotency/{key}} — segment {@code idempotency} je literal i ne
+     * kolidira sa {@code /funds/reserve|transfer|credit|...} (svi POST + razlicit prvi segment).
+     */
+    @GetMapping("/funds/idempotency/{key}")
+    public ResponseEntity<IdempotencyStatusResponse> idempotencyStatus(@PathVariable String key) {
+        return ResponseEntity.ok(
+                new IdempotencyStatusResponse(key, idempotencyService.isConsumed(key)));
     }
 
     // ── Lookup ───────────────────────────────────────────────────────────────

@@ -30,13 +30,15 @@ class ActuaryExceptionHandlerTest {
     }
 
     @Test
-    void handleIllegalArgument_returnsNotFound() {
-        IllegalArgumentException ex = new IllegalArgumentException("Invalid actuary ID");
+    void handleIllegalArgument_returnsBadRequest() {
+        // R1-186: IllegalArgumentException je validaciona greska (npr. below-used-limit)
+        // → 400 Bad Request, NE 404. Genuini "ne postoji" baca EntityNotFoundException.
+        IllegalArgumentException ex = new IllegalArgumentException("New daily limit below used limit");
 
         ResponseEntity<Map<String, String>> response = handler.handleIllegalArgument(ex);
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(response.getBody()).containsEntry("error", "Invalid actuary ID");
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).containsEntry("error", "New daily limit below used limit");
     }
 
     @Test
@@ -47,5 +49,14 @@ class ActuaryExceptionHandlerTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
         assertThat(response.getBody()).containsEntry("error", "Limit exceeded");
+    }
+
+    // R1 440 — telo nosi i `message` (FE/Mobile-first) i `error` (legacy).
+    @Test
+    void body_containsBothMessageAndError() {
+        ResponseEntity<Map<String, String>> response = handler.handleIllegalArgument(
+                new IllegalArgumentException("New daily limit below used limit"));
+        assertThat(response.getBody()).containsEntry("message", "New daily limit below used limit");
+        assertThat(response.getBody()).containsEntry("error", "New daily limit below used limit");
     }
 }

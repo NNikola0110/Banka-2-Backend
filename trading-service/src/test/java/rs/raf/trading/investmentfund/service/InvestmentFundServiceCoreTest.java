@@ -63,6 +63,7 @@ class InvestmentFundServiceCoreTest {
     @Mock private FundLiquidationService fundLiquidationService;
     @Mock private CurrencyConversionService currencyConversionService;
     @Mock private FundValueSnapshotScheduler fundValueSnapshotScheduler;
+    @Mock private rs.raf.trading.audit.service.AuditLogService auditLogService;
 
     @InjectMocks
     private InvestmentFundService service;

@@ -49,4 +49,28 @@ class ActivationEmailTemplateTest {
         String body = template.buildBody("http://example.com/activate", "   ");
         assertThat(body).contains("Zdravo");
     }
+
+    // ── [P2-input-validation-1 / R1 385] HTML injection u firstName ──────────
+
+    @Test
+    void buildBody_escapesHtmlInFirstName() {
+        String body = template.buildBody("http://example.com/activate",
+                "<script>alert('xss')</script>");
+        assertThat(body).doesNotContain("<script>alert('xss')</script>");
+        assertThat(body).contains("&lt;script&gt;");
+    }
+
+    @Test
+    void buildBody_activationLinkRemainsUnescaped() {
+        // Link je sistemski-generisan, NE escape-uje se (query parametri ostaju netaknuti).
+        String link = "http://localhost:3000/activate-account?token=abc123";
+        String body = template.buildBody(link, "Marko");
+        assertThat(body).contains(link);
+    }
+
+    @Test
+    void buildBody_preservesSerbianLatinInFirstName() {
+        String body = template.buildBody("http://example.com/activate", "Đorđe");
+        assertThat(body).contains("Đorđe");
+    }
 }

@@ -28,6 +28,7 @@ import rs.raf.banka2_bek.card.repository.CardRequestRepository;
 import rs.raf.banka2_bek.card.service.CardService;
 import rs.raf.banka2_bek.client.model.Client;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
+import rs.raf.banka2_bek.card.controller.exception_handler.CardExceptionHandler;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -74,7 +75,10 @@ class CardControllerTest {
 
         mockMvc = MockMvcBuilders
                 .standaloneSetup(cardController)
-                .setControllerAdvice(new GlobalExceptionHandler())
+                // CardExceptionHandler je @RestControllerAdvice(assignableTypes=CardController.class)
+                // — mora biti registrovan pre globalnog da OTP 401/423 (Sc28) i 403 (IDOR)
+                // ne padnu u generic GlobalExceptionHandler.
+                .setControllerAdvice(new CardExceptionHandler(), new GlobalExceptionHandler())
                 .build();
 
         testCard = CardResponseDto.builder()
@@ -281,6 +285,35 @@ class CardControllerTest {
     }
 
     // ══════════════════════════════════════════════════════════════════
+    //  PATCH /cards/{id}/activate (C2 Sc32)
+    // ══════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("PATCH /cards/1/activate - 403 sa literal porukom za deaktiviranu karticu (Sc32)")
+    void activateCard_deactivated_forbidden() throws Exception {
+        when(cardService.activateCard(1L)).thenThrow(
+                new IllegalStateException("Kartica je deaktivirana i ne može se ponovo aktivirati"));
+
+        mockMvc.perform(patch("/cards/1/activate"))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error", containsString("deaktivirana i ne može se ponovo aktivirati")));
+
+        verify(cardService).activateCard(1L);
+    }
+
+    @Test
+    @DisplayName("PATCH /cards/1/activate - 200 OK za vec aktivnu karticu (idempotent)")
+    void activateCard_active_returnsOk() throws Exception {
+        CardResponseDto active = CardResponseDto.builder()
+                .id(1L).cardNumber("1234567890123456").status(CardStatus.ACTIVE).build();
+        when(cardService.activateCard(1L)).thenReturn(active);
+
+        mockMvc.perform(patch("/cards/1/activate"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("ACTIVE"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
     //  PATCH /cards/{id}/limit
     // ══════════════════════════════════════════════════════════════════
 
@@ -344,15 +377,65 @@ class CardControllerTest {
         setupSecurityContext("marko@banka.rs");
 
         Client client = new Client();
+        client.setId(5L);
         client.setFirstName("Marko");
         client.setLastName("Markovic");
         when(clientRepository.findByEmail("marko@banka.rs")).thenReturn(Optional.of(client));
 
-        Account account = Account.builder().id(1L).accountNumber("222000112345678910").build();
+        // P1-authz-idor-1 (R1 114): racun mora pripadati ulogovanom klijentu.
+        Account account = Account.builder().id(1L).accountNumber("222000112345678910").client(client).build();
         when(accountRepository.findById(1L)).thenReturn(Optional.of(account));
 
         CardRequest savedReq = CardRequest.builder()
                 .id(10L)
+                .account(account)
+                .cardLimit(new BigDecimal("100000"))
+                .clientEmail("marko@banka.rs")
+                .clientName("Marko Markovic")
+                .status("PENDING")
+                .createdAt(LocalDateTime.of(2025, 3, 20, 12, 0))
+                .build();
+        when(cardRequestRepository.save(any(CardRequest.class))).thenReturn(savedReq);
+
+        // ACCEPTED-DEVIATION (user-directed 03.06): zahtev za karticu se podnosi
+        // direktno, BEZ verifikacionog koda. OTP vazi samo za placanja i transfere.
+        String payload = """
+                {
+                  "accountId": 1,
+                  "cardLimit": 100000
+                }
+                """;
+
+        mockMvc.perform(post("/cards/requests")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.id").value(10))
+                .andExpect(jsonPath("$.status").value("PENDING"))
+                .andExpect(jsonPath("$.clientName").value("Marko Markovic"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  ACCEPTED-DEVIATION (user-directed 03.06): zahtev za karticu BEZ email koda.
+    //  Nekadasnji C2 Sc28 email-kod gate je uklonjen — zahtev se podnosi direktno.
+    // ══════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("POST /cards/requests - 201 PENDING bez verifikacionog koda (OTP uklonjen 03.06)")
+    void submitCardRequest_noCode_created() throws Exception {
+        setupSecurityContext("marko@banka.rs");
+
+        Client client = new Client();
+        client.setId(5L);
+        client.setFirstName("Marko");
+        client.setLastName("Markovic");
+        when(clientRepository.findByEmail("marko@banka.rs")).thenReturn(Optional.of(client));
+
+        Account account = Account.builder().id(1L).accountNumber("222000112345678910").client(client).build();
+        when(accountRepository.findById(1L)).thenReturn(Optional.of(account));
+
+        CardRequest savedReq = CardRequest.builder()
+                .id(20L)
                 .account(account)
                 .cardLimit(new BigDecimal("100000"))
                 .clientEmail("marko@banka.rs")
@@ -373,9 +456,44 @@ class CardControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(payload))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.id").value(10))
-                .andExpect(jsonPath("$.status").value("PENDING"))
-                .andExpect(jsonPath("$.clientName").value("Marko Markovic"));
+                .andExpect(jsonPath("$.status").value("PENDING"));
+
+        // Zahtev je kreiran direktno, bez ikakvog OTP/email-kod koraka.
+        verify(cardRequestRepository).save(any(CardRequest.class));
+    }
+
+    @Test
+    @DisplayName("POST /cards/requests - 403 when account belongs to another client (IDOR)")
+    void submitCardRequest_foreignAccount_forbidden() throws Exception {
+        setupSecurityContext("marko@banka.rs");
+
+        Client client = new Client();
+        client.setId(5L);
+        client.setFirstName("Marko");
+        client.setLastName("Markovic");
+        when(clientRepository.findByEmail("marko@banka.rs")).thenReturn(Optional.of(client));
+
+        // Racun pripada DRUGOM klijentu (#99) — pre fix-a se ucitavao bez provere
+        // vlasnistva i zahtev se kreirao nad tudjim racunom.
+        Client other = new Client();
+        other.setId(99L);
+        Account foreignAccount = Account.builder().id(1L)
+                .accountNumber("222000199999999999").client(other).build();
+        when(accountRepository.findById(1L)).thenReturn(Optional.of(foreignAccount));
+
+        String payload = """
+                {
+                  "accountId": 1,
+                  "cardLimit": 100000
+                }
+                """;
+
+        mockMvc.perform(post("/cards/requests")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isForbidden());
+
+        verify(cardRequestRepository, never()).save(any(CardRequest.class));
     }
 
     @Test
@@ -419,11 +537,12 @@ class CardControllerTest {
         setupSecurityContext("marko@banka.rs");
 
         Client client = new Client();
+        client.setId(5L);
         client.setFirstName("Marko");
         client.setLastName("Markovic");
         when(clientRepository.findByEmail("marko@banka.rs")).thenReturn(Optional.of(client));
 
-        Account account = Account.builder().id(1L).accountNumber("222000112345678910").build();
+        Account account = Account.builder().id(1L).accountNumber("222000112345678910").client(client).build();
         when(accountRepository.findById(1L)).thenReturn(Optional.of(account));
 
         CardRequest savedReq = CardRequest.builder()

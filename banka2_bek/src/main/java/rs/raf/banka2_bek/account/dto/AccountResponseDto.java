@@ -30,6 +30,11 @@ public class AccountResponseDto {
     private BigDecimal balance;
     private BigDecimal reservedFunds;
 
+    // R1-628: ACCEPTED dupli izlaz — `currency` je NAMERAN alias za `currencyCode`.
+    // FE (50+ komponenti) cita `currency`, a `currencyCode` je zadrzan radi
+    // backwards-kompatibilnosti starijih klijenata. Oba uvek nose istu vrednost
+    // (vidi toResponse: .currencyCode(code).currency(code)). Uklanjanje bilo kog
+    // je breaking contract change kroz ceo FE — namerno se ne konsoliduje ovde.
     private String currencyCode;
     private String currency; // alias za currencyCode — FE koristi ovo polje
 

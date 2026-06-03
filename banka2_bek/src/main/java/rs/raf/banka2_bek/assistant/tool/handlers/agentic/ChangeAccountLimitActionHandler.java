@@ -24,14 +24,14 @@ public class ChangeAccountLimitActionHandler implements WriteToolHandler {
     @Override
     public String name() { return "change_account_limit"; }
 
-    @Override
-    public boolean requiresOtp() { return true; }
+    // ACCEPTED-DEVIATION (user-directed 03.06): promena limita vise NE zahteva OTP
+    // (requiresOtp() default false). OTP vazi samo za placanja i transfere.
 
     @Override
     public ToolDefinition definition() {
         return ToolDefinition.builder()
                 .name(name())
-                .description("Menja dnevni i/ili mesecni limit racuna. Samo vlasnik racuna. Zahteva OTP.")
+                .description("Menja dnevni i/ili mesecni limit racuna. Samo vlasnik racuna.")
                 .param(new ToolDefinition.Param("accountId", "integer",
                         "ID racuna", true, null, null))
                 .param(new ToolDefinition.Param("dailyLimit", "number",
@@ -58,6 +58,8 @@ public class ChangeAccountLimitActionHandler implements WriteToolHandler {
 
     @Override
     public Map<String, Object> executeFinal(Map<String, Object> args, UserContext user, String otpCode) {
+        // ACCEPTED-DEVIATION (user-directed 03.06): promena limita se primenjuje
+        // direktno, bez OTP-a.
         accountService.updateAccountLimits(
                 support.getLong(args, "accountId"),
                 support.getBigDecimal(args, "dailyLimit"),

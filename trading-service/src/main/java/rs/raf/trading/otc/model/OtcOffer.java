@@ -83,6 +83,9 @@ public class OtcOffer {
     @Column(name = "last_modified_at", nullable = false)
     private LocalDateTime lastModifiedAt;
 
+    @Version
+    private Long version;
+
     @PrePersist
     void onCreate() {
         LocalDateTime now = LocalDateTime.now();

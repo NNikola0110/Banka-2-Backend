@@ -19,13 +19,7 @@ public final class ProfitBankDtos {
         private Integer ordersDone;
     }
 
-    @Data @NoArgsConstructor @AllArgsConstructor
-    public static class BankFundPositionDto {
-        private Long fundId;
-        private String fundName;
-        private String managerName;
-        private BigDecimal percentShare;
-        private BigDecimal rsdValue;
-        private BigDecimal profitRsd;
-    }
+    // R1 506: BankFundPositionDto uklonjen — 0 BE callera. ProfitBankController
+    // .fundPositions() vraca InvestmentFundDtos.ClientFundPositionDto. (Mobile-ova
+    // istoimena Kotlin klasa je zaseban DTO koji cita ClientFundPositionDto JSON.)
 }

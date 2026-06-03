@@ -76,13 +76,37 @@ class ListingMapperTest {
     }
 
     @Test
-    void toDto_nullContractSize_defaultsToOne() {
+    void toDto_forexNullContractSize_defaultsTo1000_perSpec_OT1048() {
+        // OT-1048 [FIXED 02.06]: spec §162 "ForexPair Contract Size = standardno 1000".
+        // Ranije je ListingMapper (i ceo codebase: OrderMapper/OrderServiceImpl/
+        // TaxRealizedGainCalculator) slepo default-ovao null contractSize na 1 →
+        // FOREX margin 1×1.10×10% = 0.11 (mis-priced za faktor 1000). Sad se default
+        // razresava po tipu hartije preko ContractSize.resolve → FOREX → 1000:
+        //   maintenanceMargin = 1000 × 1.10 × 10% = 110.00.
+        // Isti resolver koristi i order-engine (OrderServiceImpl) i porez, pa display
+        // margin NE divergira od stvarno rezervisanog iznosa.
         Listing listing = new Listing();
         listing.setListingType(ListingType.FOREX);
         listing.setPrice(BigDecimal.valueOf(1.10));
         listing.setContractSize(null);
         ListingDto dto = ListingMapper.toDto(listing);
-        assertThat(dto.getMaintenanceMargin()).isEqualByComparingTo(BigDecimal.valueOf(0.11));
+        assertThat(dto.getMaintenanceMargin()).isEqualByComparingTo(BigDecimal.valueOf(110));
+        // initialMarginCost = maintenance × 1.1 = 121.00
+        assertThat(dto.getInitialMarginCost()).isEqualByComparingTo(BigDecimal.valueOf(121));
+    }
+
+    @Test
+    void toDto_futuresNullContractSize_defaultsTo1_OT1048() {
+        // OT-1048: FUTURES nema univerzalni spec default (contract size dolazi sa API-ja
+        // po hartiji — CME Crude=1000, Gold=100), pa fallback ostaje neutralno 1 kad
+        // izostane. FOREX-specific 1000 default se NE primenjuje na FUTURES.
+        Listing listing = new Listing();
+        listing.setListingType(ListingType.FUTURES);
+        listing.setPrice(BigDecimal.valueOf(75));
+        listing.setContractSize(null);
+        ListingDto dto = ListingMapper.toDto(listing);
+        // 1 × 75 × 10% = 7.5
+        assertThat(dto.getMaintenanceMargin()).isEqualByComparingTo(BigDecimal.valueOf(7.5));
     }
 
     @Test
@@ -118,6 +142,17 @@ class ListingMapperTest {
         Listing l = new Listing();
         l.setPrice(BigDecimal.valueOf(5));
         l.setPriceChange(BigDecimal.valueOf(5));
+        assertThat(ListingMapper.calculateChangePercent(l)).isNull();
+    }
+
+    @Test
+    void calculateChangePercent_negativePreviousPrice_returnsNull_R1_731() {
+        // R1-731: price=5, change=10 → previousPrice=-5 (negativna baza). % promena
+        // u odnosu na ne-pozitivnu bazu je besmislena → null (umesto matematicki
+        // validnog ali zavaravajuceg negativnog rezultata).
+        Listing l = new Listing();
+        l.setPrice(BigDecimal.valueOf(5));
+        l.setPriceChange(BigDecimal.valueOf(10));
         assertThat(ListingMapper.calculateChangePercent(l)).isNull();
     }
 

@@ -12,6 +12,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import rs.raf.banka2_bek.auth.dto.*;
 import rs.raf.banka2_bek.auth.service.AuthService;
+import rs.raf.banka2_bek.auth.service.JwtBlacklistService;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
@@ -25,6 +26,9 @@ class AuthControllerTest {
 
     @Mock
     private AuthService authService;
+
+    @Mock
+    private JwtBlacklistService blacklistService;
 
     @InjectMocks
     private AuthController authController;
@@ -95,6 +99,34 @@ class AuthControllerTest {
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.message").value("Password reset successful"));
+    }
+
+    @Test
+    void logout_blacklistsAccessAndRefreshTokens() throws Exception {
+        // N3: logout MORA blacklist-ovati i access token (iz Authorization header-a)
+        // i refresh token (iz body-ja). Bez refresh blacklist-a, ukradeni refresh
+        // token ostaje upotrebljiv 7 dana posle logout-a.
+        LogoutRequestDto body = new LogoutRequestDto();
+        body.setRefreshToken("refresh.to.revoke");
+
+        mockMvc.perform(post("/auth/logout")
+                        .header("Authorization", "Bearer access.to.revoke")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk());
+
+        org.mockito.Mockito.verify(blacklistService).blacklist("access.to.revoke");
+        org.mockito.Mockito.verify(blacklistService).blacklist("refresh.to.revoke");
+    }
+
+    @Test
+    void logout_withoutBody_blacklistsOnlyAccessToken() throws Exception {
+        // N3: logout bez body-ja (legacy klijent) i dalje blacklist-uje access token.
+        mockMvc.perform(post("/auth/logout")
+                        .header("Authorization", "Bearer access.only"))
+                .andExpect(status().isOk());
+
+        org.mockito.Mockito.verify(blacklistService).blacklist("access.only");
     }
 
     @Test

@@ -42,5 +42,9 @@ public class CreateRecurringOrderDto {
     @NotNull(message = "Ucestalost izvrsavanja je obavezna")
     private RecurringCadence cadence;
 
+    // [P2-input-validation-1 / R1 528] firstRun (ako je zadat) mora biti u
+    // buducnosti — proslost je ranije tiho zamenjivana sledecim cadence run-om,
+    // sto je krilo korisnicku gresku. @Future validira samo kad je polje != null.
+    @Future(message = "firstRun mora biti u buducnosti")
     private LocalDateTime firstRun;
 }

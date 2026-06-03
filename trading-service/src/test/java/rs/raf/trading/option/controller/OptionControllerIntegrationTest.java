@@ -194,6 +194,32 @@ class OptionControllerIntegrationTest {
     }
 
     @Test
+    void exerciseOption_returnsForbidden_forClient_deniedAtMethodGuardBeforeService() {
+        // P2-authz-method-1 (R1 462) — RED pre fix-a: exercise ruta je bila samo
+        // authenticated() (svaki ulogovan, ukljucujuci KLIJENTA, je ulazio u servis
+        // koji onda baca AccessDenied). Sad @PreAuthorize(hasRole ADMIN/EMPLOYEE)
+        // odbija klijenta PRE poziva servisa (defense-in-depth: identitet se ni ne
+        // razresava). Opcije su bankarski instrumenti — klijent ih nikad ne exercise-uje.
+        Listing listing = createListing("AAPL", new BigDecimal("210.00"));
+        Option option = createOption(listing, OptionType.CALL, new BigDecimal("180.00"),
+                LocalDate.now().plusDays(5), 4);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                url("/options/" + option.getId() + "/exercise"),
+                HttpMethod.POST,
+                new HttpEntity<>(jsonHeaders(buildToken("client@test.com", "CLIENT"))),
+                String.class
+        );
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        // Servis NIJE ni pozvan — openInterest nepromenjen, identitet nije razresavan.
+        Option unchanged = optionRepository.findById(option.getId()).orElseThrow();
+        assertThat(unchanged.getOpenInterest()).isEqualTo(4);
+        org.mockito.Mockito.verify(bankaCoreClient, org.mockito.Mockito.never())
+                .getUserByEmail("client@test.com");
+    }
+
+    @Test
     void exerciseOption_returnsForbidden_forInactiveActuaryEmployee() {
         mockBankaCoreUser("inactive.agent@test.com", INACTIVE_AGENT_ID, false, List.of("AGENT"));
 
@@ -288,6 +314,65 @@ class OptionControllerIntegrationTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).contains("currentStockPrice");
+    }
+
+    @Test
+    @DisplayName("OT-1097: GET /options?stockListingId — 200 za KLIJENTA (Sc10/72 — klijent vidi option chain)")
+    void getOptionsForStock_returnsChain_forClient() {
+        // Sc10/72: klijent (sa permisijom za trgovinu) sme da vidi option chain.
+        // Ruta je authenticated() (bez @PreAuthorize na role) — CLIENT JWT prolazi.
+        // Permisije se razresavaju rezilijentno; stub-ujemo praznu listu da filter
+        // (buildAuthorities) ne NPE-uje nad null permisijama.
+        lenient().when(bankaCoreClient.getUserPermissions("client@test.com")).thenReturn(List.of());
+
+        Listing listing = createListing("AAPL", new BigDecimal("150.00"));
+        createOption(listing, OptionType.CALL, new BigDecimal("145.00"),
+                LocalDate.now().plusDays(10), 5);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                url("/options?stockListingId=" + listing.getId()),
+                HttpMethod.GET,
+                new HttpEntity<>(jsonHeaders(buildToken("client@test.com", "CLIENT"))),
+                String.class
+        );
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).contains("currentStockPrice");
+    }
+
+    @Test
+    @DisplayName("OT-1097: GET /options/{id} — 200 za KLIJENTA (detalji opcije dostupni klijentu)")
+    void getOptionById_returnsDetails_forClient() {
+        lenient().when(bankaCoreClient.getUserPermissions("client@test.com")).thenReturn(List.of());
+
+        Listing listing = createListing("MSFT", new BigDecimal("200.00"));
+        Option option = createOption(listing, OptionType.CALL, new BigDecimal("180.00"),
+                LocalDate.now().plusDays(10), 5);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                url("/options/" + option.getId()),
+                HttpMethod.GET,
+                new HttpEntity<>(jsonHeaders(buildToken("client@test.com", "CLIENT"))),
+                String.class
+        );
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).contains("strikePrice");
+    }
+
+    @Test
+    @DisplayName("OT-1097: GET /options bez JWT → 403 (anonimni nema pristup option chain-u)")
+    void getOptionsForStock_forbidden_whenMissingJwt() {
+        Listing listing = createListing("NVDA", new BigDecimal("500.00"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                url("/options?stockListingId=" + listing.getId()),
+                HttpMethod.GET,
+                new HttpEntity<>(jsonHeaders(null)),
+                String.class
+        );
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     @Test

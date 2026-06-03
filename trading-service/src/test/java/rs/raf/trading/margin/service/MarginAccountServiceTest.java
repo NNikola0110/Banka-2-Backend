@@ -2,12 +2,15 @@ package rs.raf.trading.margin.service;
 
 import jakarta.persistence.EntityNotFoundException;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.dao.DataIntegrityViolationException;
+import rs.raf.banka2.contracts.internal.CreditFundsRequest;
 import rs.raf.banka2.contracts.internal.DebitFundsRequest;
 import rs.raf.banka2.contracts.internal.InternalAccountDto;
 import rs.raf.banka2.contracts.internal.InternalUserDto;
@@ -236,6 +239,32 @@ class MarginAccountServiceTest {
     }
 
     @Test
+    @DisplayName("OT-1105 (TOCTOU): createForUser — kad guard za vec-postojeci racun okine, "
+            + "NEPOVRATNI debitFunds se NIKAD ne poziva (gubitnik trke ne dvostruko-debituje)")
+    void createForUser_duplicateAccountGuard_neverDebits() {
+        // §57 jedan-racun-po-baznom-racunu guard je check-then-act bez DB unique
+        // constrainta — racy. Kriticna invarijanta TOCTOU gubitnika: kad guard nadje
+        // vec-postojeci margin racun, ireverzibilni out-of-process debitFunds se NE
+        // sme izvrsiti (inace bi paralelni create dvaput skinuo pocetni depozit sa
+        // baznog racuna). Ovaj test pinuje da guard puca PRE debita.
+        CreateMarginAccountDto dto = new CreateMarginAccountDto(1L, new BigDecimal("5000.00"));
+        when(userResolver.resolveCurrent()).thenReturn(client(10L));
+        when(bankaCoreClient.getAccount(1L)).thenReturn(
+                bankAccountOwnedBy(1L, 10L, "ACTIVE", "222000112345678911",
+                        "10000.00", "10000.00"));
+        // Konkurentni create je vec napravio margin racun za ovaj bazni racun.
+        when(marginAccountRepository.findByAccountId(1L)).thenReturn(List.of(new MarginAccount()));
+
+        assertThatThrownBy(() -> marginAccountService.createForUser(dto))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Margin account already exists for this base account.");
+
+        // NEPOVRATNA novcana noga se nikad ne pokrece + nista se ne perzistuje.
+        verify(bankaCoreClient, never()).debitFunds(any(), any());
+        verify(marginAccountRepository, never()).save(any());
+    }
+
+    @Test
     void createForUser_throwsWhenInsufficientAvailableBalance_preCheck() {
         CreateMarginAccountDto dto = new CreateMarginAccountDto(1L, new BigDecimal("100.00"));
         when(userResolver.resolveCurrent()).thenReturn(client(10L));
@@ -289,6 +318,58 @@ class MarginAccountServiceTest {
         verify(marginAccountRepository, never()).save(any());
     }
 
+    @Test
+    void createForUser_localSaveFailure_compensatesInitialDebit() {
+        // P2-money-tx-1 (R3 1577): debitFunds je vec uspeo (out-of-process), pa
+        // lokalni save (DataIntegrityViolation — npr. uniqueness race) MORA da
+        // okine kompenzacioni creditFunds da se debit ne izgubi.
+        CreateMarginAccountDto dto = new CreateMarginAccountDto(1L, new BigDecimal("5000.00"));
+        when(userResolver.resolveCurrent()).thenReturn(client(10L));
+        when(bankaCoreClient.getAccount(1L)).thenReturn(
+                bankAccountOwnedBy(1L, 10L, "ACTIVE", "222000112345678911",
+                        "10000.0000", "10000.0000"));
+        when(marginAccountRepository.findByAccountId(1L)).thenReturn(List.of());
+        // debit prolazi (default mock vraca null je ok — nema 409), ali save baci.
+        when(marginAccountRepository.save(any(MarginAccount.class)))
+                .thenThrow(new DataIntegrityViolationException("uk_margin_account_account_id"));
+
+        assertThatThrownBy(() -> marginAccountService.createForUser(dto))
+                .isInstanceOf(DataIntegrityViolationException.class);
+
+        // Debit je izvrsen.
+        verify(bankaCoreClient).debitFunds(
+                eq("margin-create-1"),
+                eq(new DebitFundsRequest(1L, new BigDecimal("5000.00"), BigDecimal.ZERO,
+                        "RSD", "Initial margin deposit")));
+        // Kompenzacioni credit vraca tacno debitovani iznos, sa razlicitim idempotency kljucem.
+        verify(bankaCoreClient).creditFunds(
+                eq("margin-create-1-compensate"),
+                eq(new CreditFundsRequest(1L, new BigDecimal("5000.00"), BigDecimal.ZERO,
+                        "RSD", "Compensation: reverse initial margin deposit")));
+    }
+
+    @Test
+    void createForUser_compensationItselfFailing_stillRethrowsOriginal() {
+        // Ako i kompenzacioni credit padne, originalna greska se NE prikriva
+        // (rezidual ide u manual reconciliation).
+        CreateMarginAccountDto dto = new CreateMarginAccountDto(1L, new BigDecimal("5000.00"));
+        when(userResolver.resolveCurrent()).thenReturn(client(10L));
+        when(bankaCoreClient.getAccount(1L)).thenReturn(
+                bankAccountOwnedBy(1L, 10L, "ACTIVE", "222000112345678911",
+                        "10000.0000", "10000.0000"));
+        when(marginAccountRepository.findByAccountId(1L)).thenReturn(List.of());
+        when(marginAccountRepository.save(any(MarginAccount.class)))
+                .thenThrow(new DataIntegrityViolationException("uk_margin_account_account_id"));
+        when(bankaCoreClient.creditFunds(any(), any(CreditFundsRequest.class)))
+                .thenThrow(new BankaCoreClientException(500, "banka-core down"));
+
+        assertThatThrownBy(() -> marginAccountService.createForUser(dto))
+                .isInstanceOf(DataIntegrityViolationException.class);
+
+        verify(bankaCoreClient).creditFunds(eq("margin-create-1-compensate"),
+                any(CreditFundsRequest.class));
+    }
+
     // ── deposit() tests ────────────────────────────────────────────────────────
 
     @Test
@@ -297,7 +378,8 @@ class MarginAccountServiceTest {
         MarginAccount account = activeMarginAccount(10L, "10000", "5000", MarginAccountStatus.ACTIVE);
 
         when(userResolver.resolveCurrent()).thenReturn(client(10L));
-        when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+        // P2-concurrency-locks-1 (R1-465/R3-1603): deposit sad zakljucava red preko findByIdForUpdate.
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
         marginAccountService.deposit(1L, new BigDecimal("2000"));
 
@@ -318,9 +400,42 @@ class MarginAccountServiceTest {
         MarginAccount account = activeMarginAccount(10L, "10000", "5000", MarginAccountStatus.BLOCKED);
 
         when(userResolver.resolveCurrent()).thenReturn(client(10L));
-        when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
         marginAccountService.deposit(1L, new BigDecimal("2000"));
+
+        assertThat(account.getStatus()).isEqualTo(MarginAccountStatus.ACTIVE);
+    }
+
+    @Test
+    void deposit_doesNotUnblock_whenAvailableMarginStillBelowMM_R1_769() {
+        // R1 769: odblok prag je RASPOLOZIVA marza (IM − reservedMargin), ne sirov IM.
+        // IM=4000, MM=5000, reserved=3000 → available=1000. Deposit(2000) → IM=6000,
+        // available=6000-3000=3000 < MM=5000 → racun OSTAJE BLOCKED, iako sirovi
+        // IM (6000) sad prelazi MM (raniji raw-IM check bi ga pogresno odblokirao).
+        MarginAccount account = activeMarginAccount(10L, "4000", "5000", MarginAccountStatus.BLOCKED);
+        account.setReservedMargin(new BigDecimal("3000"));
+
+        when(userResolver.resolveCurrent()).thenReturn(client(10L));
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
+
+        marginAccountService.deposit(1L, new BigDecimal("2000"));
+
+        assertThat(account.getStatus()).isEqualTo(MarginAccountStatus.BLOCKED);
+    }
+
+    @Test
+    void deposit_unblocks_whenAvailableMarginReachesMM_R1_769() {
+        // R1 769: kad raspoloziva marza dostigne MM, odblokira se.
+        // IM=4000, MM=5000, reserved=3000 → available=1000. Deposit(7000) → IM=11000,
+        // available=11000-3000=8000 >= MM=5000 → odblokira se.
+        MarginAccount account = activeMarginAccount(10L, "4000", "5000", MarginAccountStatus.BLOCKED);
+        account.setReservedMargin(new BigDecimal("3000"));
+
+        when(userResolver.resolveCurrent()).thenReturn(client(10L));
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
+
+        marginAccountService.deposit(1L, new BigDecimal("7000"));
 
         assertThat(account.getStatus()).isEqualTo(MarginAccountStatus.ACTIVE);
     }
@@ -330,7 +445,7 @@ class MarginAccountServiceTest {
         MarginAccount account = activeMarginAccount(10L, "10000", "5000", MarginAccountStatus.ACTIVE);
 
         when(userResolver.resolveCurrent()).thenReturn(client(10L));
-        when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
         marginAccountService.deposit(1L, new BigDecimal("2000"));
 
@@ -370,7 +485,7 @@ class MarginAccountServiceTest {
     @Test
     void deposit_throwsWhenMarginAccountNotFound() {
         when(userResolver.resolveCurrent()).thenReturn(client(10L));
-        when(marginAccountRepository.findById(99L)).thenReturn(Optional.empty());
+        when(marginAccountRepository.findByIdForUpdate(99L)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> marginAccountService.deposit(99L, new BigDecimal("100")))
                 .isInstanceOf(EntityNotFoundException.class)
@@ -382,11 +497,27 @@ class MarginAccountServiceTest {
         MarginAccount account = activeMarginAccount(10L, "10000", "5000", MarginAccountStatus.ACTIVE);
 
         when(userResolver.resolveCurrent()).thenReturn(client(20L));
-        when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
         assertThatThrownBy(() -> marginAccountService.deposit(1L, new BigDecimal("100")))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("can deposit funds");
+    }
+
+    @Test
+    void deposit_usesPessimisticLock_notPlainFindById() {
+        // P2-concurrency-locks-1 (R1-465/R3-1603): deposit MORA da koristi findByIdForUpdate
+        // (paritet sa withdraw P1-8). Bez pessimistic lock-a, @Version bi pukao 500 na
+        // konkurentnom deposit/withdraw/fill umesto da serijalizuje. Ovaj test cementira
+        // da deposit zakljucava red (i NE koristi plain findById).
+        MarginAccount account = activeMarginAccount(10L, "10000", "5000", MarginAccountStatus.ACTIVE);
+        when(userResolver.resolveCurrent()).thenReturn(client(10L));
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
+
+        marginAccountService.deposit(1L, new BigDecimal("2000"));
+
+        verify(marginAccountRepository).findByIdForUpdate(1L);
+        verify(marginAccountRepository, never()).findById(1L);
     }
 
     // ── withdraw() tests ───────────────────────────────────────────────────────
@@ -397,7 +528,8 @@ class MarginAccountServiceTest {
         MarginAccount account = activeMarginAccount(10L, "10000", "5000", MarginAccountStatus.ACTIVE);
 
         when(userResolver.resolveCurrent()).thenReturn(client(10L));
-        when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+        // P1-8: withdraw sad zakljucava red preko findByIdForUpdate.
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
         marginAccountService.withdraw(1L, new BigDecimal("2000"));
 
@@ -446,7 +578,7 @@ class MarginAccountServiceTest {
     @Test
     void withdraw_throwsWhenMarginAccountNotFound() {
         when(userResolver.resolveCurrent()).thenReturn(client(10L));
-        when(marginAccountRepository.findById(99L)).thenReturn(Optional.empty());
+        when(marginAccountRepository.findByIdForUpdate(99L)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> marginAccountService.withdraw(99L, new BigDecimal("100")))
                 .isInstanceOf(EntityNotFoundException.class)
@@ -458,7 +590,7 @@ class MarginAccountServiceTest {
         MarginAccount account = activeMarginAccount(10L, "10000", "5000", MarginAccountStatus.ACTIVE);
 
         when(userResolver.resolveCurrent()).thenReturn(client(20L));
-        when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
         assertThatThrownBy(() -> marginAccountService.withdraw(1L, new BigDecimal("100")))
                 .isInstanceOf(IllegalStateException.class)
@@ -470,7 +602,7 @@ class MarginAccountServiceTest {
         MarginAccount account = activeMarginAccount(10L, "10000", "5000", MarginAccountStatus.BLOCKED);
 
         when(userResolver.resolveCurrent()).thenReturn(client(10L));
-        when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
         assertThatThrownBy(() -> marginAccountService.withdraw(1L, new BigDecimal("100")))
                 .isInstanceOf(IllegalStateException.class)
@@ -482,12 +614,52 @@ class MarginAccountServiceTest {
         MarginAccount account = activeMarginAccount(10L, "10000", "5000", MarginAccountStatus.ACTIVE);
 
         when(userResolver.resolveCurrent()).thenReturn(client(10L));
-        when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
         // 10000 - 6000 = 4000 < 5000 (maintenanceMargin)
         assertThatThrownBy(() -> marginAccountService.withdraw(1L, new BigDecimal("6000")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Funds in the account cannot be below");
+    }
+
+    // ── P1-8: withdraw mora postovati reservedMargin (in-flight margin BUY hold) ──
+
+    @Test
+    void withdraw_throwsWhenReservedMarginWouldPushAvailableBelowMaintenance() {
+        // P1-8: IM=10000, reserved=8000, MM=1000.
+        // availableInitialMargin = 10000 - 8000 = 2000.
+        // withdraw(9000): sirova IM bi prosla (10000-9000=1000 >= 1000), ali
+        // raspoloziva (2000-9000=-7000) je daleko ispod MM → mora da padne.
+        MarginAccount account = activeMarginAccount(10L, "10000", "1000", MarginAccountStatus.ACTIVE);
+        account.setReservedMargin(new BigDecimal("8000"));
+
+        when(userResolver.resolveCurrent()).thenReturn(client(10L));
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
+
+        assertThatThrownBy(() -> marginAccountService.withdraw(1L, new BigDecimal("9000")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Funds in the account cannot be below");
+
+        // Sredstva ostaju netaknuta — withdraw je odbijen.
+        assertThat(account.getInitialMargin()).isEqualByComparingTo("10000");
+        verify(marginAccountRepository, never()).save(account);
+    }
+
+    @Test
+    void withdraw_succeedsWhenNothingReserved_regressionControlCase() {
+        // P1-8 regresija: kad reserved=0, ponasanje je identicno staroj logici.
+        // IM=10000, reserved=0, MM=1000. withdraw(9000): available=10000,
+        // 10000-9000=1000 >= 1000 → prolazi (granicni slucaj).
+        MarginAccount account = activeMarginAccount(10L, "10000", "1000", MarginAccountStatus.ACTIVE);
+        account.setReservedMargin(BigDecimal.ZERO);
+
+        when(userResolver.resolveCurrent()).thenReturn(client(10L));
+        when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
+
+        marginAccountService.withdraw(1L, new BigDecimal("9000"));
+
+        assertThat(account.getInitialMargin()).isEqualByComparingTo("1000");
+        verify(marginAccountRepository).save(account);
     }
 
     // ── checkMaintenanceMargin() tests ─────────────────────────────────────────
@@ -590,6 +762,35 @@ class MarginAccountServiceTest {
         verify(eventPublisher, times(3)).publishEvent(any(MarginAccountBlockedEvent.class));
     }
 
+    @Test
+    void checkMaintenanceMargin_batchResolvesEmailPerDistinctUser_R5_1894() {
+        // P2-perf-nplus1-1 (R5 1894): dva blokirana racuna ISTOG vlasnika (userId=100)
+        // → getUserById se zove TACNO JEDNOM (batch email resolve po distinct userId),
+        // ne dvaput. Stiti od N+1 mreznog lookup-a u margin-call cron-u.
+        List<Long> blockedIds = List.of(1L, 2L);
+        List<MarginAccount> blockedAccounts = List.of(
+                MarginAccount.builder().id(1L).userId(100L)
+                        .maintenanceMargin(new BigDecimal("5000"))
+                        .initialMargin(new BigDecimal("4000")).build(),
+                MarginAccount.builder().id(2L).userId(100L)
+                        .maintenanceMargin(new BigDecimal("6000"))
+                        .initialMargin(new BigDecimal("3000")).build()
+        );
+
+        when(marginAccountRepository.findEligibleForBlock(MarginAccountStatus.ACTIVE))
+                .thenReturn(blockedIds);
+        when(marginAccountRepository.findAllById(blockedIds)).thenReturn(blockedAccounts);
+        when(bankaCoreClient.getUserById("CLIENT", 100L)).thenReturn(
+                new InternalUserDto(100L, "CLIENT", "shared@test.com", "X", "Y", true, null));
+
+        marginAccountService.checkMaintenanceMargin();
+
+        // Email lookup deduplikovan na 1 poziv (oba racuna isti vlasnik).
+        verify(bankaCoreClient, times(1)).getUserById("CLIENT", 100L);
+        // Ali se i dalje publikuje po jedan event po racunu.
+        verify(eventPublisher, times(2)).publishEvent(any(MarginAccountBlockedEvent.class));
+    }
+
     // ── getTransactions() tests ────────────────────────────────────────────────
 
     @Test
@@ -664,6 +865,34 @@ class MarginAccountServiceTest {
         when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
 
         assertThatThrownBy(() -> marginAccountService.getTransactions(1L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("can access margin account transactions");
+    }
+
+    @Test
+    void getTransactions_companyMarginAccount_throwsForbiddenNotNpe() {
+        // P1-margin-1 (R1 203): CompanyMarginAccount ima userId==null. Ranije je
+        // {@code marginAccount.getUserId().equals(clientId)} bacao NPE (→ 500).
+        // Sada null-safe {@code clientId.equals(userId==null)} → false →
+        // IllegalStateException (403), ne NPE.
+        rs.raf.trading.margin.model.CompanyMarginAccount company =
+                rs.raf.trading.margin.model.CompanyMarginAccount.builder()
+                        .id(7L)
+                        .accountId(50L)
+                        .accountNumber("222000112345678911")
+                        .companyId(900L)
+                        .currency("RSD")
+                        .initialMargin(new BigDecimal("10000"))
+                        .loanValue(BigDecimal.ZERO)
+                        .maintenanceMargin(new BigDecimal("5000"))
+                        .bankParticipation(new BigDecimal("0.50"))
+                        .status(MarginAccountStatus.ACTIVE)
+                        .build();
+
+        when(userResolver.resolveCurrent()).thenReturn(client(10L));
+        when(marginAccountRepository.findById(7L)).thenReturn(Optional.of(company));
+
+        assertThatThrownBy(() -> marginAccountService.getTransactions(7L))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("can access margin account transactions");
     }

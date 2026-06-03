@@ -40,7 +40,13 @@ public class FundValueCalculator {
     private final CurrencyConversionService currencyConversionService;
 
     public BigDecimal computeFundValue(InvestmentFund fund) {
-        BigDecimal liquidAmount = bankaCoreClient.getAccount(fund.getAccountId()).balance();
+        // P1-funds-1 (1344/1555): likvidnu komponentu NAV-a citamo iz
+        // availableBalance() (slobodan cash), NE balance() (uklj. rezervisano).
+        // Withdraw/distribute/reinvest gate-uju na availableBalance(); kad fond
+        // ima in-flight reinvest BUY rezervaciju, balance() bi duplo brojao
+        // rezervisani cash (kao cash u NAV-u + buduce hartije) i precenio
+        // fundValue/profit/percentOfFund/snapshot.
+        BigDecimal liquidAmount = bankaCoreClient.getAccount(fund.getAccountId()).availableBalance();
         if (liquidAmount == null) {
             liquidAmount = BigDecimal.ZERO;
         }
@@ -83,23 +89,13 @@ public class FundValueCalculator {
                 .divide(totalInvested, 4, RoundingMode.HALF_UP);
     }
 
-    public BigDecimal computePositionPercent(Long fundId, Long userId, String userRole) {
-        ClientFundPosition position = clientFundPositionRepository
-                .findByFundIdAndUserIdAndUserRole(fundId, userId, userRole)
-                .orElse(null);
-        if (position == null) return BigDecimal.ZERO;
-
-        BigDecimal totalInvested = sumTotalInvested(fundId);
-        if (totalInvested.compareTo(BigDecimal.ZERO) == 0) return BigDecimal.ZERO;
-
-        return position.getTotalInvested()
-                .multiply(new BigDecimal("100"))
-                .divide(totalInvested, 4, RoundingMode.HALF_UP);
-    }
-
+    /**
+     * R1 793 — DB-strana COALESCE-SUM agregacija (umesto fetch-svih-pozicija +
+     * in-memory reduce). Zove se iz {@code computeProfit}/{@code computePositionValue}
+     * koji se cesto izvrsavaju u petljama (snapshot/dividend/listMyPositions).
+     */
     private BigDecimal sumTotalInvested(Long fundId) {
-        return clientFundPositionRepository.findByFundId(fundId).stream()
-                .map(ClientFundPosition::getTotalInvested)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal sum = clientFundPositionRepository.sumTotalInvestedByFundId(fundId);
+        return sum == null ? BigDecimal.ZERO : sum;
     }
 }

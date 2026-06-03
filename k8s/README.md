@@ -6,7 +6,7 @@ Kompletna paleta raw YAML manifests-a za fakultetski Kubernetes klaster
 Folder struktura prati K8s redosled apply-a (00 → 10). Svaki podfolder je
 samostalan i moze se apply-ovati sa `kubectl apply -f <folder>/`.
 
-```
+```text
 k8s/
 ├── 00-namespace.yaml
 ├── 01-configmaps/        — ConfigMaps (8 fajla, ne-sensitive env)
@@ -27,7 +27,7 @@ k8s/
 
 Pre apply-a, klaster mora imati:
 
-1. **Kubernetes 1.27+** (testirano na 1.29)
+1. **Kubernetes 1.27+**
 2. **nginx-ingress-controller** instaliran u `ingress-nginx` namespace
    ```bash
    helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx

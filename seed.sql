@@ -476,47 +476,49 @@ VALUES
 -- account_id: koristimo racune iz gornjeg inserta
 -- client_id:  1=Stefan, 2=Milica, 3=Lazar, 4=Ana
 
-INSERT INTO cards (card_number, card_name, cvv, account_id, client_id,
+-- R1-500-CVV (PCI-DSS Req 3.2): CVV se VISE NE CUVA at-rest (kolona uklonjena,
+-- Card.cvv je @Transient). Seed ga vise ne navodi.
+INSERT INTO cards (card_number, card_name, account_id, client_id,
                    card_limit, status, created_at, expiration_date)
 VALUES
     -- Stefan: 1 kartica za tekuci RSD (account_id=1)
-    ('4222001234567890', 'Visa Debit', '123', 1, 1,
+    ('4222001234567890', 'Visa Debit', 1, 1,
      250000.0000, 'ACTIVE', '2026-01-15', '2030-01-15'),
 
     -- Stefan: 1 kartica za Euro racun (account_id=3)
-    ('4222009876543210', 'Visa Debit', '456', 3, 1,
+    ('4222009876543210', 'Visa Debit', 3, 1,
      5000.0000, 'ACTIVE', '2026-02-01', '2030-02-01'),
 
     -- Milica: 1 kartica za tekuci (account_id=4)
-    ('4222005555666677', 'Visa Debit', '789', 4, 2,
+    ('4222005555666677', 'Visa Debit', 4, 2,
      200000.0000, 'ACTIVE', '2026-01-20', '2030-01-20'),
 
     -- Milica: 1 kartica za poslovni (account_id=5) — max 1 za business
-    ('4222003333444455', 'Visa Business', '321', 5, 2,
+    ('4222003333444455', 'Visa Business', 5, 2,
      1000000.0000, 'ACTIVE', '2026-02-10', '2030-02-10'),
 
     -- Lazar: 1 kartica za tekuci (account_id=7)
-    ('4222007777888899', 'Visa Debit', '654', 7, 3,
+    ('4222007777888899', 'Visa Debit', 7, 3,
      250000.0000, 'ACTIVE', '2026-03-01', '2030-03-01'),
 
     -- Ana: 1 kartica za youth racun (account_id=11), blokirana za testiranje
-    ('4222001111222233', 'Visa Debit', '987', 11, 4,
+    ('4222001111222233', 'Visa Debit', 11, 4,
      150000.0000, 'BLOCKED', '2026-01-01', '2030-01-01');
 
 -- Demo CREDIT kartica + INTERNET_PREPAID kartice (T4A nova: prosirenje tipova).
 -- Stefan: 1 CREDIT Mastercard + 1 INTERNET_PREPAID DinaCard (drugi slot 2 svog tekuceg racuna).
 -- Milica: 1 INTERNET_PREPAID na svom Euro racunu (account_id=6).
-INSERT INTO cards (card_number, card_name, cvv, account_id, client_id,
+INSERT INTO cards (card_number, card_name, account_id, client_id,
                    card_limit, card_type, card_category, prepaid_balance, credit_limit, outstanding_balance,
                    status, created_at, expiration_date, card_slot)
 VALUES
     -- Stefan CREDIT MasterCard (account_id=1, slot=2 — drugi po redu kartica)
-    ('5212003333112299', 'MasterCard Credit', '111', 1, 1,
+    ('5212003333112299', 'MasterCard Credit', 1, 1,
      200000.0000, 'MASTERCARD', 'CREDIT', 0.0000, 500000.0000, 0.0000,
      'ACTIVE', '2026-03-01', '2030-03-01', 2),
 
     -- Milica INTERNET_PREPAID DinaCard (account_id=6, slot=1) — Euro
-    ('9891001122334455', 'DinaCard Prepaid', '222', 6, 2,
+    ('9891001122334455', 'DinaCard Prepaid', 6, 2,
      50000.0000, 'DINACARD', 'INTERNET_PREPAID', 1000.0000, 0.0000, 0.0000,
      'ACTIVE', '2026-03-10', '2030-03-10', 1);
 

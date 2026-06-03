@@ -15,6 +15,8 @@ import rs.raf.banka2_bek.audit.model.AuditActionType;
 import rs.raf.banka2_bek.audit.model.AuditLog;
 import rs.raf.banka2_bek.audit.repository.AuditLogRepository;
 import rs.raf.banka2_bek.audit.service.AuditLogService;
+import rs.raf.banka2_bek.client.model.Client;
+import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.employee.model.Employee;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 
@@ -35,13 +37,16 @@ class AuditLogServiceTest {
     @Mock
     private EmployeeRepository employeeRepository;
 
+    @Mock
+    private ClientRepository clientRepository;
+
     @InjectMocks
     private AuditLogService auditLogService;
 
     @Test
     void record_savesAuditLogWithCorrectFields() {
-        auditLogService.record(1L, "EMPLOYEE", AuditActionType.LIMIT_CHANGED,
-                "desc", "ACTUARY", 5L, "old", "new");
+        auditLogService.record(1L, "EMPLOYEE", AuditActionType.PERMISSIONS_CHANGED,
+                "desc", "EMPLOYEE", 5L, "old", "new");
 
         ArgumentCaptor<AuditLog> captor = ArgumentCaptor.forClass(AuditLog.class);
         verify(auditLogRepository).save(captor.capture());
@@ -49,9 +54,9 @@ class AuditLogServiceTest {
         AuditLog saved = captor.getValue();
         assertThat(saved.getActorId()).isEqualTo(1L);
         assertThat(saved.getActorType()).isEqualTo("EMPLOYEE");
-        assertThat(saved.getActionType()).isEqualTo(AuditActionType.LIMIT_CHANGED);
+        assertThat(saved.getActionType()).isEqualTo(AuditActionType.PERMISSIONS_CHANGED);
         assertThat(saved.getDescription()).isEqualTo("desc");
-        assertThat(saved.getTargetType()).isEqualTo("ACTUARY");
+        assertThat(saved.getTargetType()).isEqualTo("EMPLOYEE");
         assertThat(saved.getTargetId()).isEqualTo(5L);
         assertThat(saved.getOldValue()).isEqualTo("old");
         assertThat(saved.getNewValue()).isEqualTo("new");
@@ -59,8 +64,8 @@ class AuditLogServiceTest {
 
     @Test
     void record_withNullOldAndNewValue_savesSuccessfully() {
-        auditLogService.record(2L, "EMPLOYEE", AuditActionType.ORDER_APPROVED,
-                "approved", "ORDER", 10L, null, null);
+        auditLogService.record(2L, "EMPLOYEE", AuditActionType.PAYMENT_CREATED,
+                "created", "PAYMENT", 10L, null, null);
 
         ArgumentCaptor<AuditLog> captor = ArgumentCaptor.forClass(AuditLog.class);
         verify(auditLogRepository).save(captor.capture());
@@ -70,9 +75,9 @@ class AuditLogServiceTest {
     }
 
     @Test
-    void record_taxRunTriggered_savesWithoutTargetId() {
-        auditLogService.record(3L, "EMPLOYEE", AuditActionType.TAX_RUN_TRIGGERED,
-                "tax run", null, null);
+    void record_withoutTarget_savesWithoutTargetId() {
+        auditLogService.record(3L, "EMPLOYEE", AuditActionType.SAVINGS_OPENED,
+                "savings opened", null, null);
 
         ArgumentCaptor<AuditLog> captor = ArgumentCaptor.forClass(AuditLog.class);
         verify(auditLogRepository).save(captor.capture());
@@ -95,12 +100,12 @@ class AuditLogServiceTest {
     @Test
     void query_withActionTypeFilter_passesEnumToRepository() {
         Pageable pageable = PageRequest.of(0, 10);
-        when(auditLogRepository.findFiltered(AuditActionType.LIMIT_CHANGED, null, null, null, pageable))
+        when(auditLogRepository.findFiltered(AuditActionType.PERMISSIONS_CHANGED, null, null, null, pageable))
                 .thenReturn(Page.empty());
 
-        auditLogService.query(AuditActionType.LIMIT_CHANGED, null, null, null, pageable);
+        auditLogService.query(AuditActionType.PERMISSIONS_CHANGED, null, null, null, pageable);
 
-        verify(auditLogRepository).findFiltered(AuditActionType.LIMIT_CHANGED, null, null, null, pageable);
+        verify(auditLogRepository).findFiltered(AuditActionType.PERMISSIONS_CHANGED, null, null, null, pageable);
     }
 
     @Test
@@ -122,9 +127,9 @@ class AuditLogServiceTest {
                 .id(1L)
                 .actorId(10L)
                 .actorType("EMPLOYEE")
-                .actionType(AuditActionType.ORDER_APPROVED)
+                .actionType(AuditActionType.PAYMENT_CREATED)
                 .description("test")
-                .targetType("ORDER")
+                .targetType("PAYMENT")
                 .targetId(42L)
                 .oldValue("PENDING")
                 .newValue("APPROVED")
@@ -142,8 +147,8 @@ class AuditLogServiceTest {
         AuditLogDto dto = result.getContent().get(0);
         assertThat(dto.getId()).isEqualTo(1L);
         assertThat(dto.getActorId()).isEqualTo(10L);
-        assertThat(dto.getActionType()).isEqualTo("ORDER_APPROVED");
-        assertThat(dto.getTargetType()).isEqualTo("ORDER");
+        assertThat(dto.getActionType()).isEqualTo("PAYMENT_CREATED");
+        assertThat(dto.getTargetType()).isEqualTo("PAYMENT");
         assertThat(dto.getTargetId()).isEqualTo(42L);
         assertThat(dto.getOldValue()).isEqualTo("PENDING");
         assertThat(dto.getNewValue()).isEqualTo("APPROVED");
@@ -176,17 +181,74 @@ class AuditLogServiceTest {
     }
 
     @Test
+    void query_actorNameLookup_client_R1392() {
+        // R1 392: pre fix-a CLIENT aktor je uvek vracao "ID:42" (resolveActorName
+        // gledao samo EMPLOYEE tabelu). Sad resolvuje ime/prezime iz CLIENT tabele.
+        Client client = new Client();
+        client.setId(42L);
+        client.setFirstName("Stefan");
+        client.setLastName("Jovanovic");
+
+        AuditLog log = AuditLog.builder()
+                .id(3L)
+                .actorId(42L)
+                .actorType("CLIENT")
+                .actionType(AuditActionType.CARD_BLOCKED)
+                .description("blocked")
+                .build();
+
+        Pageable pageable = PageRequest.of(0, 10);
+        when(auditLogRepository.findFiltered(null, null, null, null, pageable))
+                .thenReturn(new PageImpl<>(List.of(log)));
+        when(clientRepository.findById(42L)).thenReturn(Optional.of(client));
+
+        Page<AuditLogDto> result = auditLogService.query(null, null, null, null, pageable);
+
+        assertThat(result.getContent().get(0).getActorName()).isEqualTo("Stefan Jovanovic");
+    }
+
+    @Test
+    void record_descriptionOver512_truncatedNotRejected_R1395() {
+        // R1 395: description kolona je length=512 NOT NULL — neskracen tekst >512
+        // baca DataIntegrityViolation i obara ceo audit upis. Sad se skraca na 512.
+        String longDesc = "x".repeat(600);
+
+        auditLogService.record(1L, "EMPLOYEE", AuditActionType.PAYMENT_CREATED,
+                longDesc, "PAYMENT", 7L, null, null);
+
+        ArgumentCaptor<AuditLog> captor = ArgumentCaptor.forClass(AuditLog.class);
+        verify(auditLogRepository).save(captor.capture());
+
+        String saved = captor.getValue().getDescription();
+        assertThat(saved.length()).isEqualTo(512);
+        assertThat(saved).endsWith("...");
+    }
+
+    @Test
+    void record_descriptionExactly512_notTruncated_R1395() {
+        String desc512 = "y".repeat(512);
+
+        auditLogService.record(1L, "EMPLOYEE", AuditActionType.PAYMENT_CREATED,
+                desc512, "PAYMENT", 8L, null, null);
+
+        ArgumentCaptor<AuditLog> captor = ArgumentCaptor.forClass(AuditLog.class);
+        verify(auditLogRepository).save(captor.capture());
+
+        assertThat(captor.getValue().getDescription()).isEqualTo(desc512);
+    }
+
+    @Test
     void findByResource_returnsAllRecordsForTarget() {
         AuditLog log1 = AuditLog.builder().id(1L).actorId(1L).actorType("EMPLOYEE")
-                .actionType(AuditActionType.ORDER_APPROVED).description("a").build();
+                .actionType(AuditActionType.PAYMENT_CREATED).description("a").build();
         AuditLog log2 = AuditLog.builder().id(2L).actorId(1L).actorType("EMPLOYEE")
-                .actionType(AuditActionType.ORDER_DECLINED).description("b").build();
+                .actionType(AuditActionType.PAYMENT_ABORTED).description("b").build();
 
-        when(auditLogRepository.findByTargetTypeAndTargetId("ORDER", 42L))
+        when(auditLogRepository.findByTargetTypeAndTargetId("PAYMENT", 42L))
                 .thenReturn(List.of(log1, log2));
         when(employeeRepository.findById(any())).thenReturn(Optional.empty());
 
-        List<AuditLogDto> result = auditLogService.findByResource("ORDER", 42L);
+        List<AuditLogDto> result = auditLogService.findByResource("PAYMENT", 42L);
 
         assertThat(result).hasSize(2);
     }

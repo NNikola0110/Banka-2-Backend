@@ -32,7 +32,7 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Arbitro endpoint surface (Day 1 stub).
+ * Arbitro endpoint surface.
  *
  *  POST   /assistant/chat                     SSE chat stream
  *  GET    /assistant/conversations            list of user's convs
@@ -41,7 +41,8 @@ import java.util.UUID;
  *  POST   /assistant/conversations/{uuid}/clear   clear messages
  *  GET    /assistant/health                   provider + tools reachability
  *
- * Sve trase su `authenticated()` u GlobalSecurityConfig — dodaje se u Day 2.
+ * Sve trase su {@code authenticated()} u GlobalSecurityConfig
+ * ({@code requestMatchers("/assistant/**").authenticated()}).
  */
 @RestController
 @RequestMapping("/assistant")
@@ -49,6 +50,14 @@ import java.util.UUID;
 public class AssistantController {
 
     private static final Logger log = LoggerFactory.getLogger(AssistantController.class);
+
+    /**
+     * [P2-input-validation-1 / R3 1609] maksimalna velicina media uploada
+     * (slika/audio) — pre ovoga je {@code getBytes()} ucitavao ceo fajl + base64
+     * (~1.33×) u memoriju BEZ provere → OOM na arbitro pool nitima. 5MB je
+     * dovoljno za screenshot/PDF racun i kratak audio klip.
+     */
+    private static final long MAX_MEDIA_BYTES = 5L * 1024 * 1024;
 
     private final AssistantService assistantService;
     private final UserResolver userResolver;
@@ -187,6 +196,18 @@ public class AssistantController {
         org.springframework.web.multipart.MultipartFile audioPart = pickAudioPart(audio, media);
         org.springframework.web.multipart.MultipartFile imagePart = pickImagePart(media, audioPart);
 
+        // [P2-input-validation-1 / R3 1609] size-limit guard PRE bilo kakvog
+        // getBytes()/base64 — sprecava OOM na velikom uploadu. Vraca SSE error
+        // (FE prikazuje toast) umesto da pokusa ucitavanje celog fajla u memoriju.
+        if (exceedsMaxSize(audioPart) || exceedsMaxSize(imagePart)) {
+            SseEmitter emitter = new SseEmitter(5000L);
+            rs.raf.banka2_bek.assistant.service.SseEvents.error(emitter,
+                    "media_too_large",
+                    "Fajl je prevelik (maksimum " + (MAX_MEDIA_BYTES / (1024 * 1024)) + " MB).");
+            emitter.complete();
+            return emitter;
+        }
+
         String transcript = null;
         if (audioPart != null && !audioPart.isEmpty()) {
             try {
@@ -291,6 +312,14 @@ public class AssistantController {
             }
         }
         return assistantService.chat(userResolver.resolveCurrent(), request);
+    }
+
+    /**
+     * [P2-input-validation-1 / R3 1609] true ako part prelazi {@link #MAX_MEDIA_BYTES}.
+     * {@code MultipartFile.getSize()} je dostupan bez ucitavanja sadrzaja u memoriju.
+     */
+    private boolean exceedsMaxSize(org.springframework.web.multipart.MultipartFile part) {
+        return part != null && !part.isEmpty() && part.getSize() > MAX_MEDIA_BYTES;
     }
 
     /**

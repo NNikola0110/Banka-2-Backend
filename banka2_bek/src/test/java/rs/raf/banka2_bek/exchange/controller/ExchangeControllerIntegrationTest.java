@@ -1,11 +1,13 @@
 package rs.raf.banka2_bek.exchange.controller;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
-import org.springframework.http.MediaType;
-import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import rs.raf.banka2_bek.auth.config.GlobalExceptionHandler;
 import rs.raf.banka2_bek.exchange.ExchangeService;
 import rs.raf.banka2_bek.exchange.dto.CalculateExchangeResponseDto;
 import rs.raf.banka2_bek.exchange.dto.ExchangeRateDto;
@@ -19,25 +21,34 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
-// Integration test za ExchangeController. Glavni test scenariji su privremeno
-// zakomentarisani ispod (rad u toku); zadrzano kao @WebMvcTest harness za
-// kontroler bean-iranje dok se test setup ne stabilizuje.
-@WebMvcTest(ExchangeController.class)
+
+/**
+ * TEST-exchange-1: Glavni HTTP testovi za {@link ExchangeController} su ranije bili
+ * zakomentarisani ("rad u toku") — sada re-enabled kao deterministicki standalone
+ * MockMvc test (bez {@code @WebMvcTest} security-slice-a koji je verovatno bio uzrok
+ * nestabilnosti). {@link GlobalExceptionHandler} se eksplicitno wire-uje da se pokrije
+ * error-contract (nepoznata valuta → 400 preko catch-all {@code handleRuntimeException}).
+ *
+ * <p>Napomena: {@code @Positive} validacija na {@code amount} se NE testira ovde —
+ * metod-validacija zahteva {@code MethodValidationPostProcessor} koji standalone setup
+ * ne primenjuje (pokriveno na servisnom/web-MVC nivou drugde).
+ */
+@ExtendWith(MockitoExtension.class)
 class ExchangeControllerIntegrationTest {
 
-    @Autowired
-    private MockMvc mockMvc;
-
-    @MockitoBean
+    @Mock
     private ExchangeService exchangeService;
 
-    @MockitoBean
-    private rs.raf.banka2_bek.auth.service.JwtService jwtService;
+    private MockMvc mockMvc;
 
-    @MockitoBean
-    private rs.raf.banka2_bek.auth.service.CustomUserDetailsService customUserDetailsService;
+    @BeforeEach
+    void setUp() {
+        ExchangeController controller = new ExchangeController(exchangeService);
+        mockMvc = MockMvcBuilders.standaloneSetup(controller)
+                .setControllerAdvice(new GlobalExceptionHandler())
+                .build();
+    }
 
-    /*
     @Test
     void shouldReturnExchangeRates() throws Exception {
         List<ExchangeRateDto> mockRates = List.of(
@@ -48,10 +59,9 @@ class ExchangeControllerIntegrationTest {
 
         when(exchangeService.getAllRates()).thenReturn(mockRates);
 
-        mockMvc.perform(get("/exchange-rates")
-                        .contentType(MediaType.APPLICATION_JSON))
+        mockMvc.perform(get("/exchange-rates"))
                 .andExpect(status().isOk())
-                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                .andExpect(content().contentTypeCompatibleWith("application/json"))
                 .andExpect(jsonPath("$[0].currency").value("RSD"))
                 .andExpect(jsonPath("$[0].rate").value(1.0))
                 .andExpect(jsonPath("$[1].currency").value("EUR"))
@@ -93,6 +103,7 @@ class ExchangeControllerIntegrationTest {
 
     @Test
     void calculate_missingAmount_returns400() throws Exception {
+        // amount je required @RequestParam → MissingServletRequestParameterException → 400.
         mockMvc.perform(get("/exchange/calculate")
                         .param("toCurrency", "EUR"))
                 .andExpect(status().isBadRequest());
@@ -110,7 +121,7 @@ class ExchangeControllerIntegrationTest {
         when(exchangeService.calculateCross(100.0, "RSD", "EUR"))
                 .thenReturn(new CalculateExchangeResponseDto(0.845, 0.00845, "RSD", "EUR"));
 
-        // Ne saljemo fromCurrency — treba da bude RSD po defaultu
+        // Ne saljemo fromCurrency — treba da bude RSD po defaultu.
         mockMvc.perform(get("/exchange/calculate")
                         .param("amount", "100")
                         .param("toCurrency", "EUR"))
@@ -119,7 +130,8 @@ class ExchangeControllerIntegrationTest {
     }
 
     @Test
-    void calculate_unsupportedCurrency_returns500() throws Exception {
+    void calculate_unsupportedCurrency_returns400() throws Exception {
+        // Servis baca Runtime.. → GlobalExceptionHandler.handleRuntimeException → 400.
         when(exchangeService.calculateCross(anyDouble(), eq("RSD"), eq("XYZ")))
                 .thenThrow(new RuntimeException("Currency not supported: XYZ"));
 
@@ -127,6 +139,5 @@ class ExchangeControllerIntegrationTest {
                         .param("amount", "100")
                         .param("toCurrency", "XYZ"))
                 .andExpect(status().isBadRequest());
-
-} */
+    }
 }

@@ -13,6 +13,12 @@ package rs.raf.banka2_bek.card.model;
  *
  * Spec C2 §266: "Vrste kartica koje indektifikujemo po MII i IIN" odnosi se na BREND (VISA/MC/DC/AMEX).
  * Ovaj enum je {@code CARDS} type-of-payment categorija — ortogonalan na {@link CardType} brend.
+ *
+ * <p><b>R1-636 (dokumentovano ogranicenje):</b> {@code CREDIT} je trenutno
+ * KOZMETICKA kategorija — {@code Card.creditLimit}/{@code outstandingBalance} se
+ * cuvaju i prikazuju, ali nijedan payment/transakcioni put ih NE zaduzuje (nema
+ * kreditne linije, rata ni mesecne otplate). Funkcionalan credit-line je feature,
+ * ne P3 cleanup; do tada CREDIT kartica trosi kao DEBIT (direktan debit Account-a).</p>
  */
 public enum CardCategory {
     DEBIT,

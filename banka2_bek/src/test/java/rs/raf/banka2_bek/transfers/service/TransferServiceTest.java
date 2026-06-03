@@ -15,7 +15,6 @@ import rs.raf.banka2_bek.client.model.Client;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.currency.model.Currency;
 import rs.raf.banka2_bek.exchange.ExchangeService;
-import rs.raf.banka2_bek.exchange.dto.CalculateExchangeResponseDto;
 import rs.raf.banka2_bek.payment.model.PaymentStatus;
 import rs.raf.banka2_bek.transfers.model.Transfer;
 import rs.raf.banka2_bek.transfers.dto.TransferFxRequestDto;
@@ -154,6 +153,29 @@ public class TransferServiceTest {
     }
 
     @Test
+    void internalTransfer_locksAccountsInCanonicalOrder_regardlessOfDirection() {
+        // P2-concurrency-locks-1 (R3-1581): transfer iz VISEG racuna (222) u NIZI (111)
+        // mora i dalje da zakljuca NIZI (111) PRVI (kanonski redosled po account-number-u).
+        // Bez ovoga, paralelni 111→222 i 222→111 bi lock-ovali u suprotnim redosledima =
+        // ABBA deadlock. InOrder potvrdjuje globalno-konzistentan lock redosled.
+        when(accountRepository.findForUpdateByAccountNumber("111111111111111111")).thenReturn(Optional.of(fromAccount));
+        when(accountRepository.findForUpdateByAccountNumber("222222222222222222")).thenReturn(Optional.of(toAccount));
+        when(transferRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        TransferInternalRequestDto request = new TransferInternalRequestDto();
+        request.setFromAccountNumber("222222222222222222"); // VISI broj je posiljalac
+        request.setToAccountNumber("111111111111111111");   // NIZI broj je primalac
+        request.setAmount(new BigDecimal("1000"));
+
+        transferService.internalTransfer(request);
+
+        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(accountRepository);
+        // NIZI account-number (111) se zakljucava PRVI iako je primalac (to).
+        inOrder.verify(accountRepository).findForUpdateByAccountNumber("111111111111111111");
+        inOrder.verify(accountRepository).findForUpdateByAccountNumber("222222222222222222");
+    }
+
+    @Test
     void internalTransferFailsWhenInsufficientFunds() {
         when(accountRepository.findForUpdateByAccountNumber("111111111111111111")).thenReturn(Optional.of(fromAccount));
         when(accountRepository.findForUpdateByAccountNumber("222222222222222222")).thenReturn(Optional.of(toAccount));
@@ -228,9 +250,42 @@ public class TransferServiceTest {
     }
 
     @Test
-    void internalTransferFailsWhenSameAccount() {
-        when(accountRepository.findForUpdateByAccountNumber("111111111111111111")).thenReturn(Optional.of(fromAccount));
+    void internalTransferFailsWhenCompanyToPersonalDifferentOwner() {
+        // P1-authz-idor-1 (R2 1371): ovlasceno lice firme NE sme "internim" transferom
+        // (bez provizije/limita) da prebaci firmin novac na svoj LICNI racun. fromAccount
+        // je firmin (actor je ovlascen → ensureAccess prolazi), toAccount je actorov licni
+        // (ensureAccess prolazi) — ali vlasnici se razlikuju → ensureSameOwner mora odbiti.
+        rs.raf.banka2_bek.company.model.Company company =
+                new rs.raf.banka2_bek.company.model.Company();
+        company.setId(500L);
+        rs.raf.banka2_bek.company.model.AuthorizedPerson ap =
+                new rs.raf.banka2_bek.company.model.AuthorizedPerson();
+        ap.setClient(client);
+        ap.setCompany(company);
+        company.setAuthorizedPersons(List.of(ap));
 
+        // fromAccount postaje firmin (bez client vlasnika, sa company)
+        fromAccount.setClient(null);
+        fromAccount.setCompany(company);
+        // toAccount ostaje actorov licni racun (client #1)
+
+        when(accountRepository.findForUpdateByAccountNumber("111111111111111111")).thenReturn(Optional.of(fromAccount));
+        when(accountRepository.findForUpdateByAccountNumber("222222222222222222")).thenReturn(Optional.of(toAccount));
+
+        TransferInternalRequestDto request = new TransferInternalRequestDto();
+        request.setFromAccountNumber("111111111111111111");
+        request.setToAccountNumber("222222222222222222");
+        request.setAmount(new BigDecimal("1000"));
+
+        assertThatThrownBy(() -> transferService.internalTransfer(request))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("istog vlasnika");
+    }
+
+    @Test
+    void internalTransferFailsWhenSameAccount() {
+        // P2-concurrency-locks-1 (R3-1581): same-account zahtev se odbija PRE bilo kakvog
+        // lock-a (u lockTwoAccountsCanonically) — zato vise nema findForUpdate stub-a.
         TransferInternalRequestDto request = new TransferInternalRequestDto();
         request.setFromAccountNumber("111111111111111111");
         request.setToAccountNumber("111111111111111111");
@@ -293,8 +348,8 @@ public class TransferServiceTest {
         when(accountRepository.findForUpdateByAccountNumber("222222222222222222")).thenReturn(Optional.of(toAccount));
         when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankRsdAccount));
         when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.of(bankEurAccount));
-        when(exchangeService.calculateCross(1000.0, "RSD", "EUR"))
-                .thenReturn(new CalculateExchangeResponseDto(9.5, 0.0095, "RSD", "EUR"));
+        when(exchangeService.calculateCrossExact(new BigDecimal("1000"), "RSD", "EUR"))
+                .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("9.50"), new BigDecimal("0.0095")));
         when(transferRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         TransferFxRequestDto request = new TransferFxRequestDto();
@@ -344,6 +399,94 @@ public class TransferServiceTest {
     }
 
     @Test
+    void fxTransferFailsWhenAffordsAmountButNotCommission_TEST_transfers_2() {
+        // TEST-transfers-2 (TransferService:242): klijent ima TACNO za iznos, ali ne
+        // i za iznos + provizija 0.5% → odbijeno. fromAccount.available=10000,
+        // amount=10000, provizija=50 → totalDebit=10050 > 10000 → reject.
+        toAccount.setCurrency(eurCurrency);
+
+        when(accountRepository.findForUpdateByAccountNumber("111111111111111111")).thenReturn(Optional.of(fromAccount));
+        when(accountRepository.findForUpdateByAccountNumber("222222222222222222")).thenReturn(Optional.of(toAccount));
+
+        TransferFxRequestDto request = new TransferFxRequestDto();
+        request.setFromAccountNumber("111111111111111111");
+        request.setToAccountNumber("222222222222222222");
+        request.setAmount(new BigDecimal("10000")); // ima za iznos, ali ne i za iznos+provizija
+
+        assertThatThrownBy(() -> transferService.fxTransfer(request))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("Nedovoljno sredstava")
+                .hasMessageContaining("provizija");
+    }
+
+    @Test
+    void fxTransferFailsWhenBankLacksTargetReserves_TEST_transfers_3() {
+        // TEST-transfers-3 / TEST-exchange-3 (TransferService:268): klijent moze da
+        // plati iznos+proviziju, ali banka NEMA dovoljno ciljne valute u rezervi →
+        // odbijeno (knjige se ne smeju razbalansirati delimicnim transferom).
+        toAccount.setCurrency(eurCurrency);
+
+        Account bankRsdAccount = new Account();
+        bankRsdAccount.setAccountNumber("BANK-RSD");
+        bankRsdAccount.setCurrency(currency);
+        bankRsdAccount.setBalance(new BigDecimal("1000000"));
+        bankRsdAccount.setAvailableBalance(new BigDecimal("1000000"));
+        bankRsdAccount.setStatus(AccountStatus.ACTIVE);
+
+        // Banka EUR racun ima samo 1 EUR — manje od konvertovanog iznosa (9.50 EUR).
+        Account bankEurAccount = new Account();
+        bankEurAccount.setAccountNumber("BANK-EUR");
+        bankEurAccount.setCurrency(eurCurrency);
+        bankEurAccount.setBalance(new BigDecimal("1.00"));
+        bankEurAccount.setAvailableBalance(new BigDecimal("1.00"));
+        bankEurAccount.setStatus(AccountStatus.ACTIVE);
+
+        when(accountRepository.findForUpdateByAccountNumber("111111111111111111")).thenReturn(Optional.of(fromAccount));
+        when(accountRepository.findForUpdateByAccountNumber("222222222222222222")).thenReturn(Optional.of(toAccount));
+        when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankRsdAccount));
+        when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.of(bankEurAccount));
+        when(exchangeService.calculateCrossExact(new BigDecimal("1000"), "RSD", "EUR"))
+                .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("9.50"), new BigDecimal("0.0095")));
+
+        TransferFxRequestDto request = new TransferFxRequestDto();
+        request.setFromAccountNumber("111111111111111111");
+        request.setToAccountNumber("222222222222222222");
+        request.setAmount(new BigDecimal("1000"));
+
+        assertThatThrownBy(() -> transferService.fxTransfer(request))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("Bank does not have enough EUR");
+    }
+
+    @Test
+    void fxTransferFailsWhenBankTargetAccountMissing_TEST_exchange_3() {
+        // TEST-exchange-3: ako banka uopste NEMA racun u ciljnoj valuti →
+        // EntityNotFoundException (mapira se na 500/odbijeno), ne delimican transfer.
+        toAccount.setCurrency(eurCurrency);
+
+        Account bankRsdAccount = new Account();
+        bankRsdAccount.setAccountNumber("BANK-RSD");
+        bankRsdAccount.setCurrency(currency);
+        bankRsdAccount.setBalance(new BigDecimal("1000000"));
+        bankRsdAccount.setAvailableBalance(new BigDecimal("1000000"));
+        bankRsdAccount.setStatus(AccountStatus.ACTIVE);
+
+        when(accountRepository.findForUpdateByAccountNumber("111111111111111111")).thenReturn(Optional.of(fromAccount));
+        when(accountRepository.findForUpdateByAccountNumber("222222222222222222")).thenReturn(Optional.of(toAccount));
+        when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankRsdAccount));
+        when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.empty());
+
+        TransferFxRequestDto request = new TransferFxRequestDto();
+        request.setFromAccountNumber("111111111111111111");
+        request.setToAccountNumber("222222222222222222");
+        request.setAmount(new BigDecimal("1000"));
+
+        assertThatThrownBy(() -> transferService.fxTransfer(request))
+                .isInstanceOf(jakarta.persistence.EntityNotFoundException.class)
+                .hasMessageContaining("Bank account for EUR not found");
+    }
+
+    @Test
     void fxTransferFailsWhenAccountNotActive() {
         fromAccount.setStatus(AccountStatus.INACTIVE);
         toAccount.setCurrency(eurCurrency);
@@ -363,8 +506,7 @@ public class TransferServiceTest {
 
     @Test
     void fxTransferFailsWhenSameAccount() {
-        when(accountRepository.findForUpdateByAccountNumber("111111111111111111")).thenReturn(Optional.of(fromAccount));
-
+        // P2-concurrency-locks-1 (R3-1581): same-account zahtev se odbija PRE lock-a.
         TransferFxRequestDto request = new TransferFxRequestDto();
         request.setFromAccountNumber("111111111111111111");
         request.setToAccountNumber("111111111111111111");
@@ -399,7 +541,8 @@ public class TransferServiceTest {
         transfer2.setStatus(PaymentStatus.COMPLETED);
         transfer2.setCreatedBy(client);
 
-        when(transferRepository.findByCreatedByOrderByCreatedAtDesc(client))
+        // R1-653: filtriranje je sad u JPA upitu (findForClientWithFilters), ne in-memory.
+        when(transferRepository.findForClientWithFilters(client, null, null, null))
                 .thenReturn(List.of(transfer1, transfer2));
 
         List<TransferResponseDto> result = transferService.getAllTransfers(client, null, null, null);

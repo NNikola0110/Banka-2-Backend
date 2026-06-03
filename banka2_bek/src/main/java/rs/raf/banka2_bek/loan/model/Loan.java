@@ -79,6 +79,20 @@ public class Loan {
     @Column(length = 500)
     private String loanPurpose;
 
+    /**
+     * R1-659: optimisticko zakljucavanje kredita (komplement
+     * {@code LoanInstallment.@Version} iz P2-concurrency-locks-1). Stiti od
+     * lost-update prozora kad early-repay (klijent gasi ostatak duga) i installment
+     * cron paralelno menjaju {@code remainingDebt}/{@code status}/{@code effectiveRate}
+     * istog kredita — drugi commit nad istim redom baca {@code OptimisticLockException}
+     * (→ 409 kroz GlobalExceptionHandler / izolovani scheduler skip) umesto tihog
+     * gazenja stanja. Postojeca tabela: kolona dobija default 0.
+     */
+    @Version
+    @org.hibernate.annotations.ColumnDefault("0")
+    @Column(name = "version")
+    private Long version;
+
     @Column(nullable = false, updatable = false)
     @org.hibernate.annotations.ColumnDefault("CURRENT_TIMESTAMP")
     @Builder.Default

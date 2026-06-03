@@ -21,6 +21,11 @@ public class MarginAccountDto {
     private Long accountId;
     private String accountNumber;
     private Long userId;
+    /**
+     * BE-STK-06: ID kompanije za COMPANY marzni racun (Marzni_Racuni.txt §65).
+     * Null za USER marzni racun (tada je {@code userId} popunjen).
+     */
+    private Long companyId;
     private BigDecimal initialMargin;
     private BigDecimal loanValue;
     private BigDecimal maintenanceMargin;

@@ -129,6 +129,72 @@ class OrderValidationServiceTest {
     }
 
     @Nested
+    @DisplayName("Sc27 — minimalna kolicina za trgovanje")
+    class MinTradeQuantity {
+
+        @Test
+        @DisplayName("default min=1: quantity=1 prolazi (postojece ponasanje nepromenjeno)")
+        void defaultMin_quantityOne_passes() {
+            assertEquals(1, service.getMinTradeQuantity());
+            CreateOrderDto dto = validMarketBuyDto();
+            dto.setQuantity(1);
+
+            assertDoesNotThrow(() -> service.validate(dto));
+        }
+
+        @Test
+        @DisplayName("Sc27: quantity ispod konfigurisanog min praga -> IllegalArgumentException + poruka o min kolicini")
+        void belowMin_rejectedWithMinQuantityMessage() {
+            service.setMinTradeQuantity(5);
+            CreateOrderDto dto = validMarketBuyDto();
+            dto.setQuantity(3); // < 5
+
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                    () -> service.validate(dto));
+            assertTrue(ex.getMessage().contains("minimalne"),
+                    "poruka mora pomenuti minimalnu kolicinu: " + ex.getMessage());
+            assertTrue(ex.getMessage().contains("5"), "poruka mora navesti prag 5: " + ex.getMessage());
+            assertTrue(ex.getMessage().contains("3"), "poruka mora navesti uneto 3: " + ex.getMessage());
+        }
+
+        @Test
+        @DisplayName("Sc27: quantity tacno na min pragu -> prolazi (granica je inkluzivna)")
+        void exactlyAtMin_passes() {
+            service.setMinTradeQuantity(5);
+            CreateOrderDto dto = validMarketBuyDto();
+            dto.setQuantity(5);
+
+            assertDoesNotThrow(() -> service.validate(dto));
+        }
+
+        @Test
+        @DisplayName("Sc27: quantity iznad min praga -> prolazi")
+        void aboveMin_passes() {
+            service.setMinTradeQuantity(5);
+            CreateOrderDto dto = validMarketBuyDto();
+            dto.setQuantity(7);
+
+            assertDoesNotThrow(() -> service.validate(dto));
+        }
+
+        @Test
+        @DisplayName("Sc27: min prag <= 0 se klampuje na 1 (sanity) -> quantity=1 prolazi, 0 i dalje pada Sc24 porukom")
+        void nonPositiveMinClampedToOne() {
+            service.setMinTradeQuantity(0);
+            CreateOrderDto pass = validMarketBuyDto();
+            pass.setQuantity(1);
+            assertDoesNotThrow(() -> service.validate(pass));
+
+            CreateOrderDto zero = validMarketBuyDto();
+            zero.setQuantity(0);
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                    () -> service.validate(zero));
+            // quantity=0 i dalje pada na ranijem (Sc24) guardu, ne na min-quantity grani.
+            assertEquals("Quantity and contractSize must be > 0", ex.getMessage());
+        }
+    }
+
+    @Nested
     @DisplayName("LIMIT i STOP_LIMIT — limitValue")
     class LimitValue {
 

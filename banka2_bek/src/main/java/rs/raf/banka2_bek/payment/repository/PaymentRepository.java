@@ -10,8 +10,38 @@ import rs.raf.banka2_bek.payment.model.PaymentStatus;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Optional;
 
 public interface PaymentRepository extends JpaRepository<Payment, Long> {
+
+    /**
+     * N4 — Payment-level reconciler: stuck inter-bank placanja koja su ostala u
+     * PROCESSING duze od cutoff-a. interbankTxIdString != null osigurava da gledamo
+     * samo medjubankarska placanja (same-bank placanja se finalizuju sinhrono).
+     *
+     * <p>Pokriva rupu koju {@code InterbankReconciliationScheduler} (koji gleda samo
+     * {@code InterbankTransaction} redove) ne moze: ako je async dispatch task odbijen
+     * pre nego sto je {@code execute()} kreirao InterbankTransaction red, Payment ostaje
+     * PROCESSING zauvek bez ijednog reda za reconciler da uhvati.
+     */
+    @Query("""
+           select p from Payment p
+           where p.status = :status
+             and p.createdAt < :cutoff
+             and p.interbankTxIdString is not null
+           """)
+    List<Payment> findStuckInterbankPayments(@Param("status") PaymentStatus status,
+                                             @Param("cutoff") LocalDateTime cutoff);
+
+    /**
+     * P1-9 — pronadji medjubankarsko placanje po 2PC transaction id paru
+     * (routingNumber + idString). Koristi se u {@code GET /interbank/payments/{id}}
+     * da bi se za inter-bank transakciju razresilo vlasnistvo (placanje pripada
+     * {@code fromAccount.client}) pre nego sto se vrati view DTO.
+     */
+    Optional<Payment> findByInterbankTxRoutingNumberAndInterbankTxIdString(
+            Integer interbankTxRoutingNumber, String interbankTxIdString);
 
     // NAPOMENA (PostgreSQL): cast(:param as tip) je neophodan jer PG JDBC
     // ne moze da zakljuci tip NULL parametra — na JPQL ":p is null" izraz

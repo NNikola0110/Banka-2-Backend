@@ -52,7 +52,7 @@ class LoanServiceImplCoverageTest {
     @Mock private NotificationService notificationService;
     @Mock private rs.raf.banka2_bek.audit.service.AuditLogService auditLogService;
     @Mock private rs.raf.banka2_bek.employee.repository.EmployeeRepository employeeRepository;
-    @Mock private rs.raf.banka2_bek.otp.service.OtpService otpService;
+    @Mock private rs.raf.banka2_bek.exchange.CurrencyConversionService currencyConversionService;
 
     private LoanServiceImpl loanService;
 
@@ -67,13 +67,7 @@ class LoanServiceImplCoverageTest {
                 loanRequestRepository, loanRepository, installmentRepository,
                 accountRepository, clientRepository, currencyRepository,
                 notificationPublisher, "22200022", notificationService,
-                auditLogService, employeeRepository, otpService);
-
-        // BE-PAY-06: default OTP verify -> ok.
-        org.mockito.Mockito.lenient().when(otpService.verify(
-                        org.mockito.ArgumentMatchers.anyString(),
-                        org.mockito.ArgumentMatchers.anyString()))
-                .thenReturn(java.util.Map.of("verified", true));
+                auditLogService, employeeRepository, currencyConversionService);
 
         rsd = new Currency();
         rsd.setId(8L);
@@ -121,7 +115,7 @@ class LoanServiceImplCoverageTest {
         when(loanRepository.findById(1L)).thenReturn(Optional.of(loan));
         when(clientRepository.findByEmail("ghost@test.com")).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> loanService.earlyRepayment(1L, "ghost@test.com", "123456"))
+        assertThatThrownBy(() -> loanService.earlyRepayment(1L, "ghost@test.com"))
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("Klijent nije pronadjen");
     }
@@ -142,7 +136,7 @@ class LoanServiceImplCoverageTest {
         when(installmentRepository.findByLoanIdOrderByExpectedDueDateAsc(1L)).thenReturn(List.of(unpaid));
         when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com", "123456"))
+        assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com"))
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("Racun klijenta nije pronadjen");
     }
@@ -176,7 +170,7 @@ class LoanServiceImplCoverageTest {
         when(installmentRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(loanRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-        LoanResponseDto result = loanService.earlyRepayment(1L, "stefan@test.com", "123456");
+        LoanResponseDto result = loanService.earlyRepayment(1L, "stefan@test.com");
 
         assertThat(result.getStatus()).isEqualTo("PAID_OFF");
         // Paid installment remains with its original actualDueDate (null because never set)

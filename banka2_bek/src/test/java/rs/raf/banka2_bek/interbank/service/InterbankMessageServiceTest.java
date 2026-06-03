@@ -34,6 +34,9 @@ class InterbankMessageServiceTest {
     @Mock
     private BankRoutingService bankRoutingService;
 
+    @Mock
+    private rs.raf.banka2_bek.monitoring.BusinessMetrics businessMetrics;
+
     @InjectMocks
     private InterbankMessageService service;
 
@@ -221,6 +224,70 @@ class InterbankMessageServiceTest {
     }
 
     @Test
+    @DisplayName("markOutboundSent permanent 4xx on NEW_TX → FAILED_PERMANENT (terminal)")
+    void markOutboundSent_400_newTx_failedPermanent() {
+        InterbankMessage msg = pendingMessage();
+        msg.setMessageType(MessageType.NEW_TX);
+        when(repository.findBySenderRoutingNumberAndLocallyGeneratedKey(111, "abc123key"))
+                .thenReturn(Optional.of(msg));
+
+        service.markOutboundSent(KEY, 400, null);
+
+        assertThat(msg.getStatus()).isEqualTo(InterbankMessageStatus.FAILED_PERMANENT);
+    }
+
+    @Test
+    @DisplayName("N2: markOutboundSent permanent 4xx on COMMIT_TX → stays PENDING (phase-2 never abandoned, §2.9)")
+    void markOutboundSent_400_commitTx_staysPending() {
+        // N2: phase-2 poruke se NE smeju napustiti ni na permanentni 4xx — §2.9
+        // zahteva retransmisiju dok partner ne potvrdi sa 200/204. Posle YES vote-a
+        // recipient je PREPARED i ceka ishod; FAILED_PERMANENT bi ga ostavio
+        // zaglavljenog. 4xx tretiramo kao transient failure → PENDING (retry).
+        InterbankMessage msg = pendingMessage();
+        msg.setMessageType(MessageType.COMMIT_TX);
+        when(repository.findBySenderRoutingNumberAndLocallyGeneratedKey(111, "abc123key"))
+                .thenReturn(Optional.of(msg));
+
+        service.markOutboundSent(KEY, 400, null);
+
+        assertThat(msg.getStatus()).isEqualTo(InterbankMessageStatus.PENDING);
+        assertThat(msg.getRetryCount()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("1977: markOutboundSent on already-SENT message is a no-op (terminal-state guard)")
+    void markOutboundSent_alreadySent_noOp() {
+        // 1977: zakasneli/duplirani markOutboundSent ne sme da pregazi vec-SENT
+        // poruku (race izmedju glavnog send-a i retry scheduler-a). SENT je terminalno.
+        InterbankMessage msg = pendingMessage();
+        msg.setStatus(InterbankMessageStatus.SENT);
+        msg.setResponseBody("{\"original\":true}");
+        when(repository.findBySenderRoutingNumberAndLocallyGeneratedKey(111, "abc123key"))
+                .thenReturn(Optional.of(msg));
+
+        service.markOutboundSent(KEY, 200, "{\"late\":true}");
+
+        // Status i body netaknuti; nema save-a (no-op).
+        assertThat(msg.getStatus()).isEqualTo(InterbankMessageStatus.SENT);
+        assertThat(msg.getResponseBody()).isEqualTo("{\"original\":true}");
+        verify(repository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("1977: markOutboundSent on SENT_WAITING_ASYNC is a no-op (no regression to SENT)")
+    void markOutboundSent_alreadyWaitingAsync_noOp() {
+        InterbankMessage msg = pendingMessage();
+        msg.setStatus(InterbankMessageStatus.SENT_WAITING_ASYNC);
+        when(repository.findBySenderRoutingNumberAndLocallyGeneratedKey(111, "abc123key"))
+                .thenReturn(Optional.of(msg));
+
+        service.markOutboundSent(KEY, 200, "{\"x\":1}");
+
+        assertThat(msg.getStatus()).isEqualTo(InterbankMessageStatus.SENT_WAITING_ASYNC);
+        verify(repository, never()).save(any());
+    }
+
+    @Test
     @DisplayName("markOutboundSent throws when message not found")
     void markOutboundSent_notFound_throws() {
         when(repository.findBySenderRoutingNumberAndLocallyGeneratedKey(any(Integer.class), any()))
@@ -250,9 +317,11 @@ class InterbankMessageServiceTest {
     }
 
     @Test
-    @DisplayName("markOutboundFailed transitions to STUCK when retryCount reaches MAX_RETRIES")
+    @DisplayName("markOutboundFailed transitions NEW_TX (phase-1) to STUCK when retryCount reaches MAX_RETRIES")
     void markOutboundFailed_atMaxRetries_becomesStuck() {
+        // N2: samo faza-1 (NEW_TX) sme da eskalira na STUCK posle MAX_RETRY.
         InterbankMessage msg = pendingMessage();
+        msg.setMessageType(MessageType.NEW_TX);
         msg.setRetryCount(4); // MAX_RETRIES=5; after increment → 5 → STUCK
         when(repository.findBySenderRoutingNumberAndLocallyGeneratedKey(111, "abc123key"))
                 .thenReturn(Optional.of(msg));
@@ -261,6 +330,74 @@ class InterbankMessageServiceTest {
 
         assertThat(msg.getRetryCount()).isEqualTo(5);
         assertThat(msg.getStatus()).isEqualTo(InterbankMessageStatus.STUCK);
+    }
+
+    @Test
+    @DisplayName("N2: markOutboundFailed never STUCKs COMMIT_TX after MAX_RETRIES — phase-2 retransmits indefinitely (§2.9)")
+    void markOutboundFailed_commitTxAtMaxRetries_staysPending() {
+        // N2 / §2.9 + §2.8.7: posle YES vote-a (PREPARED), recipient ne sme
+        // unilateralno da abort-uje — koordinator MORA da retransmituje COMMIT_TX
+        // dok ne dobije potvrdu. Ako COMMIT_TX izadje iz retry pool-a (STUCK),
+        // recipient nikad ne sazna ishod i novac je unisten. Phase-2 mora ostati
+        // PENDING (retry-uje se beskonacno), bez obzira na retryCount.
+        InterbankMessage msg = pendingMessage();
+        msg.setMessageType(MessageType.COMMIT_TX);
+        msg.setRetryCount(50); // daleko iznad MAX_RETRIES
+        when(repository.findBySenderRoutingNumberAndLocallyGeneratedKey(111, "abc123key"))
+                .thenReturn(Optional.of(msg));
+
+        service.markOutboundFailed(KEY, "connection refused");
+
+        assertThat(msg.getRetryCount()).isEqualTo(51);
+        assertThat(msg.getStatus()).isEqualTo(InterbankMessageStatus.PENDING);
+    }
+
+    @Test
+    @DisplayName("N2: markOutboundFailed never STUCKs ROLLBACK_TX after MAX_RETRIES — phase-2 retransmits indefinitely (§2.9)")
+    void markOutboundFailed_rollbackTxAtMaxRetries_staysPending() {
+        InterbankMessage msg = pendingMessage();
+        msg.setMessageType(MessageType.ROLLBACK_TX);
+        msg.setRetryCount(99);
+        when(repository.findBySenderRoutingNumberAndLocallyGeneratedKey(111, "abc123key"))
+                .thenReturn(Optional.of(msg));
+
+        service.markOutboundFailed(KEY, "connection refused");
+
+        assertThat(msg.getRetryCount()).isEqualTo(100);
+        assertThat(msg.getStatus()).isEqualTo(InterbankMessageStatus.PENDING);
+    }
+
+    @Test
+    @DisplayName("1977: markOutboundFailed on already-SENT message is a no-op — no regression to PENDING")
+    void markOutboundFailed_alreadySent_noOp() {
+        // 1977: zakasneli failed signal (npr. stale retry posle uspesnog send-a) ne
+        // sme da regresira SENT poruku na PENDING — to bi je gurnulo u retransmisiju
+        // (dupla dostava phase-2 / lazni STUCK alarm NEW_TX).
+        InterbankMessage msg = pendingMessage();
+        msg.setStatus(InterbankMessageStatus.SENT);
+        msg.setRetryCount(0);
+        when(repository.findBySenderRoutingNumberAndLocallyGeneratedKey(111, "abc123key"))
+                .thenReturn(Optional.of(msg));
+
+        service.markOutboundFailed(KEY, "late error");
+
+        assertThat(msg.getStatus()).isEqualTo(InterbankMessageStatus.SENT);
+        assertThat(msg.getRetryCount()).isEqualTo(0); // nije inkrementiran
+        verify(repository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("1977: markOutboundFailed on FAILED_PERMANENT is a no-op")
+    void markOutboundFailed_failedPermanent_noOp() {
+        InterbankMessage msg = pendingMessage();
+        msg.setStatus(InterbankMessageStatus.FAILED_PERMANENT);
+        when(repository.findBySenderRoutingNumberAndLocallyGeneratedKey(111, "abc123key"))
+                .thenReturn(Optional.of(msg));
+
+        service.markOutboundFailed(KEY, "late error");
+
+        assertThat(msg.getStatus()).isEqualTo(InterbankMessageStatus.FAILED_PERMANENT);
+        verify(repository, never()).save(any());
     }
 
     @Test

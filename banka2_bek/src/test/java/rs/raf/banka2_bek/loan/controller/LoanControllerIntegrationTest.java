@@ -85,7 +85,6 @@ class LoanControllerIntegrationTest {
 
     @MockitoBean private ExchangeService exchangeService;
     @MockitoBean private NotificationPublisher notificationPublisher;
-    @MockitoBean private rs.raf.banka2_bek.otp.service.OtpService otpService;
 
     @BeforeEach
     void cleanDatabase() {
@@ -94,13 +93,8 @@ class LoanControllerIntegrationTest {
         });
 
         IntegrationTestCleanup.truncateAllTables(dataSource);
-
-        // BE-PAY-06: stub OtpService.verify() da vrati success — integration testovi
-        // ne testiraju OTP flow direktno (PaymentControllerIntegrationTest pokriva to).
-        org.mockito.Mockito.when(otpService.verify(
-                        org.mockito.ArgumentMatchers.anyString(),
-                        org.mockito.ArgumentMatchers.anyString()))
-                .thenReturn(java.util.Map.of("verified", true));
+        // ACCEPTED-DEVIATION (user-directed 03.06): loan flow vise nema OTP gate, pa
+        // OtpService mock/stub nije potreban (OTP vazi samo za placanja i transfere).
     }
 
     // ===== Create loan request =====
@@ -273,7 +267,7 @@ class LoanControllerIntegrationTest {
                   "interestType": "FIXED",
                   "amount": 50000,
                   "currency": "EUR",
-                  "repaymentPeriod": 6,
+                  "repaymentPeriod": 12,
                   "accountNumber": "220000000000000002",
                   "otpCode": "123456"
                 }
@@ -490,7 +484,7 @@ class LoanControllerIntegrationTest {
         String clientToken = jwtService.generateAccessToken(clientUser);
         String adminToken = jwtService.generateAccessToken(adminUser);
 
-        Long reqId = createLoanRequest(clientToken, "CASH", 60000, 6, "270000000000000001");
+        Long reqId = createLoanRequest(clientToken, "CASH", 60000, 12, "270000000000000001");
         ResponseEntity<String> approveResp = restTemplate.exchange(
                 url("/loans/requests/" + reqId + "/approve"), HttpMethod.PATCH,
                 new HttpEntity<>(jsonHeaders(adminToken)), String.class);
@@ -507,7 +501,8 @@ class LoanControllerIntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode installments = objectMapper.readTree(response.getBody());
         assertThat(installments.isArray()).isTrue();
-        assertThat(installments).hasSize(6);
+        // [P2-input-validation-1 / R1 344] period 12 (6 nije validan za CASH).
+        assertThat(installments).hasSize(12);
         // All installments should be unpaid
         for (JsonNode inst : installments) {
             assertThat(inst.path("paid").asBoolean()).isFalse();

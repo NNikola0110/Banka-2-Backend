@@ -34,6 +34,14 @@ public interface ListingService {
     ListingDto getListingById(Long id);
 
     /**
+     * P2-perf-nplus1-1 (R1 515): batch-resolve vise hartija po ID-ju jednim
+     * {@code findAllById} (+ batch testMode lookup) umesto N pojedinacnih
+     * {@code getListingById} poziva. Vraca mapu {@code listingId → ListingDto};
+     * nepostojeci ID-evi se izostavljaju. Koristi ga {@code WatchlistService.listItems}.
+     */
+    java.util.Map<Long, ListingDto> getListingsByIds(java.util.Collection<Long> ids);
+
+    /**
      * Vraca istorijske cene za hartiju za dati period.
      * Period: DAY, WEEK, MONTH, YEAR, FIVE_YEARS, ALL
      */
@@ -47,13 +55,4 @@ public interface ListingService {
      * 3. Nakon izvrsavanja operacije
      */
     void refreshPrices();
-
-    /**
-     * Ucitava pocetne podatke o hartijama (seed/bootstrap).
-     * Moze koristiti:
-     * - AlphaVantage API za akcije
-     * - Dummy CSV podatke za futures
-     * - ExchangeRate API za forex (vec postoji u exchange modulu)
-     */
-    void loadInitialData();
 }

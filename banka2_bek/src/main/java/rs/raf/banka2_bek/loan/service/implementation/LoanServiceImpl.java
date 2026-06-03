@@ -12,6 +12,7 @@ import rs.raf.banka2_bek.client.model.Client;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.currency.model.Currency;
 import rs.raf.banka2_bek.currency.repository.CurrencyRepository;
+import rs.raf.banka2_bek.exchange.CurrencyConversionService;
 import rs.raf.banka2_bek.loan.dto.*;
 import rs.raf.banka2_bek.loan.model.*;
 import rs.raf.banka2_bek.loan.service.LoanService;
@@ -22,7 +23,6 @@ import org.springframework.security.access.AccessDeniedException;
 import rs.raf.banka2_bek.notification.NotificationPublisher;
 import rs.raf.banka2_bek.notification.model.NotificationType;
 import rs.raf.banka2_bek.notification.service.NotificationService;
-import rs.raf.banka2_bek.otp.service.OtpService;
 import rs.raf.banka2_bek.audit.model.AuditActionType;
 import rs.raf.banka2_bek.audit.service.AuditLogService;
 import org.springframework.security.core.Authentication;
@@ -35,12 +35,29 @@ import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
 @Slf4j
 @Service
 public class LoanServiceImpl implements LoanService {
+
+    /**
+     * [P2-input-validation-1 / R1 344] Dozvoljeni rokovi otplate (broj rata u
+     * mesecima) po tipu kredita — Celina 2 §359-361.
+     * Gotovinski/auto/studentski/refinansirajuci: 12/24/36/48/60/72/84.
+     * Stambeni (MORTGAGE): 60/120/180/240/300/360.
+     * Bez ovoga je BE prihvatao bilo koji pozitivan period (7/13/99/1000).
+     */
+    private static final Set<Integer> STANDARD_PERIODS =
+            Set.of(12, 24, 36, 48, 60, 72, 84);
+    private static final Set<Integer> MORTGAGE_PERIODS =
+            Set.of(60, 120, 180, 240, 300, 360);
+
+    private static Set<Integer> allowedPeriods(LoanType type) {
+        return type == LoanType.MORTGAGE ? MORTGAGE_PERIODS : STANDARD_PERIODS;
+    }
 
     private final LoanRequestRepository loanRequestRepository;
     private final LoanRepository loanRepository;
@@ -54,8 +71,8 @@ public class LoanServiceImpl implements LoanService {
     // BE-PAY-01: audit hooks za loan lifecycle (approve/reject/early-repay)
     private final AuditLogService auditLogService;
     private final EmployeeRepository employeeRepository;
-    // BE-PAY-06: OTP gate za loan apply + early-repayment (paritet sa payments/savings).
-    private final OtpService otpService;
+    // P1-savings-loans-1 (R1-133/R3-1630): konverzija strane valute u RSD za FX-band lookup.
+    private final CurrencyConversionService currencyConversionService;
 
     public LoanServiceImpl(LoanRequestRepository loanRequestRepository,
                            LoanRepository loanRepository,
@@ -68,7 +85,7 @@ public class LoanServiceImpl implements LoanService {
                            NotificationService notificationService,
                            AuditLogService auditLogService,
                            EmployeeRepository employeeRepository,
-                           OtpService otpService) {
+                           CurrencyConversionService currencyConversionService) {
         this.loanRequestRepository = loanRequestRepository;
         this.loanRepository = loanRepository;
         this.installmentRepository = installmentRepository;
@@ -80,24 +97,7 @@ public class LoanServiceImpl implements LoanService {
         this.notificationService = notificationService;
         this.auditLogService = auditLogService;
         this.employeeRepository = employeeRepository;
-        this.otpService = otpService;
-    }
-
-    /**
-     * BE-PAY-06: OTP gate helper. Baca {@link AccessDeniedException} ako
-     * verifikacija ne uspe. Spec-paritet sa
-     * {@link rs.raf.banka2_bek.savings.service.SavingsDepositService#openDeposit}.
-     */
-    private void verifyOtp(String email, String otpCode) {
-        if (otpCode == null || otpCode.isBlank()) {
-            throw new AccessDeniedException("OTP kod je obavezan.");
-        }
-        Map<String, Object> verifyResult = otpService.verify(email, otpCode);
-        if (!Boolean.TRUE.equals(verifyResult.get("verified"))) {
-            String message = String.valueOf(verifyResult.getOrDefault(
-                    "message", "OTP verifikacija nije uspela."));
-            throw new AccessDeniedException(message);
-        }
+        this.currencyConversionService = currencyConversionService;
     }
 
     /**
@@ -129,11 +129,37 @@ public class LoanServiceImpl implements LoanService {
         return null;
     }
 
+    /**
+     * P0-B8 N2: privilege-escalation guard. Baca {@link AccessDeniedException}
+     * ako je trenutno autentifikovani pozivalac CLIENT (rola/authority
+     * ROLE_CLIENT ili CLIENT). Zaposleni (ROLE_EMPLOYEE / ROLE_ADMIN /
+     * SUPERVISOR) i nezasticeni interni pozivi (bez autentikacije — npr.
+     * scheduler / unit testovi) prolaze. Cilj je da ZATVORI agentic put kojim
+     * je klijent kroz Arbitro agenta mogao da odobri/odbije kredit, a da NE
+     * promeni ponasanje legitimnog HTTP employee puta.
+     */
+    private void assertNotClientCaller(String message) {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || auth.getAuthorities() == null) return; // interni/no-auth — ne diramo
+        boolean isClient = auth.getAuthorities().stream().anyMatch(a -> {
+            String role = a.getAuthority();
+            return "ROLE_CLIENT".equals(role) || "CLIENT".equals(role);
+        });
+        boolean isEmployeeOrAdmin = auth.getAuthorities().stream().anyMatch(a -> {
+            String role = a.getAuthority();
+            return "ROLE_ADMIN".equals(role) || "ROLE_EMPLOYEE".equals(role)
+                    || "ADMIN".equals(role) || "EMPLOYEE".equals(role) || "SUPERVISOR".equals(role);
+        });
+        if (isClient && !isEmployeeOrAdmin) {
+            throw new AccessDeniedException(message);
+        }
+    }
+
     @Override
     @Transactional
     public LoanRequestResponseDto createLoanRequest(LoanRequestDto request, String clientEmail) {
-        // BE-PAY-06: OTP gate (paritet sa payments/savings).
-        verifyOtp(clientEmail, request.getOtpCode());
+        // ACCEPTED-DEVIATION (user-directed 03.06): zahtev za kredit se podnosi
+        // direktno, bez OTP-a. OTP vazi samo za placanja i transfere.
 
         Client client = clientRepository.findByEmail(clientEmail)
                 .orElseThrow(() -> new RuntimeException("Klijent nije pronadjen"));
@@ -152,8 +178,19 @@ public class LoanServiceImpl implements LoanService {
             throw new RuntimeException("Valuta kredita mora da se poklapa sa valutom racuna");
         }
 
+        // [P2-input-validation-1 / R1 344] validacija perioda otplate protiv
+        // dozvoljenog skupa po tipu kredita (Celina 2 §359-361).
+        LoanType loanType = LoanType.valueOf(request.getLoanType());
+        Set<Integer> allowed = allowedPeriods(loanType);
+        if (request.getRepaymentPeriod() == null
+                || !allowed.contains(request.getRepaymentPeriod())) {
+            throw new IllegalArgumentException(
+                    "Rok otplate " + request.getRepaymentPeriod()
+                            + " nije dozvoljen za tip " + loanType + ". Dozvoljeni: " + allowed);
+        }
+
         LoanRequest loanRequest = LoanRequest.builder()
-                .loanType(LoanType.valueOf(request.getLoanType()))
+                .loanType(loanType)
                 .interestType(InterestType.valueOf(request.getInterestType()))
                 .amount(request.getAmount())
                 .currency(currency)
@@ -208,6 +245,12 @@ public class LoanServiceImpl implements LoanService {
     @Override
     @Transactional
     public LoanResponseDto approveLoanRequest(Long requestId) {
+        // P0-B8 N2: approve/reject su EMPLOYEE/ADMIN akcije. HTTP put je zasticen
+        // URL-om (/loans/requests/** hasAnyRole ADMIN,EMPLOYEE), ali agentic
+        // in-process poziv (ApproveLoanRequestActionHandler) zaobilazi kontroler
+        // i URL security. Bez ovog guard-a, klijent je mogao kroz Arbitro agenta
+        // da odobri sebi kredit. Guard odbija autentifikovanog CLIENT-a.
+        assertNotClientCaller("Odobravanje kredita je dozvoljeno samo zaposlenima.");
         LoanRequest request = loanRequestRepository.findById(requestId)
                 .orElseThrow(() -> new RuntimeException("Zahtev za kredit nije pronadjen"));
 
@@ -218,7 +261,7 @@ public class LoanServiceImpl implements LoanService {
         request.setStatus(LoanStatus.APPROVED);
         loanRequestRepository.save(request);
 
-        BigDecimal nominalRate = getBaseRate(request.getAmount());
+        BigDecimal nominalRate = getBaseRate(request.getAmount(), request.getCurrency().getCode());
         BigDecimal margin = getMargin(request.getLoanType());
         BigDecimal effectiveRate = nominalRate.add(margin);
         BigDecimal monthlyRate = effectiveRate.divide(BigDecimal.valueOf(1200), 10, RoundingMode.HALF_UP);
@@ -345,6 +388,8 @@ public class LoanServiceImpl implements LoanService {
     @Override
     @Transactional
     public LoanRequestResponseDto rejectLoanRequest(Long requestId) {
+        // P0-B8 N2: vidi approveLoanRequest — reject je takodje EMPLOYEE/ADMIN.
+        assertNotClientCaller("Odbijanje kredita je dozvoljeno samo zaposlenima.");
         LoanRequest request = loanRequestRepository.findById(requestId)
                 .orElseThrow(() -> new RuntimeException("Zahtev za kredit nije pronadjen"));
 
@@ -394,14 +439,82 @@ public class LoanServiceImpl implements LoanService {
     public LoanResponseDto getLoanById(Long loanId) {
         Loan loan = loanRepository.findById(loanId)
                 .orElseThrow(() -> new RuntimeException("Kredit nije pronadjen"));
+        // P0-B9 N3 (IDOR): bez ove provere bilo koji autentifikovani klijent je
+        // mogao da procita TUDJI kredit (iznos, kamata, rate, racun) sekvencijalnim
+        // loanId-em. CLIENT sme samo SVOJ kredit; EMPLOYEE/ADMIN bilo koji.
+        assertLoanAccessibleByCaller(loan);
         return toLoanResponse(loan);
     }
 
     @Override
     public List<InstallmentResponseDto> getInstallments(Long loanId) {
+        // P0-B9 N3 (IDOR): isti razlog kao getLoanById — rate otkrivaju strukturu
+        // tudjeg kredita. Ownership se proverava SAMO za CLIENT pozivaoca (employee/
+        // admin i no-auth interni pozivi prolaze nepromenjeni — bez dodatnog
+        // loanRepository hita, da postojeci scheduler/unit putevi ostanu netaknuti).
+        if (isClientCaller()) {
+            Loan loan = loanRepository.findById(loanId).orElse(null);
+            Client client = currentClientOrNull();
+            // CLIENT mora biti vlasnik; nepostojeci kredit -> 403 (ne otkrivamo postojanje).
+            if (client != null && (loan == null
+                    || loan.getClient() == null
+                    || !loan.getClient().getId().equals(client.getId()))) {
+                throw new AccessDeniedException("Kredit ne pripada korisniku.");
+            }
+        }
         return installmentRepository.findByLoanIdOrderByExpectedDueDateAsc(loanId).stream()
                 .map(this::toInstallmentResponse)
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * P0-B9 N3 ownership guard: baca {@link AccessDeniedException} (-&gt; HTTP 403)
+     * ako je pozivalac CLIENT a kredit ne pripada njemu. Zaposleni
+     * (ROLE_EMPLOYEE/ROLE_ADMIN/SUPERVISOR) i nezasticeni interni pozivi (bez
+     * auth konteksta — scheduleri/unit testovi) prolaze.
+     */
+    private void assertLoanAccessibleByCaller(Loan loan) {
+        if (isCallerEmployeeOrAdmin()) return;
+        Client client = currentClientOrNull();
+        if (client == null) return; // no-auth / interni — ne diramo (B8 obrazac)
+        if (loan.getClient() == null || !loan.getClient().getId().equals(client.getId())) {
+            throw new AccessDeniedException("Kredit ne pripada korisniku.");
+        }
+    }
+
+    /**
+     * Vraca {@code true} samo kad je autentifikovani pozivalac CLIENT
+     * (ROLE_CLIENT/CLIENT) i NIJE employee/admin. No-auth (interni/scheduler/unit)
+     * vraca {@code false} — ti putevi ne smeju da plate dodatni loanRepository hit.
+     */
+    private boolean isClientCaller() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || auth.getAuthorities() == null) return false;
+        if (isCallerEmployeeOrAdmin()) return false;
+        return auth.getAuthorities().stream().anyMatch(a -> {
+            String role = a.getAuthority();
+            return "ROLE_CLIENT".equals(role) || "CLIENT".equals(role);
+        });
+    }
+
+    private boolean isCallerEmployeeOrAdmin() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || auth.getAuthorities() == null) return false;
+        return auth.getAuthorities().stream().anyMatch(a -> {
+            String role = a.getAuthority();
+            return "ROLE_ADMIN".equals(role) || "ROLE_EMPLOYEE".equals(role)
+                    || "ADMIN".equals(role) || "EMPLOYEE".equals(role) || "SUPERVISOR".equals(role);
+        });
+    }
+
+    private Client currentClientOrNull() {
+        try {
+            Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+            if (auth == null || auth.getName() == null) return null;
+            return clientRepository.findByEmail(auth.getName()).orElse(null);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     @Override
@@ -415,9 +528,9 @@ public class LoanServiceImpl implements LoanService {
 
     @Override
     @Transactional
-    public LoanResponseDto earlyRepayment(Long loanId, String clientEmail, String otpCode) {
-        // BE-PAY-06: OTP gate (early repayment je money-mover — paritet sa savings withdraw-early).
-        verifyOtp(clientEmail, otpCode);
+    public LoanResponseDto earlyRepayment(Long loanId, String clientEmail) {
+        // ACCEPTED-DEVIATION (user-directed 03.06): prevremena otplata vise NE zahteva
+        // OTP. OTP vazi samo za placanja i transfere; krediti nisu placanja.
 
         Loan loan = loanRepository.findById(loanId)
                 .orElseThrow(() -> new RuntimeException("Kredit nije pronadjen"));
@@ -505,26 +618,37 @@ public class LoanServiceImpl implements LoanService {
 
     // --- Interest rate tables from spec ---
 
-    private BigDecimal getBaseRate(BigDecimal amount) {
-        // Convert to RSD equivalent for rate lookup (simplified: assume RSD or use amount directly)
-        double amt = amount.doubleValue();
-        if (amt <= 500_000) return new BigDecimal("6.25");
-        if (amt <= 1_000_000) return new BigDecimal("6.00");
-        if (amt <= 2_000_000) return new BigDecimal("5.75");
-        if (amt <= 5_000_000) return new BigDecimal("5.50");
-        if (amt <= 10_000_000) return new BigDecimal("5.25");
-        if (amt <= 20_000_000) return new BigDecimal("5.00");
+    /**
+     * P1-savings-loans-1 (R1-133 / R3-1630): tranza nominalne stope se bira po RSD
+     * ekvivalentu iznosa. Ranije se koristio SIROV {@code amount.doubleValue()} bez FX
+     * konverzije — 100000 EUR (~11.7M RSD) je padalo u najnizu tranzu (6.25% umesto ~5.00%).
+     * Sada se strani iznos konvertuje u RSD pre lookup-a; BigDecimal poredjenja umesto
+     * sirovog double-a. Defanzivno: ako FX nije dostupan (npr. exchange servis nedostupan),
+     * pada na sirov iznos (RSD krediti — dominantan slucaj — su nepromenjeni).
+     */
+    private BigDecimal getBaseRate(BigDecimal amount, String currencyCode) {
+        BigDecimal rsdAmount = amount;
+        if (currencyCode != null && !"RSD".equalsIgnoreCase(currencyCode)) {
+            try {
+                rsdAmount = currencyConversionService.convert(amount, currencyCode, "RSD");
+            } catch (RuntimeException e) {
+                log.warn("FX konverzija {} -> RSD nije uspela za nominal-rate lookup ({}), "
+                        + "koristim sirov iznos", currencyCode, e.getMessage());
+                rsdAmount = amount;
+            }
+        }
+        if (rsdAmount.compareTo(new BigDecimal("500000")) <= 0) return new BigDecimal("6.25");
+        if (rsdAmount.compareTo(new BigDecimal("1000000")) <= 0) return new BigDecimal("6.00");
+        if (rsdAmount.compareTo(new BigDecimal("2000000")) <= 0) return new BigDecimal("5.75");
+        if (rsdAmount.compareTo(new BigDecimal("5000000")) <= 0) return new BigDecimal("5.50");
+        if (rsdAmount.compareTo(new BigDecimal("10000000")) <= 0) return new BigDecimal("5.25");
+        if (rsdAmount.compareTo(new BigDecimal("20000000")) <= 0) return new BigDecimal("5.00");
         return new BigDecimal("4.75");
     }
 
+    /** R1-657: delegira na {@link LoanType#getMargin()} (jedinstven izvor istine). */
     private BigDecimal getMargin(LoanType type) {
-        return switch (type) {
-            case CASH -> new BigDecimal("1.75");
-            case MORTGAGE -> new BigDecimal("1.50");
-            case AUTO -> new BigDecimal("1.25");
-            case REFINANCING -> new BigDecimal("1.00");
-            case STUDENT -> new BigDecimal("0.75");
-        };
+        return type.getMargin();
     }
 
     // --- Mappers ---

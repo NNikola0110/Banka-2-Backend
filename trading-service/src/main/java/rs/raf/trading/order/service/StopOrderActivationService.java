@@ -51,9 +51,19 @@ public class StopOrderActivationService {
                     continue;
                 }
 
-                // 2b. Dohvatiti trenutnu trzisnu cenu
-                BigDecimal currentPrice = listing.getPrice();
-                if (currentPrice == null || currentPrice.compareTo(BigDecimal.ZERO) <= 0) {
+                // 2b. Dohvatiti trzisnu cenu za triger.
+                // P1-dividends-order-1 (1321 / spec §329-331,358-360): STOP i STOP_LIMIT
+                // se aktiviraju po ASK (BUY) / BID (SELL), NE po poslednjoj (last) ceni.
+                //   - Buy [Stop|Stop-Limit]: okida kad ASK >= stopValue (po asku zapravo kupujemo)
+                //   - Sell [Stop|Stop-Limit]: okida kad BID <= stopValue (po bidu zapravo prodajemo)
+                // Fallback na last price ako ask/bid nije dostupan (seed listinzi bez kotacije).
+                BigDecimal triggerPrice = (order.getDirection() == OrderDirection.BUY)
+                        ? listing.getAsk()
+                        : listing.getBid();
+                if (triggerPrice == null) {
+                    triggerPrice = listing.getPrice();
+                }
+                if (triggerPrice == null || triggerPrice.compareTo(BigDecimal.ZERO) <= 0) {
                     continue;
                 }
 
@@ -65,13 +75,13 @@ public class StopOrderActivationService {
                 // 2c. Provera stop uslova po specifikaciji [cite: 72, 74]
                 boolean shouldActivate = false;
                 if (order.getDirection() == OrderDirection.BUY) {
-                    // BUY stop: aktivira se kad currentPrice >= stopValue [cite: 72]
-                    if (currentPrice.compareTo(order.getStopValue()) >= 0) {
+                    // BUY stop/stop-limit: aktivira se kad ASK >= stopValue (§329/358)
+                    if (triggerPrice.compareTo(order.getStopValue()) >= 0) {
                         shouldActivate = true;
                     }
                 } else if (order.getDirection() == OrderDirection.SELL) {
-                    // SELL stop: aktivira se kad currentPrice <= stopValue [cite: 74]
-                    if (currentPrice.compareTo(order.getStopValue()) <= 0) {
+                    // SELL stop/stop-limit: aktivira se kad BID <= stopValue (§331/360)
+                    if (triggerPrice.compareTo(order.getStopValue()) <= 0) {
                         shouldActivate = true;
                     }
                 }
@@ -81,9 +91,10 @@ public class StopOrderActivationService {
                     OrderType originalType = order.getOrderType();
 
                     if (originalType == OrderType.STOP) {
-                        // STOP postaje MARKET [cite: 76]
+                        // STOP postaje MARKET [cite: 76]; pricePerUnit = trzisna cena
+                        // po kojoj se izvrsava (ask za BUY, bid za SELL).
                         order.setOrderType(OrderType.MARKET);
-                        order.setPricePerUnit(currentPrice);
+                        order.setPricePerUnit(triggerPrice);
                     } else if (originalType == OrderType.STOP_LIMIT) {
                         // STOP_LIMIT postaje LIMIT
                         order.setOrderType(OrderType.LIMIT);
@@ -96,7 +107,7 @@ public class StopOrderActivationService {
 
                     log.info("Stop order #{} activated: {} -> {}, trigger price: {}, stop value: {}",
                             order.getId(), originalType, order.getOrderType(),
-                            currentPrice, order.getStopValue());
+                            triggerPrice, order.getStopValue());
                 }
 
             } catch (Exception e) {

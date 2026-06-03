@@ -1,7 +1,10 @@
 package rs.raf.trading.stock.repository;
 
 import jakarta.persistence.criteria.Predicate;
+import jakarta.persistence.criteria.Root;
+import jakarta.persistence.criteria.Subquery;
 import org.springframework.data.jpa.domain.Specification;
+import rs.raf.trading.berza.model.Exchange;
 import rs.raf.trading.stock.model.Listing;
 import rs.raf.trading.stock.model.ListingType;
 
@@ -13,6 +16,28 @@ import java.util.List;
 public final class ListingSpec {
 
     private ListingSpec() {}
+
+    /**
+     * Sc25 (Celina 3, TestoviCelina3 §25): hartije sa nepoznatog (orphan) exchange-a
+     * se NE prikazuju. Bilo koji listing cija {@code exchangeAcronym} ne odgovara
+     * nijednoj poznatoj berzi (ili je {@code null}) se iskljucuje iz svih listing
+     * upita — bez obzira na korisnicki filter.
+     *
+     * <p>Implementirano kao korelirani EXISTS sub-upit ({@code exchangeAcronym IN
+     * (SELECT acronym FROM exchanges)}) umesto kao in-memory filter posle fetch-a:
+     * tako se orphan hartije iskljucuju na DB nivou (paginacija/brojanje su tacni —
+     * in-memory bi izbrojao orphan u {@code totalElements} pa skinuo iz sadrzaja,
+     * lazuci page metapodatke). {@code null} acronym ne moze da bude {@code IN}
+     * praznog/ne-null skupa pa je takodje iskljucen.
+     */
+    public static Specification<Listing> tradeableExchange() {
+        return (root, query, cb) -> {
+            Subquery<String> knownAcronyms = query.subquery(String.class);
+            Root<Exchange> exchange = knownAcronyms.from(Exchange.class);
+            knownAcronyms.select(exchange.get("acronym"));
+            return root.get("exchangeAcronym").in(knownAcronyms);
+        };
+    }
 
     /**
      * Filtrira listinge po tipu, pretrazi, exchange prefixu, rasponu cena i settlement date-u.

@@ -21,6 +21,16 @@ import java.util.List;
  * delegira na {@link SavingsDepositProcessor} (drugi bean) tako da @Transactional
  * prolazi kroz Spring AOP proxy. Intra-class @Transactional pozivi bi bili
  * silently ignorisani (CGLib proxy ne presreca direktne `this.method()` pozive).
+ *
+ * <p><b>R1-666 (single-instance assumption):</b> {@link #runSavingsCycle()} NEMA
+ * distribuirani lock (ShedLock). Pod HA / multi-replica deploy-om bi vise instanci
+ * paralelno pokrenulo isti ciklus. To NE duplira novac jer je svaki depozit zasticen
+ * {@code @Version} optimistic lock-om u {@link SavingsDepositProcessor} (drugi worker
+ * dobija {@code OptimisticLockException} → skip, vidi catch-grane nize), ali se
+ * pravi nepotreban duplo-rad. Trenutni deploy je single-instance scheduler-a.
+ * TODO (kad se ide na HA): obmotati {@code runSavingsCycle} ShedLock-om
+ * ({@code @SchedulerLock}) da samo jedna replika izvrsava ciklus. Puna ShedLock
+ * migracija (DB lock tabela + dep) je van P3 cleanup scope-a.</p>
  */
 @Service
 @RequiredArgsConstructor
@@ -44,7 +54,9 @@ public class SavingsScheduler {
     public void runSavingsCycle() {
         LocalDate today = LocalDate.now(ZoneOffset.UTC);
 
-        List<SavingsDeposit> dueForInterest = depositRepo.findByStatusAndNextInterestPaymentDateLessThanEqual(
+        // R7: ogranicava na nextInterestPaymentDate <= maturityDate (ne placa kamatu
+        // preko roka posle downtime catch-up-a). Processor ima i defanzivni guard.
+        List<SavingsDeposit> dueForInterest = depositRepo.findDueForInterest(
                 SavingsDepositStatus.ACTIVE, today);
         log.info("SavingsScheduler: {} deposit-a za isplatu kamate za {}", dueForInterest.size(), today);
         for (SavingsDeposit d : dueForInterest) {

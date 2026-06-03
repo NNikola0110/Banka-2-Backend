@@ -97,4 +97,34 @@ class AccountCreatedConfirmationEmailTemplateTest {
         assertThat(body).contains("Tip računa");
         assertThat(body).contains("Broj računa");
     }
+
+    // ── [P2-input-validation-1 / R1 385] HTML injection ──────────────────────
+
+    @Test
+    void buildBody_escapesHtmlInFirstName() {
+        String body = template.buildBody("<script>alert(1)</script>", "1234567890", "Tekući");
+        assertThat(body).doesNotContain("<script>alert(1)</script>");
+        assertThat(body).contains("&lt;script&gt;");
+    }
+
+    @Test
+    void buildBody_escapesHtmlInAccountType() {
+        String body = template.buildBody("Marko", "1234567890", "<img src=x onerror=alert(1)>");
+        assertThat(body).doesNotContain("<img src=x");
+        assertThat(body).contains("&lt;img");
+    }
+
+    @Test
+    void buildBody_escapesHtmlInAccountNumber() {
+        String body = template.buildBody("Marko", "<b>1234</b>", "Tekući");
+        assertThat(body).doesNotContain("<b>1234</b>");
+        assertThat(body).contains("&lt;b&gt;1234&lt;/b&gt;");
+    }
+
+    @Test
+    void buildBody_preservesSerbianLatinCharacters() {
+        String body = template.buildBody("Đorđe", "1234567890", "Štedni čćšđž");
+        assertThat(body).contains("Đorđe");
+        assertThat(body).contains("Štedni čćšđž");
+    }
 }

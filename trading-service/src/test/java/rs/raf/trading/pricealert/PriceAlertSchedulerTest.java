@@ -3,23 +3,19 @@ package rs.raf.trading.pricealert;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.scheduling.annotation.Scheduled;
 import rs.raf.trading.pricealert.repository.PriceAlertRepository;
 import rs.raf.trading.pricealert.scheduler.PriceAlertScheduler;
 import rs.raf.trading.pricealert.service.PriceAlertService;
-import rs.raf.trading.stock.model.Listing;
-import rs.raf.trading.stock.model.ListingType;
-import rs.raf.trading.stock.repository.ListingRepository;
 
-import java.math.BigDecimal;
+import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -27,6 +23,9 @@ import static org.mockito.Mockito.when;
 
 /**
  * [B5 - Cenovni alarmi] Unit testovi za {@link PriceAlertScheduler}.
+ *
+ * <p>R2-1384: scheduler vise NE cita Listing entitete sam — prosledjuje samo
+ * {@code listingId}-eve servisu (sveza cena se cita u servis-tx).
  */
 @ExtendWith(MockitoExtension.class)
 class PriceAlertSchedulerTest {
@@ -35,7 +34,6 @@ class PriceAlertSchedulerTest {
     private PriceAlertScheduler scheduler;
 
     @Mock private PriceAlertRepository alertRepository;
-    @Mock private ListingRepository listingRepository;
     @Mock private PriceAlertService priceAlertService;
 
     @Test
@@ -46,34 +44,20 @@ class PriceAlertSchedulerTest {
 
         scheduler.scanActiveAlerts();
 
-        verifyNoInteractions(listingRepository);
         verifyNoInteractions(priceAlertService);
     }
 
     @Test
-    @DisplayName("scanActiveAlerts_fetchesListingsAndDelegatesToService")
-    void scanActiveAlerts_fetchesListingsAndDelegatesToService() {
+    @DisplayName("scanActiveAlerts_delegatesListingIdsToService")
+    void scanActiveAlerts_delegatesListingIdsToService() {
         List<Long> ids = List.of(10L, 20L);
         when(alertRepository.findDistinctListingIdsByActiveTrue()).thenReturn(ids);
-
-        Listing l1 = new Listing();
-        l1.setId(10L);
-        l1.setTicker("AAPL");
-        l1.setListingType(ListingType.STOCK);
-        l1.setPrice(new BigDecimal("160"));
-        Listing l2 = new Listing();
-        l2.setId(20L);
-        l2.setTicker("MSFT");
-        l2.setListingType(ListingType.STOCK);
-        l2.setPrice(new BigDecimal("250"));
-        when(listingRepository.findAllById(ids)).thenReturn(List.of(l1, l2));
-        when(priceAlertService.checkAlerts(List.of(l1, l2))).thenReturn(2);
+        when(priceAlertService.checkAlertsForListings(ids)).thenReturn(2);
 
         scheduler.scanActiveAlerts();
 
-        ArgumentCaptor<List<Listing>> captor = ArgumentCaptor.forClass(List.class);
-        verify(priceAlertService, times(1)).checkAlerts(captor.capture());
-        assertThat(captor.getValue()).hasSize(2);
+        // R2-1384: scheduler prosledjuje ID-eve; servis cita svezu cenu u svojoj tx.
+        verify(priceAlertService, times(1)).checkAlertsForListings(ids);
     }
 
     @Test
@@ -85,7 +69,6 @@ class PriceAlertSchedulerTest {
         // Ne sme da baci — scheduler mora da preživi
         scheduler.scanActiveAlerts();
 
-        verifyNoInteractions(listingRepository);
         verifyNoInteractions(priceAlertService);
     }
 
@@ -93,13 +76,28 @@ class PriceAlertSchedulerTest {
     @DisplayName("scanActiveAlerts_serviceThrows_doesNotPropagate")
     void scanActiveAlerts_serviceThrows_doesNotPropagate() {
         when(alertRepository.findDistinctListingIdsByActiveTrue()).thenReturn(List.of(10L));
-        Listing l1 = new Listing();
-        l1.setId(10L);
-        when(listingRepository.findAllById(List.of(10L))).thenReturn(List.of(l1));
-        when(priceAlertService.checkAlerts(List.of(l1))).thenThrow(new RuntimeException("oops"));
+        when(priceAlertService.checkAlertsForListings(List.of(10L)))
+                .thenThrow(new RuntimeException("oops"));
 
         scheduler.scanActiveAlerts();
 
-        verify(priceAlertService).checkAlerts(List.of(l1));
+        verify(priceAlertService).checkAlertsForListings(List.of(10L));
+    }
+
+    @Test
+    @DisplayName("R1 512: scanActiveAlerts koristi fixedDelay (ne fixedRate) — bez preklapajucih instanci")
+    void scanActiveAlerts_usesFixedDelayNotFixedRate() throws Exception {
+        Method m = PriceAlertScheduler.class.getMethod("scanActiveAlerts");
+        Scheduled scheduled = m.getAnnotation(Scheduled.class);
+
+        assertThat(scheduled).as("scanActiveAlerts mora imati @Scheduled").isNotNull();
+        // fixedDelayString postavljen → fixedDelay() literal je default -1 (koristi string).
+        assertThat(scheduled.fixedDelayString())
+                .as("mora koristiti fixedDelay (fixedDelayString), ne fixedRate")
+                .isNotBlank();
+        assertThat(scheduled.fixedRate())
+                .as("NE sme koristiti fixedRate (preklapajuci ciklusi)").isEqualTo(-1L);
+        assertThat(scheduled.fixedRateString())
+                .as("NE sme koristiti fixedRateString").isEmpty();
     }
 }

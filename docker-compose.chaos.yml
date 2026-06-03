@@ -1,0 +1,79 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.chaos.yml — SAGA/2PC chaos-testing overlay (NIJE deo normalnog stacka)
+#
+# Koristi se ISKLJUCIVO kao overlay preko glavnog docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.chaos.yml up -d
+#
+# Bez `-f docker-compose.chaos.yml` glavni stack radi netaknut (chaos profil OFF).
+#
+# Sta ovaj overlay menja:
+#   1. Dodaje `toxiproxy` kontejner (Shopify Toxiproxy) IZMEDJU trading-service-a i
+#      banka-core-a (backend). Toxiproxy je TCP proxy koji ume da injektuje mrezne
+#      mane (latency, down, timeout, bandwidth, slicer) na live link bez restart-a.
+#   2. Preusmerava trading-service `BANKACORE_BASE_URL` sa `http://backend:8080`
+#      na `http://toxiproxy:8666` — SVI banka-core pozivi iz SAGA-e (reserve/commit/
+#      credit/transfer/release/debit u F1..F5 + C1..C5) sad prolaze kroz proxy, pa
+#      ih mozemo "pokvariti" runtime-om (SG-09a service unavailable, SG-10 latency).
+#   3. Pali `SAGA_CHAOS_ENABLED=true` na trading-service-u → aktivira
+#      HeaderSagaFaultInjector (X-Saga-* header-driven fault injection). U release-u
+#      je ovaj bean NoOp (saga.chaos.enabled=false default), pa header-i nemaju efekta.
+#
+# Toxiproxy proxy (banka-core link) se kreira pri boot-u iz mount-ovanog
+# `chaos/toxiproxy.json` (listen :8666 → upstream backend:8080). Toxic-i (latency/
+# down) se dodaju RUNTIME-om preko Toxiproxy admin API-ja (:8474) ili
+# `toxiproxy-cli` — vidi docs/chaos-testing.md (SG-09a / SG-10 / SG-11 procedure).
+#
+# NAPOMENA: ovo NE menja produkcioni kod ni glavni compose. Sve je u zasebnom
+# overlay-u + zasebnom `chaos/` direktorijumu.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # Shopify Toxiproxy — TCP fault-injection proxy. Sedi izmedju trading-service-a
+  # i banka-core-a (backend). Admin API na :8474, proxy listener na :8666.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    container_name: banka2_toxiproxy
+    # `-host 0.0.0.0` da admin API bude dostupan iz drugih kontejnera + sa hosta.
+    # `-config` ucitava proxy definiciju pri boot-u (proxy postoji odmah, bez
+    # rucnog `toxiproxy-cli create`). Toxic-i se ne definisu ovde — dodaju se
+    # runtime-om u runbook procedurama (da bi normalan boot bio "zdrav" link).
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/toxiproxy.json"]
+    volumes:
+      - ./chaos/toxiproxy.json:/etc/toxiproxy/toxiproxy.json:ro
+    ports:
+      # 8474 = Toxiproxy admin/HTTP API (dodavanje/uklanjanje toxic-a sa hosta).
+      # 8666 = banka-core proxy listener (izlozen na host za eksterni debug; u
+      # Docker mrezi trading-service ga doseze kao toxiproxy:8666).
+      - "${TOXIPROXY_ADMIN_PORT:-8474}:8474"
+      - "${TOXIPROXY_BANKACORE_PORT:-8666}:8666"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      # toxiproxy image ima `toxiproxy-cli`; `list` uspeva kad admin API odgovara.
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+  # trading-service overlay — preusmeren na Toxiproxy + chaos profil upaljen.
+  # Sve ostale postavke (DB, RabbitMQ, Influx, JWT, internal key) nasledjuje iz
+  # glavnog docker-compose.yml (merge po imenu servisa).
+  trading-service:
+    environment:
+      # KLJUC: banka-core pozivi sad idu kroz Toxiproxy umesto direktno na backend.
+      # Toxiproxy forward-uje na backend:8080 (vidi chaos/toxiproxy.json upstream).
+      BANKACORE_BASE_URL: http://toxiproxy:8666
+      # Aktivira HeaderSagaFaultInjector (@ConditionalOnProperty saga.chaos.enabled=true).
+      # Sad X-Saga-Force-Fail / -Kind / -Compensate-Fail / -Times / -Inject-Delay /
+      # -Force-Fail-Mid header-i imaju efekta (SG-05..08 fault, SG-10 inject-delay,
+      # SG-11 widen-window). U release-u ostaje false → NoOp.
+      SAGA_CHAOS_ENABLED: "true"
+    depends_on:
+      # trading-service mora cekati toxiproxy (banka-core link) pre nego sto SAGA
+      # pozove banka-core. Nasledjeni depends_on (trading_db/rabbitmq/influxdb) se
+      # MERGE-uje sa ovim (Compose spaja depends_on mape po kljucu).
+      toxiproxy:
+        condition: service_healthy

@@ -27,6 +27,7 @@ import rs.raf.banka2_bek.account.model.AccountStatus;
 import rs.raf.banka2_bek.account.model.AccountType;
 import rs.raf.banka2_bek.account.repository.AccountRepository;
 import rs.raf.banka2_bek.currency.model.Currency;
+import rs.raf.banka2_bek.exchange.CurrencyConversionService;
 import rs.raf.banka2_bek.internalapi.model.FundReservation;
 import rs.raf.banka2_bek.internalapi.model.FundReservationStatus;
 import rs.raf.banka2_bek.internalapi.model.InternalRequest;
@@ -57,6 +58,7 @@ class InternalFundsServiceTest {
     @Mock TransactionRepository transactionRepository;
     @Mock InternalIdempotencyService idempotencyService;
     @Mock ObjectMapper objectMapper;
+    @Mock CurrencyConversionService currencyConversionService;
 
     @InjectMocks InternalFundsService service;
 
@@ -207,7 +209,7 @@ class InternalFundsServiceTest {
         assertThat(account.getReservedAmount()).isEqualByComparingTo("200.00");
         // commission == 0 → bankin racun se NE dira
         verify(accountRepository, never())
-                .findFirstByAccountCategoryAndCurrency_Code(any(), anyString());
+                .findByAccountCategoryAndCurrencyCodeForUpdate(any(), anyString());
     }
 
     @Test
@@ -219,8 +221,9 @@ class InternalFundsServiceTest {
         when(fundReservationRepository.findByReservationIdForUpdate("res-001c"))
                 .thenReturn(Optional.of(reservation));
         when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
-        when(accountRepository.findFirstByAccountCategoryAndCurrency_Code(
-                AccountCategory.BANK_TRADING, "RSD")).thenReturn(Optional.of(bankTradingAccount));
+        // P0-B3: provizija se sad kreditira preko PESSIMISTIC_WRITE lookup-a (lost-update fix).
+        when(accountRepository.findByAccountCategoryAndCurrencyCodeForUpdate(
+                AccountCategory.BANK_TRADING, "RSD")).thenReturn(List.of(bankTradingAccount));
         when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(fundReservationRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -237,6 +240,12 @@ class InternalFundsServiceTest {
         assertThat(bankTradingAccount.getBalance()).isEqualByComparingTo("100050.00");
         assertThat(bankTradingAccount.getAvailableBalance()).isEqualByComparingTo("100050.00");
         verify(accountRepository).save(bankTradingAccount);
+        // P0-B3 (lost-update fix): bankin provizioni racun MORA biti razresen pod
+        // PESSIMISTIC_WRITE lock-om, NE preko ne-locking findFirstBy...Currency_Code.
+        verify(accountRepository).findByAccountCategoryAndCurrencyCodeForUpdate(
+                AccountCategory.BANK_TRADING, "RSD");
+        verify(accountRepository, never())
+                .findFirstByAccountCategoryAndCurrency_Code(any(), anyString());
     }
 
     @Test
@@ -380,7 +389,7 @@ class InternalFundsServiceTest {
         assertThat(toAccount.getAvailableBalance()).isEqualByComparingTo("700.00");
         // commission == null → bankin racun se NE dira
         verify(accountRepository, never())
-                .findFirstByAccountCategoryAndCurrency_Code(any(), anyString());
+                .findByAccountCategoryAndCurrencyCodeForUpdate(any(), anyString());
     }
 
     @Test
@@ -389,8 +398,8 @@ class InternalFundsServiceTest {
 
         when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
         when(accountRepository.findForUpdateById(2L)).thenReturn(Optional.of(toAccount));
-        when(accountRepository.findFirstByAccountCategoryAndCurrency_Code(
-                AccountCategory.BANK_TRADING, "RSD")).thenReturn(Optional.of(bankTradingAccount));
+        when(accountRepository.findByAccountCategoryAndCurrencyCodeForUpdate(
+                AccountCategory.BANK_TRADING, "RSD")).thenReturn(List.of(bankTradingAccount));
         when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
@@ -424,8 +433,8 @@ class InternalFundsServiceTest {
 
         when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(eurFrom));
         when(accountRepository.findForUpdateById(2L)).thenReturn(Optional.of(rsdTo));
-        when(accountRepository.findFirstByAccountCategoryAndCurrency_Code(
-                AccountCategory.BANK_TRADING, "EUR")).thenReturn(Optional.of(
+        when(accountRepository.findByAccountCategoryAndCurrencyCodeForUpdate(
+                AccountCategory.BANK_TRADING, "EUR")).thenReturn(List.of(
                 buildPlainAccount("311000900000000099", "100000.00", 99L, eur)));
         when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -443,8 +452,8 @@ class InternalFundsServiceTest {
         // to-noga: RSD racun dobija 119000 RSD
         assertThat(rsdTo.getBalance()).isEqualByComparingTo("119000.00");
         assertThat(rsdTo.getAvailableBalance()).isEqualByComparingTo("119000.00");
-        // banka dobija proviziju u EUR — bankin EUR racun resolve-ovan
-        verify(accountRepository).findFirstByAccountCategoryAndCurrency_Code(
+        // banka dobija proviziju u EUR — bankin EUR racun resolve-ovan (PESSIMISTIC_WRITE)
+        verify(accountRepository).findByAccountCategoryAndCurrencyCodeForUpdate(
                 AccountCategory.BANK_TRADING, "EUR");
     }
 
@@ -463,6 +472,94 @@ class InternalFundsServiceTest {
                 .hasMessageContaining("Nedovoljno raspolozivih sredstava");
 
         verify(accountRepository, never()).save(any());
+    }
+
+    // ─── TEST-branches-3: transfer FX integrity check (BE-INT-07) + provizija edge ──
+    // Validacije se dese PRE pesimistickog lock-a, pa ne treba stub-ovati racune.
+
+    @Test
+    void transfer_negativeCommission_rejected_TEST_branches_3() {
+        TransferFundsRequest req = new TransferFundsRequest(
+                1L, new BigDecimal("100.00"), 2L, new BigDecimal("100.00"),
+                new BigDecimal("-5.00"), "RSD", "test");
+
+        assertThatThrownBy(() -> service.transfer(req))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Provizija ne sme biti negativna");
+
+        verify(accountRepository, never()).findForUpdateById(any());
+        verify(accountRepository, never()).save(any());
+    }
+
+    @Test
+    void transfer_expectedRateNonPositive_rejected_TEST_branches_3() {
+        TransferFundsRequest req = new TransferFundsRequest(
+                1L, new BigDecimal("100.00"), 2L, new BigDecimal("100.00"),
+                null, null, "test", BigDecimal.ZERO); // expectedRate == 0
+
+        assertThatThrownBy(() -> service.transfer(req))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("expectedRate mora biti pozitivan");
+
+        verify(accountRepository, never()).findForUpdateById(any());
+    }
+
+    @Test
+    void transfer_fxDriftExceeds1Percent_rejected_TEST_branches_3() {
+        // debitAmount=100, expectedRate=2.0 → computedCredit=200. Stvarni creditAmount=100
+        // → drift=100 >> 1% od 100 (=1) → odbijeno (inverzni kurs / off-by-decimal bug).
+        TransferFundsRequest req = new TransferFundsRequest(
+                1L, new BigDecimal("100.00"), 2L, new BigDecimal("100.00"),
+                null, null, "cross-currency", new BigDecimal("2.0"));
+
+        assertThatThrownBy(() -> service.transfer(req))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("FX rate drift exceeds 1% tolerance");
+
+        verify(accountRepository, never()).findForUpdateById(any());
+        verify(accountRepository, never()).save(any());
+    }
+
+    @Test
+    void transfer_fxDriftWithinTolerance_accepted_TEST_branches_3() {
+        // debitAmount=100, expectedRate=1.005 → computedCredit=100.5. creditAmount=100
+        // → drift=0.5 <= 1% od 100 (=1) → prolazi.
+        Account toAccount = buildPlainAccount("222000200000000009", "0.00", 2L);
+        when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
+        when(accountRepository.findForUpdateById(2L)).thenReturn(Optional.of(toAccount));
+        when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        TransferFundsRequest req = new TransferFundsRequest(
+                1L, new BigDecimal("100.00"), 2L, new BigDecimal("100.00"),
+                null, null, "within-tolerance", new BigDecimal("1.005"));
+
+        TransferFundsResponse response = service.transfer(req);
+
+        assertThat(response.fromAccountId()).isEqualTo(1L);
+        assertThat(account.getBalance()).isEqualByComparingTo("9900.00");
+        assertThat(toAccount.getBalance()).isEqualByComparingTo("100.00");
+    }
+
+    @Test
+    void transfer_expectedRateNull_skipsFxCheck_TEST_branches_3() {
+        // expectedRate==null → FX integrity check se preskace (back-compat), prenos prolazi
+        // i kad bi racunski "drift" bio veliki (caller je odgovoran).
+        Account toAccount = buildPlainAccount("222000200000000010", "0.00", 2L);
+        when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
+        when(accountRepository.findForUpdateById(2L)).thenReturn(Optional.of(toAccount));
+        when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        // debitAmount 100, creditAmount 5000 (cross-currency) — bez expectedRate provere.
+        TransferFundsRequest req = new TransferFundsRequest(
+                1L, new BigDecimal("100.00"), 2L, new BigDecimal("5000.00"),
+                null, null, "no-expectedRate"); // 7-arg ctor → expectedRate=null
+
+        TransferFundsResponse response = service.transfer(req);
+
+        assertThat(response.fromAccountId()).isEqualTo(1L);
+        assertThat(toAccount.getBalance()).isEqualByComparingTo("5000.00");
     }
 
     // ─── idempotency tests ────────────────────────────────────────────────────
@@ -513,14 +610,14 @@ class InternalFundsServiceTest {
         assertThat(account.getBalance()).isEqualByComparingTo("10750.00");
         assertThat(account.getAvailableBalance()).isEqualByComparingTo("10750.00");
         verify(accountRepository, never())
-                .findFirstByAccountCategoryAndCurrency_Code(any(), anyString());
+                .findByAccountCategoryAndCurrencyCodeForUpdate(any(), anyString());
     }
 
     @Test
     void credit_withCommission_creditsAccountAndBank() {
         when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
-        when(accountRepository.findFirstByAccountCategoryAndCurrency_Code(
-                AccountCategory.BANK_TRADING, "RSD")).thenReturn(Optional.of(bankTradingAccount));
+        when(accountRepository.findByAccountCategoryAndCurrencyCodeForUpdate(
+                AccountCategory.BANK_TRADING, "RSD")).thenReturn(List.of(bankTradingAccount));
         when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
@@ -598,14 +695,14 @@ class InternalFundsServiceTest {
         assertThat(account.getBalance()).isEqualByComparingTo("9350.00");
         assertThat(account.getAvailableBalance()).isEqualByComparingTo("9350.00");
         verify(accountRepository, never())
-                .findFirstByAccountCategoryAndCurrency_Code(any(), anyString());
+                .findByAccountCategoryAndCurrencyCodeForUpdate(any(), anyString());
     }
 
     @Test
     void debit_withCommission_debitsAccountAndCreditsBank() {
         when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
-        when(accountRepository.findFirstByAccountCategoryAndCurrency_Code(
-                AccountCategory.BANK_TRADING, "RSD")).thenReturn(Optional.of(bankTradingAccount));
+        when(accountRepository.findByAccountCategoryAndCurrencyCodeForUpdate(
+                AccountCategory.BANK_TRADING, "RSD")).thenReturn(List.of(bankTradingAccount));
         when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
@@ -756,24 +853,54 @@ class InternalFundsServiceTest {
     }
 
     @Test
-    void collectTax_clientHasNoRsdAccount_returnsCollectedFalse() {
+    void collectTax_eurOnlyClient_collectsFromEurAccountViaFx() {
+        // P0-B3 (EUR-only fix): klijent ima SAMO EUR racun (dobit ostvarena u EUR).
+        // Pre fix-a porez se NIKAD nije naplacivao (collected=false). Sad se RSD iznos
+        // poreza konvertuje u EUR (srednji kurs) i nativni ekvivalent se skida sa EUR
+        // racuna; drzava i dalje dobija RSD iznos (conservation).
         Account stateAccount = buildPlainAccount("178000000000000001", "0.00", 50L);
-        // klijent ima samo EUR racun
-        Account clientEur = buildPlainAccount("222000300000000003", "5000.00", 12L);
-        Currency eur = new Currency();
-        eur.setId(2L);
-        eur.setCode("EUR");
-        eur.setName("Euro");
-        eur.setSymbol("E");
-        eur.setCountry("DE");
-        org.springframework.test.util.ReflectionTestUtils.setField(clientEur, "currency", eur);
+        Account clientEur = buildPlainAccount("222000300000000003", "5000.00", 12L, eur);
 
         when(accountRepository.findBankAccountForUpdateByCurrency("17858459", "RSD"))
                 .thenReturn(Optional.of(stateAccount));
         when(accountRepository.findByClientIdAndStatusOrderByAvailableBalanceDesc(
                 103L, AccountStatus.ACTIVE)).thenReturn(List.of(clientEur));
+        when(accountRepository.findForUpdateById(12L)).thenReturn(Optional.of(clientEur));
+        // 300 RSD ≈ 2.5594 EUR (srednji kurs)
+        when(currencyConversionService.convert(new BigDecimal("300.00"), "RSD", "EUR"))
+                .thenReturn(new BigDecimal("2.5594"));
+        when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         TaxCollectRequest req = new TaxCollectRequest(103L, new BigDecimal("300.00"), "Porez");
+        TaxCollectResponse response = service.collectTax(req);
+
+        // Naplaceno (collectedAmount izvestava RSD iznos poreza).
+        assertThat(response.collected()).isTrue();
+        assertThat(response.collectedAmount()).isEqualByComparingTo("300.00");
+        // EUR racun debitovan FX-ekvivalentom (5000 - 2.5594).
+        assertThat(clientEur.getBalance()).isEqualByComparingTo("4997.4406");
+        assertThat(clientEur.getAvailableBalance()).isEqualByComparingTo("4997.4406");
+        // Drzava dobija RSD iznos poreza (conservation).
+        assertThat(stateAccount.getBalance()).isEqualByComparingTo("300.00");
+        assertThat(stateAccount.getAvailableBalance()).isEqualByComparingTo("300.00");
+    }
+
+    @Test
+    void collectTax_noAccountCoversEvenAfterFx_returnsCollectedFalse() {
+        // Jedini racun je EUR sa premalo sredstava i posle FX-a → preskoci, collected=false.
+        Account stateAccount = buildPlainAccount("178000000000000001", "0.00", 50L);
+        Account clientEur = buildPlainAccount("222000300000000009", "1.00", 13L, eur);
+
+        when(accountRepository.findBankAccountForUpdateByCurrency("17858459", "RSD"))
+                .thenReturn(Optional.of(stateAccount));
+        when(accountRepository.findByClientIdAndStatusOrderByAvailableBalanceDesc(
+                104L, AccountStatus.ACTIVE)).thenReturn(List.of(clientEur));
+        // 300 RSD ≈ 2.5594 EUR > 1.00 EUR raspolozivo → ne pokriva
+        when(currencyConversionService.convert(new BigDecimal("300.00"), "RSD", "EUR"))
+                .thenReturn(new BigDecimal("2.5594"));
+
+        TaxCollectRequest req = new TaxCollectRequest(104L, new BigDecimal("300.00"), "Porez");
         TaxCollectResponse response = service.collectTax(req);
 
         assertThat(response.collected()).isFalse();

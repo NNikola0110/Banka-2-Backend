@@ -52,6 +52,15 @@ import java.time.LocalDateTime;
         // UNIQUE indeks na particionisanoj tabeli sadrzi particijski kljuc).
         // Logicki idempotency par ostaje (sender_routing_number, locally_generated_key)
         // — created_at je samo da PG dozvoli unique enforcement.
+        //
+        // P2-concurrency-locks-1 (R3-1582) — VAZNO: posto ovaj UNIQUE indeks ukljucuje
+        // created_at, on NE iznudjuje pravu idempotenciju (dva NEW_TX sa istim kljucem
+        // ali razlicitim created_at oba prolaze → DataIntegrityViolation se NE okida).
+        // Zato je ovaj indeks samo AUDIT/lookup ubrzanje (cache hit), a NIJE
+        // double-reserve barijera. Stvarna NEW_TX double-reserve serijalizacija se sidri
+        // na NEPARTICIONISANU `interbank_transactions` tabelu (real UNIQUE +
+        // findForUpdate u TransactionExecutorService.saveRecipientState) — ona je PRE
+        // money-leg-a (doValidateAndReserve), pa serijalizuje rezervaciju.
         @Index(
                 name = "idx_ibm_idempotence",
                 columnList = "sender_routing_number, locally_generated_key, created_at",
@@ -129,8 +138,13 @@ public class InterbankMessage {
      * OptimisticLockException ako se verzija promenila izmedju load-a i save-a;
      * scheduler tretira to kao "drugi je vec uzeo, preskoci do sledeceg ciklusa".
      */
+    // R3 1588: @ColumnDefault("0") da DDL kolona ima default 0 — bez toga
+    // svaki INSERT koji ne setuje version eksplicitno (npr. raw SQL / seed)
+    // upise NULL, a Hibernate optimisticki lock na NULL version-u baca
+    // gresku pri prvom update-u.
     @Version
     @Column(name = "version")
+    @ColumnDefault("0")
     private Long version;
 
 }

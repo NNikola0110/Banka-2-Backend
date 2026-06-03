@@ -11,7 +11,8 @@ import java.util.Optional;
 
 public interface FundReservationRepository extends JpaRepository<FundReservation, Long> {
 
-    Optional<FundReservation> findByReservationId(String reservationId);
+    // R1-708: ne-locking findByReservationId uklonjen (0 callera) — sve rezervacijske
+    // mutacije idu kroz pesimisticki-zakljucani findByReservationIdForUpdate.
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select r from FundReservation r where r.reservationId = :rid")

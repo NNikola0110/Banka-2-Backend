@@ -1,5 +1,6 @@
 package rs.raf.trading.order.service;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -7,12 +8,16 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import rs.raf.trading.actuary.model.ActuaryInfo;
 import rs.raf.trading.actuary.model.ActuaryType;
 import rs.raf.trading.actuary.repository.ActuaryInfoRepository;
 import rs.raf.trading.order.model.OrderStatus;
 
 import java.math.BigDecimal;
+import java.util.Arrays;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -185,10 +190,22 @@ class OrderStatusServiceTest {
     class DetermineStatusEdgeCases {
 
         @Test
-        @DisplayName("AGENT with null dailyLimit treated as 0, any price -> PENDING")
-        void agentNullDailyLimit_pendingForAnyPrice() {
+        @DisplayName("R2-1356: AGENT with null dailyLimit -> UNLIMITED -> APPROVED (ne PENDING)")
+        void agentNullDailyLimit_unlimited_approved() {
             when(actuaryInfoRepository.findByEmployeeId(10L)).thenReturn(
                     Optional.of(agentInfo(false, BigDecimal.ZERO, null)));
+
+            // Cak i ogroman iznos prolazi kad limit nije postavljen (null = neogranicen).
+            OrderStatus status = service.determineStatus("EMPLOYEE", 10L, new BigDecimal("99999999"));
+
+            assertEquals(OrderStatus.APPROVED, status);
+        }
+
+        @Test
+        @DisplayName("R2-1356: AGENT null dailyLimit + needApproval=true i dalje PENDING")
+        void agentNullDailyLimit_needApproval_stillPending() {
+            when(actuaryInfoRepository.findByEmployeeId(10L)).thenReturn(
+                    Optional.of(agentInfo(true, BigDecimal.ZERO, null)));
 
             OrderStatus status = service.determineStatus("EMPLOYEE", 10L, new BigDecimal("1"));
 
@@ -243,6 +260,67 @@ class OrderStatusServiceTest {
             when(actuaryInfoRepository.findByEmployeeId(10L)).thenReturn(Optional.empty());
 
             OrderStatus status = service.determineStatus("UNKNOWN_ROLE", 10L, new BigDecimal("100"));
+
+            assertEquals(OrderStatus.APPROVED, status);
+        }
+    }
+
+    // ── R1-184: fail-closed kad zaposleni nema ActuaryInfo ali nosi AGENT ────
+
+    @Nested
+    @DisplayName("R1-184 — EMPLOYEE bez ActuaryInfo (fail-closed)")
+    class NoActuaryInfoFailClosed {
+
+        @AfterEach
+        void clearCtx() {
+            SecurityContextHolder.clearContext();
+        }
+
+        private void securityAuthorities(String... authorities) {
+            var auths = Arrays.stream(authorities).map(SimpleGrantedAuthority::new).toList();
+            SecurityContextHolder.getContext().setAuthentication(
+                    new UsernamePasswordAuthenticationToken("user@test.com", null, auths));
+        }
+
+        @Test
+        @DisplayName("AGENT autoritet bez ActuaryInfo → PENDING (ne tretira se kao supervizor)")
+        void agentAuthorityNoActuaryInfo_pending() {
+            when(actuaryInfoRepository.findByEmployeeId(3L)).thenReturn(Optional.empty());
+            securityAuthorities("ROLE_EMPLOYEE", "AGENT");
+
+            OrderStatus status = service.determineStatus("EMPLOYEE", 3L, new BigDecimal("1000"));
+
+            assertEquals(OrderStatus.PENDING, status);
+        }
+
+        @Test
+        @DisplayName("SUPERVISOR autoritet bez ActuaryInfo → APPROVED")
+        void supervisorAuthorityNoActuaryInfo_approved() {
+            when(actuaryInfoRepository.findByEmployeeId(3L)).thenReturn(Optional.empty());
+            securityAuthorities("ROLE_EMPLOYEE", "SUPERVISOR");
+
+            OrderStatus status = service.determineStatus("EMPLOYEE", 3L, new BigDecimal("1000"));
+
+            assertEquals(OrderStatus.APPROVED, status);
+        }
+
+        @Test
+        @DisplayName("AGENT + ADMIN autoritet bez ActuaryInfo → APPROVED (admin je supervizor)")
+        void agentPlusAdminAuthorityNoActuaryInfo_approved() {
+            when(actuaryInfoRepository.findByEmployeeId(3L)).thenReturn(Optional.empty());
+            securityAuthorities("ROLE_ADMIN", "AGENT", "SUPERVISOR");
+
+            OrderStatus status = service.determineStatus("EMPLOYEE", 3L, new BigDecimal("1000"));
+
+            assertEquals(OrderStatus.APPROVED, status);
+        }
+
+        @Test
+        @DisplayName("bez SecurityContext-a (nema autoriteta) → APPROVED (backward-compat)")
+        void noSecurityContext_approved() {
+            when(actuaryInfoRepository.findByEmployeeId(3L)).thenReturn(Optional.empty());
+
+            OrderStatus status = service.determineStatus("EMPLOYEE", 3L, new BigDecimal("1000"));
 
             assertEquals(OrderStatus.APPROVED, status);
         }

@@ -49,6 +49,14 @@ public class LlmHttpClient {
     private final String baseUrl;
     private final String apiKey;
 
+    /**
+     * P2-perf-nplus1-1 (R5 1905): dedikovani executor je sad polje (ne lokalna
+     * promenljiva) da bi se mogao uredno ugasiti u {@link #shutdown()}
+     * ({@code @PreDestroy}). Bez ovoga je 16-thread pool curio na svaki context
+     * restart (test/redeploy) — daemon thread-ovi nikad nisu join-ovani.
+     */
+    private final java.util.concurrent.ExecutorService executor;
+
     public LlmHttpClient(AssistantProperties properties,
                          @Qualifier("assistantObjectMapper") ObjectMapper objectMapper) {
         this.properties = properties;
@@ -60,7 +68,7 @@ public class LlmHttpClient {
         // sa svim ostalim async pozivima u JVM-u. Pri 10+ concurrent agentic
         // chat sesija to je usko grlo. Vlastiti pool sa 16 thread-a daje
         // izolovan throughput za LLM pozive.
-        java.util.concurrent.ExecutorService executor =
+        this.executor =
                 java.util.concurrent.Executors.newFixedThreadPool(
                         16,
                         r -> {
@@ -73,6 +81,24 @@ public class LlmHttpClient {
                 .version(HttpClient.Version.HTTP_1_1)
                 .executor(executor)
                 .build();
+    }
+
+    /**
+     * P2-perf-nplus1-1 (R5 1905): uredno gasi dedikovani HTTP executor pri
+     * gasenju Spring konteksta — graceful drain (5s) pa hard shutdown. Bez ovoga
+     * je svaki context restart curio 16 thread-ova.
+     */
+    @jakarta.annotation.PreDestroy
+    public void shutdown() {
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     public OpenAiChatResponse chatNonStream(OpenAiChatRequest request) {

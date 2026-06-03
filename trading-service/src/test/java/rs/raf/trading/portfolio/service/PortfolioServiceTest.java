@@ -17,8 +17,10 @@ import rs.raf.trading.stock.model.Listing;
 import rs.raf.trading.stock.model.ListingType;
 import rs.raf.trading.stock.repository.ListingRepository;
 import rs.raf.trading.tax.repository.TaxRecordRepository;
+import rs.raf.trading.tax.util.TaxConstants;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.List;
@@ -174,6 +176,57 @@ class PortfolioServiceTest {
         }
 
         @Test
+        @DisplayName("R1-173: plain STOCK (no settlementDate) leaves inTheMoney null")
+        void plainStock_inTheMoneyNull() {
+            authenticateAs(1L);
+            Portfolio p = buildPortfolio(1L, 1L, 10L, "AAPL", 10, new BigDecimal("100.00"));
+            // buildListing → STOCK bez settlementDate
+            when(portfolioRepository.findByUserIdAndUserRole(1L, "CLIENT")).thenReturn(List.of(p));
+            when(listingRepository.findById(10L)).thenReturn(Optional.of(buildListing(10L, new BigDecimal("120.00"))));
+
+            List<PortfolioItemDto> result = portfolioService.getMyPortfolio();
+
+            // Iako je pozicija u profitu (120 > 100), STOCK bez isteka NEMA ITM pojam.
+            assertThat(result.get(0).getInTheMoney()).isNull();
+            assertThat(result.get(0).getSettlementDate()).isNull();
+        }
+
+        @Test
+        @DisplayName("R1-173: settlement-dated instrument gets ITM (long position worth more)")
+        void settlementDatedInstrument_inTheMoneySet() {
+            authenticateAs(1L);
+            Portfolio p = buildPortfolio(1L, 1L, 10L, "FUT", 10, new BigDecimal("100.00"));
+            Listing listing = buildListing(10L, new BigDecimal("120.00"));
+            listing.setListingType(ListingType.FUTURES);
+            listing.setSettlementDate(java.time.LocalDate.now().plusDays(30));
+            when(portfolioRepository.findByUserIdAndUserRole(1L, "CLIENT")).thenReturn(List.of(p));
+            when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
+
+            List<PortfolioItemDto> result = portfolioService.getMyPortfolio();
+
+            // 120 > 100 → long pozicija je ITM
+            assertThat(result.get(0).getInTheMoney()).isTrue();
+            assertThat(result.get(0).getSettlementDate()).isNotNull();
+        }
+
+        @Test
+        @DisplayName("R1-173: settlement-dated instrument below cost is NOT ITM")
+        void settlementDatedInstrument_belowCost_notInTheMoney() {
+            authenticateAs(1L);
+            Portfolio p = buildPortfolio(1L, 1L, 10L, "FUT", 10, new BigDecimal("150.00"));
+            Listing listing = buildListing(10L, new BigDecimal("130.00"));
+            listing.setListingType(ListingType.FUTURES);
+            listing.setSettlementDate(java.time.LocalDate.now().plusDays(30));
+            when(portfolioRepository.findByUserIdAndUserRole(1L, "CLIENT")).thenReturn(List.of(p));
+            when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
+
+            List<PortfolioItemDto> result = portfolioService.getMyPortfolio();
+
+            // 130 < 150 → nije ITM
+            assertThat(result.get(0).getInTheMoney()).isFalse();
+        }
+
+        @Test
         @DisplayName("multiple portfolio items are all returned")
         void multipleItems() {
             authenticateAs(1L);
@@ -241,6 +294,26 @@ class PortfolioServiceTest {
             assertThat(summary.getTotalProfit()).isEqualByComparingTo(BigDecimal.ZERO);
             assertThat(summary.getUnpaidTaxThisMonth()).isEqualByComparingTo(BigDecimal.ZERO);
         }
+
+        @Test
+        @DisplayName("unpaidTax estimate koristi kanonski TaxConstants.computeTax (R1-737, jedna politika zaokruzivanja)")
+        void unpaidTaxUsesCanonicalTaxConstantsHelper() {
+            authenticateAs(1L);
+            // profit sa frakcionim centima: (120.34 - 100.01) * 7 = 20.33 * 7 = 142.31
+            Portfolio p = buildPortfolio(1L, 1L, 10L, "AAPL", 7, new BigDecimal("100.01"));
+            when(portfolioRepository.findByUserIdAndUserRole(1L, "CLIENT")).thenReturn(List.of(p));
+            when(listingRepository.findById(10L)).thenReturn(Optional.of(buildListing(10L, new BigDecimal("120.34"))));
+
+            PortfolioSummaryDto summary = portfolioService.getSummary();
+
+            BigDecimal totalProfit = summary.getTotalProfit();
+            // Prikazani neplaceni porez MORA biti izveden iz iste politike zaokruzivanja
+            // kao porez koji se stvarno naplacuje (TaxConstants.computeTax → TAX_SCALE),
+            // a ne iz rucnog multiply+setScale(2). Display rounding na 2 decimale.
+            BigDecimal expected = TaxConstants.computeTax(totalProfit)
+                    .setScale(2, RoundingMode.HALF_UP);
+            assertThat(summary.getUnpaidTaxThisMonth()).isEqualByComparingTo(expected);
+        }
     }
 
     // ─── setPublicQuantity ──────────────────────────────────────────────────────
@@ -287,24 +360,24 @@ class PortfolioServiceTest {
         }
 
         @Test
-        @DisplayName("throws when portfolio item not found")
+        @DisplayName("R1 422: not-found baca EntityNotFoundException (→404), ne bare RuntimeException(→400)")
         void portfolioNotFound() {
             authenticateAs(1L);
             when(portfolioRepository.findById(99L)).thenReturn(Optional.empty());
 
             assertThatThrownBy(() -> portfolioService.setPublicQuantity(99L, 10))
-                    .isInstanceOf(RuntimeException.class);
+                    .isInstanceOf(jakarta.persistence.EntityNotFoundException.class);
         }
 
         @Test
-        @DisplayName("throws when user does not own the portfolio item")
+        @DisplayName("R1 422: no-access baca AccessDeniedException (→403), ne bare RuntimeException(→400)")
         void wrongUser() {
             authenticateAs(1L);
             Portfolio p = buildPortfolio(1L, 999L, 10L, "AAPL", 100, new BigDecimal("100.00")); // Different userId
             when(portfolioRepository.findById(1L)).thenReturn(Optional.of(p));
 
             assertThatThrownBy(() -> portfolioService.setPublicQuantity(1L, 10))
-                    .isInstanceOf(RuntimeException.class)
+                    .isInstanceOf(org.springframework.security.access.AccessDeniedException.class)
                     .hasMessageContaining("pristup");
         }
 
@@ -334,6 +407,42 @@ class PortfolioServiceTest {
 
             assertThat(result.getPublicQuantity()).isEqualTo(100);
         }
+
+        @Test
+        @DisplayName("OT-1046 karakterizacija: setPublicQuantity NE odbija non-STOCK portfolio stavku "
+                + "(spec §483 javni rezim je za akcije; BE trenutno NE enforce-uje listingType filter)")
+        void nonStockPortfolioItem_currentlyAllowed_characterization() {
+            // Spec §483: "Za akcije: broj hartija u javnom rezimu". Javni rezim je
+            // koncept za STOCK (OTC trading akcijama). Trenutni BE setPublicQuantity
+            // validira SAMO opseg (0..quantity) + vlasnistvo — NE proverava listingType.
+            // Ovaj karakterizacioni test PINUJE trenutno ponasanje (non-STOCK prolazi);
+            // ako tim odluci da forsira STOCK-only gate, ovaj test treba osveziti.
+            authenticateAs(1L);
+            Portfolio forexItem = buildPortfolio(1L, 1L, 10L, "EUR/USD", 100, new BigDecimal("1.10"));
+            forexItem.setListingType("FOREX");
+            when(portfolioRepository.findById(1L)).thenReturn(Optional.of(forexItem));
+            when(listingRepository.findById(10L)).thenReturn(Optional.of(buildListing(10L, new BigDecimal("1.10"))));
+
+            PortfolioItemDto result = portfolioService.setPublicQuantity(1L, 50);
+
+            // Trenutno ponasanje: prolazi (non-STOCK nije odbijen).
+            assertThat(result.getPublicQuantity()).isEqualTo(50);
+            verify(portfolioRepository).save(forexItem);
+        }
+
+        @Test
+        @DisplayName("OT-1054: Portfolio ima @Version polje (optimistic-lock infrastruktura za "
+                + "concurrent setPublicQuantity vs SELL lost-update detekciju)")
+        void portfolioHasVersionFieldForOptimisticLock() throws NoSuchFieldException {
+            // OT-1054: konkurentni setPublicQuantity vs SELL fill nad istom Portfolio
+            // pozicijom mora biti detektovan (ne tih lost-update). Pravi concurrency
+            // test trazi realnu DB tx (docker/@DataJpaTest); ovde defanzivno pinujemo
+            // da @Version postoji (na commit fazi OLE -> 409 mapiran u
+            // TradingGlobalExceptionHandler, pokriveno OLE->409 testovima). Bez @Version
+            // bi paralelni update tiho prepisao tudji (lost-update).
+            java.lang.reflect.Field version = Portfolio.class.getDeclaredField("version");
+            assertThat(version.isAnnotationPresent(jakarta.persistence.Version.class)).isTrue();
+        }
     }
 
     // ─── Identitet ──────────────────────────────────────────────────────────────
@@ -360,6 +469,70 @@ class PortfolioServiceTest {
             assertThatThrownBy(() -> portfolioService.getMyPortfolio())
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("nije pronadjen");
+        }
+    }
+
+    // ─── OT-1218 (REKLASIFIKOVANO): portfolio NE predstavlja opcione pozicije ──────
+
+    /**
+     * [OT-1218 — REKLASIFIKOVANO 02.06, reviewer-blocker close]
+     *
+     * <p>Raniji "fix" je dodao {@code PortfolioItemDto.optionId} koji se razresavao
+     * iz ticker-a SAMO kad {@code listingType} NIJE u {STOCK,FUTURES,FOREX}. Reviewer
+     * je dokazao da je ta grana NEDOSTIZNA u proizvodnji:
+     * <ul>
+     *   <li>{@link ListingType} enum = {STOCK, FUTURES, FOREX} — nema OPTION;</li>
+     *   <li>jedini producer ({@code OptionService.updatePortfolioBuy}) upisuje
+     *       ticker/tip OSNOVNE akcije ({@code listing.getListingType().name()} =
+     *       "STOCK"), nikad ticker/tip opcije;</li>
+     *   <li>svaki {@code portfolios} red u {@code trading-seed.sql} je STOCK/FUTURES.</li>
+     * </ul>
+     * Stari test je rucno radio {@code p.setListingType("OPTION")} — oblik portfolio
+     * reda koji sistem nikad ne kreira (testirao hipotezu, ne stvarni data-flow).
+     *
+     * <p>Domenska istina: opcione pozicije zive ISKLJUCIVO u {@code options}
+     * tabeli; plain-opciju izvrsava aktuar/admin iz lanca opcija
+     * (SecuritiesDetailsPage, {@code OptionItem.id} = pravi {@code Option.id}), NE
+     * iz portfolija. Zato je {@code optionId} polje uklonjeno kao dead-contract i
+     * {@code PortfolioService} vise ne zavisi od {@code OptionRepository}. Ovi
+     * testovi pinuju TAJ model.
+     */
+    @Nested
+    @DisplayName("OT-1218 reklasifikovano: portfolio drzi samo STOCK/FUTURES/FOREX (ne opcione pozicije)")
+    class PortfolioNeverHoldsOptions {
+
+        @Test
+        @DisplayName("ListingType enum nema OPTION clan — opciona pozicija se NE moze predstaviti kao Portfolio red")
+        void listingTypeEnum_hasNoOptionMember() {
+            assertThat(ListingType.values())
+                    .extracting(Enum::name)
+                    .containsExactlyInAnyOrder("STOCK", "FUTURES", "FOREX")
+                    .doesNotContain("OPTION");
+        }
+
+        @Test
+        @DisplayName("PortfolioItemDto vise NE izlaze optionId (dead-contract uklonjen)")
+        void portfolioItemDto_hasNoOptionIdField() {
+            assertThat(java.util.Arrays.stream(PortfolioItemDto.class.getDeclaredFields())
+                    .map(java.lang.reflect.Field::getName))
+                    .doesNotContain("optionId");
+        }
+
+        @Test
+        @DisplayName("realan (STOCK) portfolio red mapira u DTO bez ikakve option-resolucije (0 dodatnih upita)")
+        void realStockPosition_mapsWithoutOptionResolution() {
+            authenticateAs(1L);
+            // Producer upisuje OSNOVNU akciju (STOCK) — to je JEDINI oblik koji sistem kreira.
+            Portfolio p = buildPortfolio(1L, 1L, 10L, "AAPL", 10, new BigDecimal("100.00"));
+            when(portfolioRepository.findByUserIdAndUserRole(1L, "CLIENT")).thenReturn(List.of(p));
+            when(listingRepository.findById(10L)).thenReturn(Optional.of(buildListing(10L, new BigDecimal("120.00"))));
+
+            List<PortfolioItemDto> result = portfolioService.getMyPortfolio();
+
+            // Mapiranje radi bez OptionRepository zavisnosti; profit i dalje korektan.
+            assertThat(result).hasSize(1);
+            assertThat(result.get(0).getListingType()).isEqualTo("STOCK");
+            assertThat(result.get(0).getProfit()).isEqualByComparingTo(new BigDecimal("200"));
         }
     }
 }

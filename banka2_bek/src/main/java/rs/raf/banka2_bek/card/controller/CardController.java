@@ -86,6 +86,18 @@ public class CardController {
         return ResponseEntity.ok(cardService.deactivateCard(id));
     }
 
+    /**
+     * C2 Sc32 (§spec): pokusaj aktivacije kartice. Deaktivirana kartica je
+     * ireverzibilna — vraca poruku "Kartica je deaktivirana i ne moze se ponovo
+     * aktivirati" (403 kroz CardExceptionHandler IllegalState handler).
+     */
+    @Operation(summary = "Activate card",
+            description = "Pokusaj aktivacije kartice. Deaktivirana kartica se ne moze ponovo aktivirati (Sc32).")
+    @PatchMapping("/{id}/activate")
+    public ResponseEntity<CardResponseDto> activateCard(@PathVariable Long id) {
+        return ResponseEntity.ok(cardService.activateCard(id));
+    }
+
     @Operation(summary = "Update card limit")
     @PatchMapping("/{id}/limit")
     public ResponseEntity<CardResponseDto> updateCardLimit(
@@ -102,7 +114,10 @@ public class CardController {
     @PostMapping("/{id}/top-up")
     public ResponseEntity<CardResponseDto> topUpPrepaidCard(
             @PathVariable Long id,
-            @RequestBody Map<String, Object> body) {
+            @RequestBody Map<String, Object> body,
+            // P1-idempotency-1 (R5-1849): opcioni klijent-generisan kljuc za
+            // replay-safe dopunu. Kad nije prosledjen, ponasanje je nepromenjeno.
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
         Long sourceAccountId = body.get("sourceAccountId") != null
                 ? Long.valueOf(String.valueOf(body.get("sourceAccountId"))) : null;
         if (sourceAccountId == null) {
@@ -110,7 +125,7 @@ public class CardController {
         }
         BigDecimal amount = body.get("amount") != null
                 ? new BigDecimal(String.valueOf(body.get("amount"))) : null;
-        return ResponseEntity.ok(cardService.topUpPrepaidCard(id, sourceAccountId, amount));
+        return ResponseEntity.ok(cardService.topUpPrepaidCard(id, sourceAccountId, amount, idempotencyKey));
     }
 
     /**
@@ -120,7 +135,8 @@ public class CardController {
     @PostMapping("/{id}/withdraw")
     public ResponseEntity<CardResponseDto> withdrawFromPrepaidCard(
             @PathVariable Long id,
-            @RequestBody Map<String, Object> body) {
+            @RequestBody Map<String, Object> body,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
         Long targetAccountId = body.get("targetAccountId") != null
                 ? Long.valueOf(String.valueOf(body.get("targetAccountId"))) : null;
         if (targetAccountId == null) {
@@ -128,7 +144,7 @@ public class CardController {
         }
         BigDecimal amount = body.get("amount") != null
                 ? new BigDecimal(String.valueOf(body.get("amount"))) : null;
-        return ResponseEntity.ok(cardService.withdrawFromPrepaidCard(id, targetAccountId, amount));
+        return ResponseEntity.ok(cardService.withdrawFromPrepaidCard(id, targetAccountId, amount, idempotencyKey));
     }
 
     // ===== Card Requests (klijent podnosi zahtev, admin odobrava) =====
@@ -143,6 +159,23 @@ public class CardController {
         Long accountId = Long.valueOf(String.valueOf(body.get("accountId")));
         Account account = accountRepository.findById(accountId)
                 .orElseThrow(() -> new IllegalArgumentException("Racun nije pronadjen"));
+
+        // P1-authz-idor-1 (R1 114): IDOR — klijent je mogao da podnese zahtev za karticu
+        // nad TUDJIM racunom prosledivanjem proizvoljnog accountId (account se ucitavao
+        // bez ikakve provere vlasnistva). Klijent sme samo nad sopstvenim racunom; ako
+        // pozivalac nije klijent (employee/admin agentic put), preskace se (oni legitimno
+        // obradjuju tudje racune). IllegalState→403 (CardExceptionHandler).
+        if (client != null) {
+            boolean ownsAccount = account.getClient() != null
+                    && account.getClient().getId().equals(client.getId());
+            if (!ownsAccount) {
+                throw new IllegalStateException("Racun ne pripada ulogovanom klijentu.");
+            }
+        }
+
+        // ACCEPTED-DEVIATION (user-directed 03.06): nekadasnji C2 Sc28 email-kod gate
+        // za zahtev kartice je UKLONJEN. Zahtev se podnosi direktno (PENDING), bez
+        // verifikacionog koda. OTP/verifikacija vazi iskljucivo za placanja i transfere.
 
         BigDecimal limit = body.get("cardLimit") != null ? new BigDecimal(String.valueOf(body.get("cardLimit"))) : BigDecimal.valueOf(100000);
 

@@ -86,6 +86,8 @@ class InvestmentFundServiceT8UnitTest {
     @Mock private FundLiquidationService fundLiquidationService;
     @Mock private CurrencyConversionService currencyConversionService;
     @Mock private FundValueSnapshotScheduler fundValueSnapshotScheduler;
+    @Mock private rs.raf.trading.audit.service.AuditLogService auditLogService;
+    @Mock private rs.raf.trading.notification.service.NotificationService notificationService;
 
     @InjectMocks
     private InvestmentFundService service;
@@ -171,8 +173,11 @@ class InvestmentFundServiceT8UnitTest {
 
         // banka-core transfer: izvorni racun gubi debitAmount+commission (87 EUR),
         // fond dobija amountRsd (10000 RSD), banka dobija commission (1 EUR).
+        // P1-funds-1 (1553): invest idempotency kljuc je sada STABILAN (ne
+        // fund-invest-{txId}) — ne asertujemo tacan kljuc ovde (vidi
+        // FundsP1BatchTest.invest_usesStableIdempotencyKey).
         ArgumentCaptor<TransferFundsRequest> reqCap = ArgumentCaptor.forClass(TransferFundsRequest.class);
-        verify(bankaCoreClient).transferFunds(eq("fund-invest-1"), reqCap.capture());
+        verify(bankaCoreClient).transferFunds(anyString(), reqCap.capture());
         TransferFundsRequest req = reqCap.getValue();
         assertEquals(sourceAccountId, req.fromAccountId());
         assertBd("87.0000", req.debitAmount());
@@ -187,6 +192,30 @@ class InvestmentFundServiceT8UnitTest {
         assertEquals(ClientFundTransactionStatus.COMPLETED, lastTx.getStatus());
         assertTrue(lastTx.isInflow());
         assertBd("10000.0000", lastTx.getAmountRsd());
+    }
+
+    @Test
+    @DisplayName("R1 485: invest na NEAKTIVAN fond baca FundInactiveException (→409 CONFLICT), ne IllegalState(→403)")
+    void invest_inactiveFund_throwsFundInactiveConflict() {
+        Long fundId = 1L;
+        Long clientId = 10L;
+        Long sourceAccountId = 101L;
+        Long fundAccountId = 201L;
+
+        InvestmentFund fund = fund(fundId, fundAccountId, "Banka 2 Stable Income", new BigDecimal("1000"));
+        fund.setActive(false); // neaktivan
+
+        when(investmentFundRepository.findById(fundId)).thenReturn(Optional.of(fund));
+
+        assertThrows(rs.raf.trading.investmentfund.exception.FundInactiveException.class, () ->
+                service.invest(
+                        fundId,
+                        new InvestFundDto(new BigDecimal("10000"), "RSD", sourceAccountId),
+                        clientId,
+                        UserRole.CLIENT));
+
+        // novcana noga se NIKAD ne okida za neaktivan fond
+        verify(bankaCoreClient, never()).transferFunds(anyString(), any(TransferFundsRequest.class));
     }
 
     @Test
@@ -238,8 +267,9 @@ class InvestmentFundServiceT8UnitTest {
         assertBd("10000.0000", result.getTotalInvested());
 
         // 0% komisija -> debitAmount == 85, commission == 0
+        // P1-funds-1 (1553): stabilan invest idempotency kljuc.
         ArgumentCaptor<TransferFundsRequest> reqCap = ArgumentCaptor.forClass(TransferFundsRequest.class);
-        verify(bankaCoreClient).transferFunds(eq("fund-invest-1"), reqCap.capture());
+        verify(bankaCoreClient).transferFunds(anyString(), reqCap.capture());
         TransferFundsRequest req = reqCap.getValue();
         assertBd("85.0000", req.debitAmount());
         assertBd("10000.0000", req.creditAmount());
@@ -293,6 +323,87 @@ class InvestmentFundServiceT8UnitTest {
                 p.getTotalInvested().compareTo(new BigDecimal("5000.0000")) == 0
         ));
         verify(fundLiquidationService, never()).liquidateFor(anyLong(), any());
+
+        // C-notif-email blocker #1 (Sc35/49/50): immediate (likvidni) withdraw MORA
+        // poslati TACNO JEDNO FUND_PAYOUT obavestenje o uspesnoj isplati. Ranije ovaj
+        // (najcesci) put nije slao NISTA — exactly-once je bio prekrsen u nuli.
+        // Blocker #3: referenca je per-transakcija (FUND_TRANSACTION, txId=1).
+        verify(notificationService, times(1)).notify(eq(clientId), eq(UserRole.CLIENT),
+                eq(rs.raf.trading.notification.model.NotificationType.FUND_PAYOUT),
+                anyString(), anyString(), eq("FUND_TRANSACTION"), eq(1L));
+    }
+
+    @Test
+    @DisplayName("C-notif-email blocker #1: likvidni withdraw salje TACNO 1 FUND_PAYOUT 'uspesno' (Sc35/49/50)")
+    void withdraw_liquidPath_emitsExactlyOneSuccessNotification() {
+        Long fundId = 1L;
+        Long clientId = 10L;
+        Long fundAccountId = 201L;
+        Long destinationAccountId = 101L;
+
+        InvestmentFund fund = fund(fundId, fundAccountId, "Banka 2 Stable Income", new BigDecimal("1000"));
+        InternalAccountDto fundAccount = fundCashAccount(fundAccountId, "RSD", new BigDecimal("10000.0000"));
+        InternalAccountDto destinationAccount = clientAccount(destinationAccountId, clientId, "RSD", new BigDecimal("1000.0000"));
+
+        ClientFundPosition position = position(1L, fundId, clientId, UserRole.CLIENT, new BigDecimal("10000.0000"));
+
+        when(investmentFundRepository.findById(fundId)).thenReturn(Optional.of(fund));
+        when(bankaCoreClient.getAccount(fundAccountId)).thenReturn(fundAccount);
+        when(bankaCoreClient.getAccount(destinationAccountId)).thenReturn(destinationAccount);
+        when(clientFundPositionRepository.findByFundIdAndUserIdAndUserRole(fundId, clientId, UserRole.CLIENT))
+                .thenReturn(Optional.of(position));
+
+        service.withdraw(
+                fundId,
+                new WithdrawFundDto(new BigDecimal("5000"), destinationAccountId),
+                clientId,
+                UserRole.CLIENT);
+
+        // Tacno JEDAN FUND_PAYOUT (success) i NIJEDAN "pokrenuta" (jer je likvidni put).
+        ArgumentCaptor<String> titleCap = ArgumentCaptor.forClass(String.class);
+        verify(notificationService, times(1)).notify(eq(clientId), eq(UserRole.CLIENT),
+                eq(rs.raf.trading.notification.model.NotificationType.FUND_PAYOUT),
+                titleCap.capture(), anyString(), eq("FUND_TRANSACTION"), eq(1L));
+        assertTrue(titleCap.getValue().toLowerCase().contains("uspe"),
+                "Naslov mora oznacavati USPESNU isplatu, bio: " + titleCap.getValue());
+        // Likvidacija se NE poziva (fond ima dovoljno cash-a) → nema FIFO notify.
+        verify(fundLiquidationService, never()).liquidateFor(anyLong(), any());
+    }
+
+    @Test
+    @DisplayName("C-notif-email blocker #1: PENDING withdraw salje TACNO 1 FUND_PAYOUT 'pokrenuta' (Sc36)")
+    void withdraw_pendingPath_emitsExactlyOneInitiatedNotification() {
+        Long fundId = 1L;
+        Long clientId = 10L;
+        Long fundAccountId = 201L;
+        Long destinationAccountId = 101L;
+
+        InvestmentFund fund = fund(fundId, fundAccountId, "Banka 2 Stable Income", new BigDecimal("1000"));
+        InternalAccountDto fundAccount = fundCashAccount(fundAccountId, "RSD", new BigDecimal("1000.0000"));
+        InternalAccountDto destinationAccount = clientAccount(destinationAccountId, clientId, "RSD", BigDecimal.ZERO);
+
+        ClientFundPosition position = position(1L, fundId, clientId, UserRole.CLIENT, new BigDecimal("5000.0000"));
+
+        when(investmentFundRepository.findById(fundId)).thenReturn(Optional.of(fund));
+        when(bankaCoreClient.getAccount(fundAccountId)).thenReturn(fundAccount);
+        when(bankaCoreClient.getAccount(destinationAccountId)).thenReturn(destinationAccount);
+        when(clientFundPositionRepository.findByFundIdAndUserIdAndUserRole(fundId, clientId, UserRole.CLIENT))
+                .thenReturn(Optional.of(position));
+
+        service.withdraw(
+                fundId,
+                new WithdrawFundDto(new BigDecimal("5000"), destinationAccountId),
+                clientId,
+                UserRole.CLIENT);
+
+        // Tacno JEDAN FUND_PAYOUT ("pokrenuta"), keyed per-transakcija (txId=1).
+        ArgumentCaptor<String> titleCap = ArgumentCaptor.forClass(String.class);
+        verify(notificationService, times(1)).notify(eq(clientId), eq(UserRole.CLIENT),
+                eq(rs.raf.trading.notification.model.NotificationType.FUND_PAYOUT),
+                titleCap.capture(), anyString(), eq("FUND_TRANSACTION"), eq(1L));
+        assertTrue(titleCap.getValue().toLowerCase().contains("pokrenut"),
+                "Naslov mora oznacavati POKRENUTU isplatu, bio: " + titleCap.getValue());
+        verify(fundLiquidationService).liquidateFor(eq(fundId), any());
     }
 
     @Test
@@ -331,7 +442,12 @@ class InvestmentFundServiceT8UnitTest {
         // Nedovoljno cash-a -> nema isplate (transferFunds), poziva se likvidacija
         // za shortfall = 5000 - 1000 = 4000.
         verify(bankaCoreClient, never()).transferFunds(anyString(), any());
-        verify(clientFundPositionRepository).delete(position);
+        // P1-funds-1 (1343): pozicija se NE dira u PENDING grani — umanjuje se TEK
+        // pri stvarnoj isplati (FIFO onFillCompleted u FundLiquidationService).
+        // Ranije je decreasePosition brisao poziciju ODMAH → klijent je gubio udeo
+        // ako likvidacija nikad ne uspe.
+        verify(clientFundPositionRepository, never()).delete(position);
+        verify(clientFundPositionRepository, never()).save(any(ClientFundPosition.class));
         verify(fundLiquidationService).liquidateFor(eq(fundId), argThat(amount ->
                 amount.compareTo(new BigDecimal("4000.0000")) == 0
         ));
@@ -403,6 +519,41 @@ class InvestmentFundServiceT8UnitTest {
     }
 
     @Test
+    @DisplayName("P1-authz-idor-1 (R2 1351): AGENT (ne-supervizor) employee invest u ime banke -> AccessDenied")
+    void invest_agentEmployee_throwsAccessDenied() {
+        // Celina 4: ProfitBank invest/withdraw je samo za supervizore (agent samo
+        // discovery&details). ensureSupervisor (preko actuaryInfoRepository) je vec
+        // service-layer gate — agent (ActuaryInfo nije SUPERVISOR / nema reda) -> 403.
+        Long fundId = 1L;
+        Long agentId = 7L;
+        Long sourceAccountId = 102L;
+        Long fundAccountId = 202L;
+
+        InvestmentFund fund = fund(fundId, fundAccountId, "Banka 2 Stable Income", new BigDecimal("1000"));
+        InternalAccountDto sourceAccount = bankTradingAccount(sourceAccountId, "RSD", new BigDecimal("100000.0000"));
+        InternalAccountDto fundAccount = fundCashAccount(fundAccountId, "RSD", BigDecimal.ZERO);
+
+        when(investmentFundRepository.findById(fundId)).thenReturn(Optional.of(fund));
+        when(bankaCoreClient.getAccount(sourceAccountId)).thenReturn(sourceAccount);
+        when(bankaCoreClient.getAccount(fundAccountId)).thenReturn(fundAccount);
+        // Agent: nije supervizor → ensureSupervisor baca AccessDenied.
+        when(actuaryInfoRepository.findByEmployeeId(agentId)).thenReturn(Optional.empty());
+
+        assertThrows(
+                AccessDeniedException.class,
+                () -> service.invest(
+                        fundId,
+                        new InvestFundDto(new BigDecimal("10000"), "RSD", sourceAccountId),
+                        agentId,
+                        UserRole.EMPLOYEE
+                )
+        );
+
+        verify(clientFundTransactionRepository, never()).save(any(ClientFundTransaction.class));
+        verify(bankaCoreClient, never()).transferFunds(anyString(), any());
+    }
+
+    @Test
     @DisplayName("T8 UNIT: invest odbija kada nema dovoljno sredstava na racunu")
     void invest_whenInsufficientFunds_throwsInsufficientFundsException() {
         Long fundId = 1L;
@@ -452,7 +603,8 @@ class InvestmentFundServiceT8UnitTest {
         when(bankaCoreClient.getAccount(fundAccountId)).thenReturn(fundAccount);
         when(clientFundPositionRepository.findByFundIdAndUserIdAndUserRole(fundId, clientId, UserRole.CLIENT))
                 .thenReturn(Optional.empty());
-        when(bankaCoreClient.transferFunds(eq("fund-invest-1"), any(TransferFundsRequest.class)))
+        // P1-funds-1 (1553): stabilan invest idempotency kljuc (ne fund-invest-{txId}).
+        when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
                 .thenThrow(new BankaCoreClientException(409, "banka-core 409"));
 
         assertThrows(
@@ -527,6 +679,74 @@ class InvestmentFundServiceT8UnitTest {
         assertTrue(ex.getMessage().contains("veci od pozicije"));
         verify(clientFundTransactionRepository, never()).save(any(ClientFundTransaction.class));
         verify(fundLiquidationService, never()).liquidateFor(anyLong(), any());
+    }
+
+    @Test
+    @DisplayName("R1 791: parcijalno povlacenje koje ostavlja poziciju ispod minimuma se odbija")
+    void withdraw_partialLeavingPositionBelowMinimum_throwsIllegalArgument_R1_791() {
+        Long fundId = 1L;
+        Long clientId = 10L;
+        Long fundAccountId = 201L;
+        Long destinationAccountId = 101L;
+
+        // minimumContribution = 1000; pozicija = 5000; povlaci 4500 -> ostatak 500 < 1000.
+        InvestmentFund fund = fund(fundId, fundAccountId, "Banka 2 Stable Income", new BigDecimal("1000"));
+        InternalAccountDto fundAccount = fundCashAccount(fundAccountId, "RSD", new BigDecimal("10000.0000"));
+        InternalAccountDto destinationAccount = clientAccount(destinationAccountId, clientId, "RSD", BigDecimal.ZERO);
+
+        ClientFundPosition position = position(1L, fundId, clientId, UserRole.CLIENT, new BigDecimal("5000.0000"));
+
+        when(investmentFundRepository.findById(fundId)).thenReturn(Optional.of(fund));
+        when(bankaCoreClient.getAccount(fundAccountId)).thenReturn(fundAccount);
+        when(bankaCoreClient.getAccount(destinationAccountId)).thenReturn(destinationAccount);
+        when(clientFundPositionRepository.findByFundIdAndUserIdAndUserRole(fundId, clientId, UserRole.CLIENT))
+                .thenReturn(Optional.of(position));
+
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class,
+                () -> service.withdraw(
+                        fundId,
+                        new WithdrawFundDto(new BigDecimal("4500"), destinationAccountId),
+                        clientId,
+                        UserRole.CLIENT
+                )
+        );
+
+        assertTrue(ex.getMessage().contains("ispod minimuma"));
+        verify(clientFundTransactionRepository, never()).save(any(ClientFundTransaction.class));
+        verify(bankaCoreClient, never()).transferFunds(anyString(), any());
+    }
+
+    @Test
+    @DisplayName("R1 791: potpuno povlacenje cele pozicije je dozvoljeno (ostatak 0, ne ispod minimuma)")
+    void withdraw_fullPosition_allowedEvenIfMinimumGtZero_R1_791() {
+        Long fundId = 1L;
+        Long clientId = 10L;
+        Long fundAccountId = 201L;
+        Long destinationAccountId = 101L;
+
+        // minimumContribution = 1000; pozicija = 5000; povlaci celih 5000 -> ostatak 0 (OK).
+        InvestmentFund fund = fund(fundId, fundAccountId, "Banka 2 Stable Income", new BigDecimal("1000"));
+        InternalAccountDto fundAccount = fundCashAccount(fundAccountId, "RSD", new BigDecimal("10000.0000"));
+        InternalAccountDto destinationAccount = clientAccount(destinationAccountId, clientId, "RSD", BigDecimal.ZERO);
+
+        ClientFundPosition position = position(1L, fundId, clientId, UserRole.CLIENT, new BigDecimal("5000.0000"));
+
+        when(investmentFundRepository.findById(fundId)).thenReturn(Optional.of(fund));
+        when(bankaCoreClient.getAccount(fundAccountId)).thenReturn(fundAccount);
+        when(bankaCoreClient.getAccount(destinationAccountId)).thenReturn(destinationAccount);
+        when(clientFundPositionRepository.findByFundIdAndUserIdAndUserRole(fundId, clientId, UserRole.CLIENT))
+                .thenReturn(Optional.of(position));
+
+        ClientFundTransactionDto result = service.withdraw(
+                fundId,
+                new WithdrawFundDto(new BigDecimal("5000"), destinationAccountId),
+                clientId,
+                UserRole.CLIENT
+        );
+
+        assertNotNull(result);
+        assertEquals("COMPLETED", result.getStatus());
     }
 
     @Test

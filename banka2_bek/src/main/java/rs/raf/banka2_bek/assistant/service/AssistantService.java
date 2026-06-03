@@ -7,7 +7,9 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import rs.raf.banka2_bek.assistant.config.AssistantProperties;
 import rs.raf.banka2_bek.assistant.dto.ChatRequestDto;
@@ -40,7 +42,6 @@ import rs.raf.banka2_bek.auth.util.UserContext;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -101,6 +102,13 @@ public class AssistantService {
     // da prosledi @Qualifier na konstruktor parametre).
     private final ObjectMapper assistantObjectMapper;
     private final TaskExecutor assistantTaskExecutor;
+    // P2-money-tx-1 (R3 1576): runChat se izvrsava na assistantTaskExecutor thread-u,
+    // pa metoda-level @Transactional (cak i da je public) NE bi imala efekta — tx
+    // se NE propagira kroz executor boundary. Umesto laznog @Transactional na runChat,
+    // svaki persist (conversation + message kao jedna jedinica) ide kroz eksplicitnu
+    // TransactionTemplate granicu — atomican commit po poruci, bez drzanja tx otvorene
+    // tokom LLM stream-a (koji traje minutima → lock-during-IO antipattern).
+    private final PlatformTransactionManager assistantTransactionManager;
 
     /* ============================== CHAT ENDPOINT ============================== */
 
@@ -112,6 +120,17 @@ public class AssistantService {
         SseEmitter emitter = timeout == null ? new SseEmitter() : new SseEmitter(timeout);
         emitter.onTimeout(() -> log.debug("ARBITRO chat timeout user={}:{}", user.userRole(), user.userId()));
         emitter.onError(t -> log.debug("ARBITRO chat onError: {}", t.getMessage()));
+
+        // R5-364: top-level master prekidac (assistant.enabled / ARBITRO_ENABLED).
+        // Ranije se binduje ali se NIGDE nije citao → ARBITRO_ENABLED=false NIJE gasilo
+        // asistenta. Sad, kad je iskljucen, vracamo kratak "disabled" SSE event umesto
+        // pokretanja LLM flow-a (nested tools/agentic/reasoning prekidaci ostaju zasebni).
+        if (!properties.isEnabled()) {
+            SseEvents.error(emitter, "assistant_disabled",
+                    "Arbitro asistent je trenutno onemogucen.");
+            emitter.complete();
+            return emitter;
+        }
 
         if (!rateLimiter.tryAcquire(user.userId(), user.userRole())) {
             auditLogger.logRateLimit(user);
@@ -125,8 +144,11 @@ public class AssistantService {
         return emitter;
     }
 
-    @Transactional
-    protected void runChat(UserContext user, ChatRequestDto request, SseEmitter emitter) {
+    // P2-money-tx-1 (R3 1576): NIJE @Transactional — izvrsava se na executor thread-u
+    // (assistantTaskExecutor.execute) gde proxy-based @Transactional ne moze da otvori
+    // ni propagira tx. Persistencija je atomicna po-poruci kroz TransactionTemplate u
+    // persistMessage. Vidljivost svedena na private (poziva se samo iz chat()).
+    private void runChat(UserContext user, ChatRequestDto request, SseEmitter emitter) {
         long startMs = System.currentTimeMillis();
         AssistantConversation conv = null;
         List<String> toolsUsed = new ArrayList<>();
@@ -151,7 +173,7 @@ public class AssistantService {
             // tool list-i samo ako je explicit ON. Default OFF (sigurniji).
             boolean agenticOn = properties.getAgentic().isEnabled()
                     && Boolean.TRUE.equals(request.getAgenticMode());
-            List<Map<String, Object>> tools = useTools ? toolDefinitions(agenticOn) : null;
+            List<Map<String, Object>> tools = useTools ? toolDefinitions(agenticOn, user) : null;
 
             // Phase 5 multimodal + Phase 4 agentic: media ide u Ollama 'images' polje;
             // agenticOn ukljucuje AGENTIC_OVERLAY u system prompt (override-uje
@@ -243,6 +265,14 @@ public class AssistantService {
                         // ne pucamo — wizard ce probati ispod
                     } catch (AgentActionGateway.AgenticRateLimitedException e) {
                         SseEvents.error(emitter, "rate_limited", e.getMessage());
+                        emitter.complete();
+                        return;
+                    } catch (AgentActionGateway.AgenticActionForbiddenException e) {
+                        // P0-B8 N1: rola korisnika ne sme ovu akciju — NE padaj na
+                        // wizard (i wizard bi odbio), vec vrati jasnu gresku.
+                        log.info("ARBITRO direct-preview forbidden tool={} for role {}:{}",
+                                forcedFirstTool, user.userRole(), user.userId());
+                        SseEvents.error(emitter, "forbidden", e.getMessage());
                         emitter.complete();
                         return;
                     } catch (Exception e) {
@@ -442,6 +472,15 @@ public class AssistantService {
                                 ok = false;
                                 result = Map.of("error", "AGENTIC_RATE_LIMITED",
                                         "message", e.getMessage());
+                            } catch (AgentActionGateway.AgenticActionForbiddenException e) {
+                                // P0-B8 N1: rola korisnika ne sme ovu akciju —
+                                // obavesti model da je akcija zabranjena (NE preview-uj).
+                                ok = false;
+                                result = Map.of("error", "AGENTIC_ACTION_FORBIDDEN",
+                                        "message", e.getMessage() != null ? e.getMessage()
+                                                : "Akcija nije dozvoljena za ulogu korisnika.");
+                                log.info("ARBITRO agentic action '{}' forbidden for role {}:{}",
+                                        name, user.userRole(), user.userId());
                             } catch (Exception e) {
                                 ok = false;
                                 result = Map.of("error", "PREVIEW_FAILED",
@@ -756,27 +795,37 @@ public class AssistantService {
         return conv;
     }
 
+    /**
+     * P2-money-tx-1 (R3 1576): persist message + conversation kao JEDNU atomicnu
+     * jedinicu kroz {@link TransactionTemplate}. Pozива се са runChat executor
+     * thread-a gde nema ambient transakcije — bez ovog template-a, {@code save(msg)}
+     * i {@code save(conv)} bi se commit-ovali nezavisno (auto-commit po pozivu), pa
+     * bi pad izmedju njih ostavio siroti msg bez azuriranog conv naslova/updatedAt.
+     */
     private AssistantMessage persistMessage(AssistantConversation conv, AssistantMessageRole role,
                                             String content, String toolCallId, String toolCallsJson,
                                             PageContextDto page) {
-        AssistantMessage msg = AssistantMessage.builder()
-                .conversation(conv)
-                .role(role)
-                .content(content == null ? "" : content)
-                .toolCallId(toolCallId)
-                .toolCalls(toolCallsJson)
-                .pageRoute(page != null ? page.getRoute() : null)
-                .pageName(page != null ? page.getPageName() : null)
-                .build();
-        AssistantMessage saved = messageRepository.save(msg);
-        conv.setUpdatedAt(LocalDateTime.now());
-        // Auto-set title from first user message
-        if (role == AssistantMessageRole.USER && conv.getTitle() == null) {
-            String preview = content == null ? "Razgovor" : content.trim();
-            conv.setTitle(preview.length() > 80 ? preview.substring(0, 80) + "…" : preview);
-        }
-        conversationRepository.save(conv);
-        return saved;
+        TransactionTemplate tx = new TransactionTemplate(assistantTransactionManager);
+        return tx.execute(status -> {
+            AssistantMessage msg = AssistantMessage.builder()
+                    .conversation(conv)
+                    .role(role)
+                    .content(content == null ? "" : content)
+                    .toolCallId(toolCallId)
+                    .toolCalls(toolCallsJson)
+                    .pageRoute(page != null ? page.getRoute() : null)
+                    .pageName(page != null ? page.getPageName() : null)
+                    .build();
+            AssistantMessage saved = messageRepository.save(msg);
+            conv.setUpdatedAt(LocalDateTime.now());
+            // Auto-set title from first user message
+            if (role == AssistantMessageRole.USER && conv.getTitle() == null) {
+                String preview = content == null ? "Razgovor" : content.trim();
+                conv.setTitle(preview.length() > 80 ? preview.substring(0, 80) + "…" : preview);
+            }
+            conversationRepository.save(conv);
+            return saved;
+        });
     }
 
     private MessageDto toMessageDto(AssistantMessage m) {
@@ -907,16 +956,29 @@ public class AssistantService {
      */
     private Map<String, Object> extractCreatePaymentParams(String msg, UserContext user) {
         // 1. Iznos
+        // R3-1637: PREFER broj uz valutni sufiks (npr. "200 RSD") umesto prvog broja u
+        // poruci. "plati racun 289 Milici 200 rsd" je pre vracao 289 (broj racuna) kao
+        // iznos; sad biramo "200" jer ima valutni sufiks. Fallback: prvi broj ako nijedan
+        // nema sufiks.
         java.util.regex.Matcher amountMatch = java.util.regex.Pattern
                 .compile("([0-9]+(?:[\\.,][0-9]+)?)\\s*(rsd|din|dinara|eur|usd|chf|gbp)?",
                         java.util.regex.Pattern.CASE_INSENSITIVE)
                 .matcher(msg);
         Double amount = null;
-        if (amountMatch.find()) {
+        Double firstNumber = null;
+        while (amountMatch.find()) {
+            Double parsed;
             try {
-                amount = Double.parseDouble(amountMatch.group(1).replace(",", "."));
-            } catch (NumberFormatException ignored) { /* skip */ }
+                parsed = Double.parseDouble(amountMatch.group(1).replace(",", "."));
+            } catch (NumberFormatException ignored) { /* skip */ continue; }
+            if (firstNumber == null) firstNumber = parsed;
+            // group(2) != null → broj nosi valutni sufiks: prioritet.
+            if (amountMatch.group(2) != null && !amountMatch.group(2).isBlank()) {
+                amount = parsed;
+                break;
+            }
         }
+        if (amount == null) amount = firstNumber; // nijedan broj nema sufiks → prvi broj
         if (amount == null || amount <= 0) return null;
 
         // 2. Recipient name — izmedju glagola placanja i broja iznosa
@@ -1057,15 +1119,37 @@ public class AssistantService {
      * Vraca tool definicije za LLM-ov tools array. Ako je {@code agenticOn} false,
      * iskljucujemo {@link WriteToolHandler}-e — LLM ne dobija ni schema ni
      * mogucnost da ih pozove.
+     *
+     * <p>P0-B8 N1: dodatno filtriramo write tool-ove po roli korisnika —
+     * CLIENT ne sme ni da VIDI EMPLOYEE-only alate (approve_loan_request,
+     * unblock_card, update_actuary_limit, ...) u LLM tool katalogu. Inace bi
+     * model mogao da ih emit-uje, a gateway tek tada odbije; bolje je da ih
+     * uopste ne nudimo. Read-only tool-ovi i tool-ovi sa praznim
+     * {@link WriteToolHandler#allowedRoles()} su dostupni svima.</p>
      */
-    private List<Map<String, Object>> toolDefinitions(boolean agenticOn) {
+    private List<Map<String, Object>> toolDefinitions(boolean agenticOn, UserContext user) {
         return toolRegistry.getAll().values().stream()
                 .filter(h -> agenticOn || !(h instanceof WriteToolHandler))
+                .filter(h -> isToolRoleAllowed(h, user))
                 .map(h -> {
                     ToolDefinition def = h.definition();
                     return def.toOpenAiSpec();
                 })
                 .toList();
+    }
+
+    /**
+     * P0-B8 N1: true ako korisnikova rola sme da koristi dati handler. Samo
+     * {@link WriteToolHandler} ima role gate; read-only tool-ovi su uvek
+     * dozvoljeni. Prazna {@code allowedRoles()} znaci "sve role".
+     */
+    private boolean isToolRoleAllowed(ToolHandler handler, UserContext user) {
+        if (!(handler instanceof WriteToolHandler write)) return true;
+        List<String> allowed = write.allowedRoles();
+        if (allowed == null || allowed.isEmpty()) return true;
+        String role = user.userRole();
+        if (role == null) return false;
+        return allowed.stream().anyMatch(r -> r.equalsIgnoreCase(role));
     }
 
     private Map<String, Object> dispatchTool(String name, Map<String, Object> args, UserContext user) {
@@ -1377,8 +1461,4 @@ public class AssistantService {
         }
     }
 
-    /* ============================== UNUSED IMPORTS GUARD ============================== */
-    // (Drzi LinkedHashMap import in scope za ako kasnije zatreba u tool spec building-u.)
-    @SuppressWarnings("unused")
-    private static final Map<String, Object> __KEEP_LINKED = new LinkedHashMap<>();
 }

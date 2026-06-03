@@ -10,6 +10,7 @@ import rs.raf.banka2_bek.audit.dto.AuditLogDto;
 import rs.raf.banka2_bek.audit.model.AuditActionType;
 import rs.raf.banka2_bek.audit.model.AuditLog;
 import rs.raf.banka2_bek.audit.repository.AuditLogRepository;
+import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 
 import java.time.LocalDateTime;
@@ -27,8 +28,12 @@ import java.util.Optional;
 @RequiredArgsConstructor
 public class AuditLogService {
 
+    /** Maks duzina {@code description} kolone (AuditLog.java:40). */
+    static final int MAX_DESCRIPTION_LENGTH = 512;
+
     private final AuditLogRepository auditLogRepository;
     private final EmployeeRepository employeeRepository;
+    private final ClientRepository clientRepository;
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void record(Long actorId, String actorType, AuditActionType action,
@@ -38,13 +43,26 @@ public class AuditLogService {
                 .actorId(actorId)
                 .actorType(actorType)
                 .actionType(action)
-                .description(description)
+                .description(truncate(description))
                 .targetType(targetType)
                 .targetId(targetId)
                 .oldValue(oldValue)
                 .newValue(newValue)
                 .build();
         auditLogRepository.save(log);
+    }
+
+    /**
+     * R1 395: {@code description} je {@code length=512} NOT NULL — ne-skraceni
+     * tekst duzi od 512 znakova baca {@code DataIntegrityViolationException} (PG)
+     * i obara ceo audit upis. Skratimo na 512 (sa "..." sufiksom kad je odsecak)
+     * umesto da izgubimo ceo trag.
+     */
+    private static String truncate(String description) {
+        if (description == null || description.length() <= MAX_DESCRIPTION_LENGTH) {
+            return description;
+        }
+        return description.substring(0, MAX_DESCRIPTION_LENGTH - 3) + "...";
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
@@ -93,9 +111,19 @@ public class AuditLogService {
     }
 
     private String resolveActorName(Long actorId, String actorType) {
+        if (actorId == null) {
+            return "ID:null";
+        }
         if ("EMPLOYEE".equals(actorType)) {
             return employeeRepository.findById(actorId)
                     .map(e -> e.getFirstName() + " " + e.getLastName())
+                    .orElse("ID:" + actorId);
+        }
+        // R1 392: CLIENT aktor je ranije uvek davao "ID:42" jer resolveActorName
+        // gleda samo EMPLOYEE tabelu. Klijent ime/prezime razresavamo iz CLIENT tabele.
+        if ("CLIENT".equals(actorType)) {
+            return clientRepository.findById(actorId)
+                    .map(c -> c.getFirstName() + " " + c.getLastName())
                     .orElse("ID:" + actorId);
         }
         return "ID:" + actorId;

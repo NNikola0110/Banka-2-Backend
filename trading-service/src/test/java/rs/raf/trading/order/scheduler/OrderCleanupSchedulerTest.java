@@ -5,11 +5,15 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.mockito.junit.jupiter.MockitoSettings;
+import org.mockito.quality.Strictness;
 import rs.raf.trading.notification.model.NotificationType;
 import rs.raf.trading.notification.service.NotificationService;
 import rs.raf.trading.order.model.Order;
+import rs.raf.trading.order.model.OrderDirection;
 import rs.raf.trading.order.model.OrderStatus;
 import rs.raf.trading.order.repository.OrderRepository;
+import rs.raf.trading.order.service.FundReservationService;
 import rs.raf.trading.stock.model.Listing;
 
 import java.time.LocalDate;
@@ -24,12 +28,15 @@ import static org.mockito.Mockito.*;
  * automatskom otkazu naloga sa proteklim settlement datumom.
  */
 @ExtendWith(MockitoExtension.class)
+@MockitoSettings(strictness = Strictness.LENIENT)
 public class OrderCleanupSchedulerTest {
 
     @Mock
     private OrderRepository orderRepository;
     @Mock
     private NotificationService notificationService;
+    @Mock
+    private FundReservationService fundReservationService;
 
     @InjectMocks
     private OrderCleanupScheduler orderCleanupScheduler;
@@ -110,6 +117,69 @@ public class OrderCleanupSchedulerTest {
                 eq("ORDER"),
                 eq(99L)
         );
+    }
+
+    // ── P1-dividends-order-1 (164): auto-decline oslobadja rezervaciju (leak fix) ──
+
+    @Test
+    void cleanupExpiredOrders_approvedBuy_releasesReservationBeforeDecline() {
+        // APPROVED BUY order sa proteklim settlement-om: rezervacija MORA biti oslobodjena,
+        // inace sredstva ostaju zauvek zakljucana (leak) iako je order DECLINED.
+        Order order = mock(Order.class);
+        Listing listing = mock(Listing.class);
+        when(listing.getSettlementDate()).thenReturn(LocalDate.now().minusDays(1));
+        when(listing.getTicker()).thenReturn("CLM24");
+        when(order.getListing()).thenReturn(listing);
+        when(order.getStatus()).thenReturn(OrderStatus.APPROVED);
+        when(order.getDirection()).thenReturn(OrderDirection.BUY);
+        when(order.isReservationReleased()).thenReturn(false);
+        when(orderRepository.findActiveNonDone()).thenReturn(List.of(order));
+
+        orderCleanupScheduler.cleanupExpiredOrders();
+
+        // Release pre setStatus(DECLINED).
+        verify(fundReservationService).releaseForBuy(order);
+        verify(order).setStatus(OrderStatus.DECLINED);
+        verify(orderRepository).save(order);
+    }
+
+    @Test
+    void cleanupExpiredOrders_pendingOrder_doesNotReleaseReservation() {
+        // PENDING order jos nema rezervaciju (rezervacija se desava pri APPROVED),
+        // pa se release NE poziva (idempotentno, bez suvisnog banka-core poziva).
+        Order order = mock(Order.class);
+        Listing listing = mock(Listing.class);
+        when(listing.getSettlementDate()).thenReturn(LocalDate.now().minusDays(1));
+        when(listing.getTicker()).thenReturn("CLM24");
+        when(order.getListing()).thenReturn(listing);
+        when(order.getStatus()).thenReturn(OrderStatus.PENDING);
+        when(orderRepository.findActiveNonDone()).thenReturn(List.of(order));
+
+        orderCleanupScheduler.cleanupExpiredOrders();
+
+        verify(fundReservationService, never()).releaseForBuy(any());
+        verify(order).setStatus(OrderStatus.DECLINED);
+        verify(orderRepository).save(order);
+    }
+
+    @Test
+    void cleanupExpiredOrders_releaseFails_stillDeclinesOrder() {
+        // Ako banka-core release padne, order se i dalje declime-uje (best-effort release).
+        Order order = mock(Order.class);
+        Listing listing = mock(Listing.class);
+        when(listing.getSettlementDate()).thenReturn(LocalDate.now().minusDays(1));
+        when(listing.getTicker()).thenReturn("CLM24");
+        when(order.getListing()).thenReturn(listing);
+        when(order.getStatus()).thenReturn(OrderStatus.APPROVED);
+        when(order.getDirection()).thenReturn(OrderDirection.BUY);
+        when(order.isReservationReleased()).thenReturn(false);
+        when(orderRepository.findActiveNonDone()).thenReturn(List.of(order));
+        doThrow(new RuntimeException("banka-core down")).when(fundReservationService).releaseForBuy(order);
+
+        orderCleanupScheduler.cleanupExpiredOrders();
+
+        verify(order).setStatus(OrderStatus.DECLINED);
+        verify(orderRepository).save(order);
     }
 
     @Test

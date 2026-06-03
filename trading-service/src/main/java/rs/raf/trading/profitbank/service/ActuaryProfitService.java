@@ -18,6 +18,7 @@ import rs.raf.trading.stock.util.ListingCurrencyResolver;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -28,10 +29,22 @@ import java.util.Set;
 /**
  * P6 — Spec Celina 4 (Nova) §4393-4505 (Stranica: Profit aktuara).
  *
- * Za svakog aktuara (supervizor + agent) racuna ukupan profit u RSD:
- *   - Per-listing: SELL value - BUY cost (samo done orderi)
+ * Za svakog aktuara (supervizor + agent) racuna OSTVAREN (realized) profit u RSD:
+ *   - Per-listing: FIFO sparivanje BUY→SELL lotova (samo done orderi)
+ *   - Realizovan P/L = Σ (sellCena − buyCena) × sparena kolicina za zatvorene lotove
  *   - Konvertuj u RSD po srednjem kursu (bez komisije)
  *   - Sumiraj kroz sve listinge
+ *
+ * <p><b>R1 507 (FIFO / nema lazni gubitak za otvorenu poziciju):</b> spec
+ * ("ostvareni profit") = REALIZOVAN P/L za ZATVORENE (BUY→SELL) lotove, ne
+ * mark-to-market neostvarenih pozicija. Stari kod je radio prost
+ * {@code Σ SELL − Σ BUY} po listingu, pa je OTVORENA pozicija (samo BUY, jos
+ * neprodato) prikazivana kao OGROMAN LAZNI GUBITAK (npr. BUY 10×100 bez SELL →
+ * −1000). FIFO sparivanje resava to: nesparen BUY (otvorena duga pozicija) ne
+ * realizuje nista (0), a nesparen SELL (prodaja bez evidentirane kupovine —
+ * legacy/seed pozicija) realizuje pun prihod (zero cost-basis, paritet sa
+ * starom SELL-only semantikom). Tako BUY-only pozicija daje 0 umesto laznog
+ * gubitka, a sparen BUY→SELL lot daje tacan realizovan P/L.</p>
  *
  * Cache: Caffeine sa TTL 5 min (vidi {@link ProfitBankCacheConfig}).
  * Iteracija po svim DONE orderima + per-order FX konverzija je O(n) u
@@ -57,51 +70,47 @@ public class ActuaryProfitService {
 
     @Cacheable(value = ProfitBankCacheConfig.ACTUARY_PROFIT_CACHE, sync = true)
     public List<ActuaryProfitDto> listAllActuariesProfit() {
-        // 1) Skupi sve DONE ordere koje su inicirali zaposleni (userRole=EMPLOYEE).
+        // 1) Skupi sve DONE ordere koje su inicirali zaposleni (userRole=EMPLOYEE),
+        //    hronoloski (FIFO red sparivanja BUY->SELL). createdAt je vreme
+        //    kreiranja naloga; null-ovi (legacy/seed) idu na kraj stabilno.
         List<Order> doneEmployeeOrders = orderRepository.findByIsDoneTrue().stream()
                 .filter(o -> UserRole.isEmployee(o.getUserRole()))
+                .filter(o -> o.getListing() != null)
+                .sorted(Comparator.comparing(Order::getCreatedAt,
+                        Comparator.nullsLast(Comparator.naturalOrder()))
+                        .thenComparing(o -> o.getId() == null ? Long.MAX_VALUE : o.getId()))
                 .toList();
 
-        // 2) Per-aktuar: per-listing { sell, buy }
-        Map<Long, Map<Long, BigDecimal>> sellByActuarPerListing = new HashMap<>();
-        Map<Long, Map<Long, BigDecimal>> buyByActuarPerListing = new HashMap<>();
+        // 2) Per-aktuar: per-listing lista lotova (u hronoloskom redu) + valuta + broj naloga.
+        Map<Long, Map<Long, List<Lot>>> lotsByActuarPerListing = new HashMap<>();
         Map<Long, Map<Long, String>> currencyByActuarPerListing = new HashMap<>();
         Map<Long, Integer> ordersDoneCount = new HashMap<>();
 
         for (Order order : doneEmployeeOrders) {
-            if (order.getListing() == null) continue;
             Long actuarId = order.getUserId();
             Long listingId = order.getListing().getId();
-            BigDecimal value = nullSafe(order.getPricePerUnit())
-                    .multiply(BigDecimal.valueOf(order.getQuantity()))
-                    .multiply(BigDecimal.valueOf(order.getContractSize()));
+            BigDecimal unitPrice = nullSafe(order.getPricePerUnit());
+            long qty = (long) order.getQuantity() * order.getContractSize();
 
             currencyByActuarPerListing
                     .computeIfAbsent(actuarId, k -> new HashMap<>())
                     .putIfAbsent(listingId, resolveOrderCurrency(order.getListing()));
 
-            if (order.getDirection() == OrderDirection.SELL) {
-                sellByActuarPerListing
-                        .computeIfAbsent(actuarId, k -> new HashMap<>())
-                        .merge(listingId, value, BigDecimal::add);
-            } else {
-                buyByActuarPerListing
-                        .computeIfAbsent(actuarId, k -> new HashMap<>())
-                        .merge(listingId, value, BigDecimal::add);
-            }
+            lotsByActuarPerListing
+                    .computeIfAbsent(actuarId, k -> new HashMap<>())
+                    .computeIfAbsent(listingId, k -> new ArrayList<>())
+                    .add(new Lot(order.getDirection(), qty, unitPrice));
+
             ordersDoneCount.merge(actuarId, 1, Integer::sum);
         }
 
-        // 3) Per-aktuar: sum profit u RSD
-        Set<Long> allActuarIds = new HashSet<>();
-        allActuarIds.addAll(sellByActuarPerListing.keySet());
-        allActuarIds.addAll(buyByActuarPerListing.keySet());
+        // 3) Per-aktuar: sum REALIZOVANOG profita u RSD (FIFO po listingu).
+        Set<Long> allActuarIds = new HashSet<>(lotsByActuarPerListing.keySet());
 
         return allActuarIds.stream()
                 .map(actuarId -> buildActuaryProfit(
                         actuarId,
-                        sellByActuarPerListing.getOrDefault(actuarId, Map.of()),
-                        buyByActuarPerListing.getOrDefault(actuarId, Map.of()),
+                        lotsByActuarPerListing.getOrDefault(actuarId, Map.of()),
                         currencyByActuarPerListing.getOrDefault(actuarId, Map.of()),
                         ordersDoneCount.getOrDefault(actuarId, 0)))
                 .filter(java.util.Objects::nonNull)
@@ -109,10 +118,64 @@ public class ActuaryProfitService {
                 .toList();
     }
 
+    /** Jedan zatvoren/otvoren lot trgovine (smer, kolicina, jedinicna cena). */
+    private record Lot(OrderDirection direction, long quantity, BigDecimal unitPrice) {}
+
+    /**
+     * R1 507 — FIFO realizovan P/L za jedan listing.
+     *
+     * <p>BUY lotovi se redaju u FIFO red. SELL sparuje najstarije otvorene BUY
+     * lotove: realizovan = (sellCena − buyCena) × sparena kolicina. Nesparen
+     * BUY (otvorena DUGA pozicija) na kraju NE realizuje nista (0) — kljucna
+     * razlika od starog {@code Σ SELL − Σ BUY} (koji ju je prikazivao kao
+     * gubitak). Nesparen SELL (prodaja bez evidentirane kupovine — seed/legacy)
+     * realizuje pun prihod {@code sellCena × kolicina} (zero cost-basis),
+     * zadrzavajuci staru SELL-only semantiku da postojeci testovi/seed ostanu
+     * konzistentni.</p>
+     */
+    private BigDecimal computeRealizedProfit(List<Lot> lots) {
+        // FIFO red otvorenih BUY lotova: [remainingQty, unitPrice].
+        java.util.ArrayDeque<long[]> openBuysQty = new java.util.ArrayDeque<>();
+        java.util.ArrayDeque<BigDecimal> openBuysPrice = new java.util.ArrayDeque<>();
+        BigDecimal realized = BigDecimal.ZERO;
+
+        for (Lot lot : lots) {
+            if (lot.direction() == OrderDirection.BUY) {
+                if (lot.quantity() > 0) {
+                    openBuysQty.addLast(new long[]{lot.quantity()});
+                    openBuysPrice.addLast(lot.unitPrice());
+                }
+                continue;
+            }
+            // SELL: sparuj sa najstarijim otvorenim BUY lotovima (FIFO).
+            long sellRemaining = lot.quantity();
+            BigDecimal sellPrice = lot.unitPrice();
+            while (sellRemaining > 0 && !openBuysQty.isEmpty()) {
+                long[] head = openBuysQty.peekFirst();
+                BigDecimal buyPrice = openBuysPrice.peekFirst();
+                long matched = Math.min(sellRemaining, head[0]);
+                // realizovan P/L za sparenu kolicinu = (sell − buy) × matched
+                realized = realized.add(
+                        sellPrice.subtract(buyPrice).multiply(BigDecimal.valueOf(matched)));
+                head[0] -= matched;
+                sellRemaining -= matched;
+                if (head[0] == 0) {
+                    openBuysQty.removeFirst();
+                    openBuysPrice.removeFirst();
+                }
+            }
+            // Nesparen SELL (nema evidentiranog BUY-a): zero cost-basis → pun prihod.
+            if (sellRemaining > 0) {
+                realized = realized.add(sellPrice.multiply(BigDecimal.valueOf(sellRemaining)));
+            }
+        }
+        // Nespareni BUY lotovi (otvorena DUGA pozicija) NE realizuju nista (0) — R1 507.
+        return realized;
+    }
+
     private ActuaryProfitDto buildActuaryProfit(
             Long actuarId,
-            Map<Long, BigDecimal> sellByListing,
-            Map<Long, BigDecimal> buyByListing,
+            Map<Long, List<Lot>> lotsByListing,
             Map<Long, String> currencyByListing,
             int ordersDone) {
         // Identitet aktuara razresava banka-core. Ako zaposleni vise ne postoji
@@ -131,14 +194,17 @@ public class ActuaryProfitService {
         }
 
         BigDecimal totalProfitRsd = BigDecimal.ZERO;
-        Set<Long> allListings = new HashSet<>(sellByListing.keySet());
-        allListings.addAll(buyByListing.keySet());
-        for (Long listingId : allListings) {
-            BigDecimal sell = sellByListing.getOrDefault(listingId, BigDecimal.ZERO);
-            BigDecimal buy = buyByListing.getOrDefault(listingId, BigDecimal.ZERO);
-            BigDecimal assetProfit = sell.subtract(buy);
+        for (Map.Entry<Long, List<Lot>> entry : lotsByListing.entrySet()) {
+            Long listingId = entry.getKey();
+            BigDecimal realized = computeRealizedProfit(entry.getValue());
             String ccy = currencyByListing.getOrDefault(listingId, "RSD");
-            totalProfitRsd = totalProfitRsd.add(convertToRsd(assetProfit, ccy));
+            // R1 509: ako FX konverzija padne, leg se ISKLJUCUJE iz RSD sume (sa
+            // jasnom indikacijom u logu) umesto da se sirov strani iznos tiho sabere
+            // kao RSD (sto je davalo pogresan RSD broj — mesanje valuta).
+            BigDecimal legRsd = convertToRsd(realized, ccy, actuarId, listingId);
+            if (legRsd != null) {
+                totalProfitRsd = totalProfitRsd.add(legRsd);
+            }
         }
 
         Set<String> perms = resolvePermissions(emp.email());
@@ -174,14 +240,28 @@ public class ActuaryProfitService {
         }
     }
 
-    private BigDecimal convertToRsd(BigDecimal amount, String fromCurrency) {
+    /**
+     * Konvertuje realizovan P/L jedne hartije u RSD.
+     *
+     * <p>R1 509: ako FX konverzija padne (kurs nedostupan / banka-core pad),
+     * vraca {@code null} — leg se ISKLJUCUJE iz RSD sume sa jasnom indikacijom
+     * u logu. Stari kod je u tom slucaju TIHO sabirao sirov strani iznos kao da
+     * je RSD (npr. 300 USD → 300 RSD), proizvodeci pogresan ukupan RSD broj
+     * (mesanje valuta bez indikacije). Bolje je izostaviti taj leg nego
+     * prikazati netacan, valutno-pomesan total.</p>
+     *
+     * @return RSD iznos, ili {@code null} ako FX konverzija nije uspela (leg se preskace)
+     */
+    private BigDecimal convertToRsd(BigDecimal amount, String fromCurrency, Long actuarId, Long listingId) {
         if (amount == null || amount.signum() == 0) return BigDecimal.ZERO;
         if (fromCurrency == null || "RSD".equalsIgnoreCase(fromCurrency)) return amount;
         try {
             return currencyConversionService.convert(amount, fromCurrency, "RSD");
         } catch (RuntimeException e) {
-            log.warn("Konverzija {} -> RSD nije uspela ({}); koristim raw amount", fromCurrency, e.getMessage());
-            return amount;
+            log.warn("FX konverzija {}->RSD nije uspela za aktuara #{} listing #{} ({}); "
+                            + "leg ISKLJUCEN iz RSD profita (ne mesam valute u total)",
+                    fromCurrency, actuarId, listingId, e.getMessage());
+            return null;
         }
     }
 

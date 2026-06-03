@@ -5,6 +5,7 @@ import jakarta.mail.internet.MimeMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.mail.javamail.JavaMailSender;
@@ -20,6 +21,7 @@ import rs.raf.notification.mail.template.TransactionEmailTemplate;
 
 import java.util.Properties;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -145,5 +147,41 @@ class MailNotificationServiceTest {
         service.sendActivationConfirmationMail("ana@test.com", "Ana");
 
         verify(mailSender).send(any(MimeMessage.class));
+    }
+
+    // ── P2-notif-reliability-2 (R3 1591): in-app email subject ──
+
+    @Test
+    void sendInAppNotificationMail_usesTitleAsSubject() throws Exception {
+        ArgumentCaptor<MimeMessage> captor = ArgumentCaptor.forClass(MimeMessage.class);
+        when(inAppGenericEmailTemplate.buildBody(any(), any(), any())).thenReturn("<html/>");
+
+        service.sendInAppNotificationMail("u@test.com", "Ana", "Order izvrsen", "Telo");
+
+        verify(mailSender).send(captor.capture());
+        assertThat(captor.getValue().getSubject()).isEqualTo("Order izvrsen");
+    }
+
+    @Test
+    void sendInAppNotificationMail_emptyTitle_usesDefaultSubject() throws Exception {
+        // R3 1591: prazan title bi inace dao email BEZ subject-a → default subject.
+        ArgumentCaptor<MimeMessage> captor = ArgumentCaptor.forClass(MimeMessage.class);
+        when(inAppGenericEmailTemplate.buildBody(any(), any(), any())).thenReturn("<html/>");
+
+        service.sendInAppNotificationMail("u@test.com", "Ana", "  ", "Telo");
+
+        verify(mailSender).send(captor.capture());
+        assertThat(captor.getValue().getSubject()).isEqualTo("Obaveštenje");
+    }
+
+    @Test
+    void sendInAppNotificationMail_nullTitle_usesDefaultSubject() throws Exception {
+        ArgumentCaptor<MimeMessage> captor = ArgumentCaptor.forClass(MimeMessage.class);
+        when(inAppGenericEmailTemplate.buildBody(any(), any(), any())).thenReturn("<html/>");
+
+        service.sendInAppNotificationMail("u@test.com", "Ana", null, "Telo");
+
+        verify(mailSender).send(captor.capture());
+        assertThat(captor.getValue().getSubject()).isEqualTo("Obaveštenje");
     }
 }

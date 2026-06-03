@@ -8,10 +8,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
-import rs.raf.banka2.contracts.internal.InternalOtpVerifyResponse;
-import rs.raf.trading.client.BankaCoreClient;
 import rs.raf.trading.order.dto.CreateOrderDto;
 import rs.raf.trading.order.dto.OrderDto;
 import rs.raf.trading.order.service.OrderService;
@@ -23,10 +20,13 @@ import java.util.Map;
  * Controller za kreiranje i upravljanje orderima.
  * SecurityConfig je vec konfigurisan za ove rute.
  *
- * NAPOMENA (copy-first ekstrakcija, faza 2c): u monolitu je OTP verifikaciju
- * radio lokalni {@code OtpService}. U trading-service-u OTP zivi u banka-core
- * domenu, pa se verifikacija radi preko banka-core internog seam-a
- * ({@link BankaCoreClient#verifyOtp} — {@code POST /internal/otp/verify}).
+ * <p><b>ACCEPTED-DEVIATION (user-directed 03.06):</b> OTP/email-verifikacija je
+ * UKLONJENA sa kreiranja ordera (berza/trading) po izricitoj korisnickoj UX
+ * odluci — OTP ostaje ISKLJUCIVO na money-out flow-ovima (placanja + transferi).
+ * Kreiranje BUY/SELL naloga sada ide direktno (uz uobicajene trade-permisija +
+ * funds/holdings provere u {@link OrderService#createOrder}), bez verifikacionog
+ * koda. {@code dto.otpCode} je zadrzan kao opcioni/ignorisan back-compat field
+ * (FE sme da ga salje, BE ga ne gleda).
  */
 @Tag(name = "Orders", description = "Kreiranje i upravljanje nalozima za trgovinu hartijama od vrednosti")
 @RestController
@@ -35,37 +35,22 @@ import java.util.Map;
 public class OrderController {
 
     private final OrderService orderService;
-    private final BankaCoreClient bankaCoreClient;
 
     /**
      * POST /orders - Kreiranje novog ordera (BUY ili SELL)
      * Pristup: aktuari i klijenti sa permisijom za trgovinu.
      *
-     * OTP se verifikuje preko banka-core internog seam-a. Ako kreiranje ordera
-     * pukne, trgovinska transakcija radi rollback; banka-core OTP used=true
-     * marking je u zasebnoj banka-core transakciji (verifikacija je idempotentna
-     * za isti kod u kratkom prozoru).
+     * <p>ACCEPTED-DEVIATION (user-directed 03.06): bez OTP gate-a — nalog se kreira
+     * direktno. Autorizacija (autentifikacija + trade-permisija) ostaje u
+     * SecurityConfig-u + {@code OrderServiceImpl.ensureTradingAccess}; novcane /
+     * holdings provere ostaju netaknute u servisu.
      */
     @PostMapping
-    @Transactional
     public ResponseEntity<?> createOrder(@Valid @RequestBody CreateOrderDto dto) {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
         String email = auth != null ? auth.getName() : null;
         if (email == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Neautorizovan pristup"));
-        }
-
-        InternalOtpVerifyResponse otpResult = bankaCoreClient.verifyOtp(email, dto.getOtpCode());
-        if (!otpResult.verified()) {
-            String message = otpResult.blocked()
-                    ? "Verifikacija blokirana — previse neuspesnih pokusaja"
-                    : "Verifikacija neuspesna";
-            Map<String, Object> body = new java.util.HashMap<>();
-            body.put("verified", otpResult.verified());
-            body.put("blocked", otpResult.blocked());
-            body.put("message", message);
-            body.put("error", message);
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(body);
         }
 
         OrderDto response = orderService.createOrder(dto);

@@ -60,44 +60,27 @@ class PaymentRecipientExceptionHandlerTest {
         assertThat((String) response.getBody().get("message")).contains("amount: Amount is required");
     }
 
+    // R4 1779 — INFO-DISCLOSURE fix: malformed JSON vise NE prosledjuje sirov
+    // Jackson cause.getMessage() (naziv klase, lokacija parsera, ocekivani tip).
+    // Telo je STATICNO "Invalid request format." nezavisno od cause-a; pravi razlog
+    // se loguje server-side. (Fix-aligned: stari testovi su asertirali leak-ovano telo.)
     @Test
-    void handleJsonParse_withProblemMarker_extractsProblem() {
-        String innerMessage = "some prefix problem: Invalid enum value\nother stuff";
-        RuntimeException cause = new RuntimeException(innerMessage);
+    void handleJsonParse_doesNotLeakRawJacksonMessage() {
+        String leakyJackson = "Cannot deserialize value of type `java.math.BigDecimal` from String "
+                + "\"abc\": not a valid representation\n at [Source: line: 7, column: 42]";
+        RuntimeException cause = new RuntimeException(leakyJackson);
         HttpMessageNotReadableException ex = new HttpMessageNotReadableException("Parse error", cause, null);
 
         ResponseEntity<Map<String, Object>> response = handler.handleJsonParse(ex);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat((String) response.getBody().get("message")).isEqualTo("Invalid enum value");
+        String message = (String) response.getBody().get("message");
+        assertThat(message).isEqualTo("Invalid request format.");
+        assertThat(message).doesNotContain("Source").doesNotContain("BigDecimal").doesNotContain("column");
     }
 
     @Test
-    void handleJsonParse_withProblemMarkerButBlank_returnsFullMessage() {
-        String innerMessage = "some prefix problem:   \nother stuff";
-        RuntimeException cause = new RuntimeException(innerMessage);
-        HttpMessageNotReadableException ex = new HttpMessageNotReadableException("Parse error", cause, null);
-
-        ResponseEntity<Map<String, Object>> response = handler.handleJsonParse(ex);
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-        // Falls through to return the full message when problem part is blank
-        assertThat(response.getBody().get("message")).isNotNull();
-    }
-
-    @Test
-    void handleJsonParse_noProblemMarker_returnsFullMessage() {
-        RuntimeException cause = new RuntimeException("Just a plain error message");
-        HttpMessageNotReadableException ex = new HttpMessageNotReadableException("Parse error", cause, null);
-
-        ResponseEntity<Map<String, Object>> response = handler.handleJsonParse(ex);
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat((String) response.getBody().get("message")).isEqualTo("Just a plain error message");
-    }
-
-    @Test
-    void handleJsonParse_causeMessageNull_returnsDefaultMessage() {
+    void handleJsonParse_causeMessageNull_returnsStaticMessage() {
         RuntimeException cause = new RuntimeException((String) null);
         HttpMessageNotReadableException ex = new HttpMessageNotReadableException("Parse error", cause, null);
 
@@ -107,15 +90,27 @@ class PaymentRecipientExceptionHandlerTest {
         assertThat((String) response.getBody().get("message")).isEqualTo("Invalid request format.");
     }
 
+    // R1 330 — nepostojece placanje (getPaymentById) je 404, ne 400.
     @Test
-    void handleJsonParse_withProblemMarkerNoNewline_extractsProblem() {
-        String innerMessage = "some prefix problem: Invalid value here";
-        RuntimeException cause = new RuntimeException(innerMessage);
-        HttpMessageNotReadableException ex = new HttpMessageNotReadableException("Parse error", cause, null);
+    void handlePaymentNotFound_returns404() {
+        rs.raf.banka2_bek.payment.exception.PaymentNotFoundException ex =
+                new rs.raf.banka2_bek.payment.exception.PaymentNotFoundException("Placanje nije pronadjeno.");
 
-        ResponseEntity<Map<String, Object>> response = handler.handleJsonParse(ex);
+        ResponseEntity<Map<String, Object>> response = handler.handlePaymentNotFound(ex);
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat((String) response.getBody().get("message")).isEqualTo("Invalid value here");
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getBody()).containsEntry("message", "Placanje nije pronadjeno.");
+        assertThat(response.getBody()).containsEntry("status", 404);
+    }
+
+    @Test
+    void handlePaymentNotOwned_returns403() {
+        rs.raf.banka2_bek.payment.exception.PaymentNotOwnedException ex =
+                new rs.raf.banka2_bek.payment.exception.PaymentNotOwnedException("Placanje ne pripada korisniku.");
+
+        ResponseEntity<Map<String, Object>> response = handler.handlePaymentNotOwned(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getBody()).containsEntry("status", 403);
     }
 }

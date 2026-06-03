@@ -129,33 +129,6 @@ class InterbankOtcNegotiationRepositoryTest {
     }
 
     @Test
-    @DisplayName("findByLocalPartyTypeAndStatus — filtrira po BUYER/SELLER")
-    void filterByPartyType() {
-        // 2 SELLER pregovora
-        repository.save(buildSellerSideNegotiation(
-                "neg-s1", "AAPL", new BigDecimal("10"), InterbankOtcNegotiationStatus.ACTIVE));
-        repository.save(buildSellerSideNegotiation(
-                "neg-s2", "AAPL", new BigDecimal("20"), InterbankOtcNegotiationStatus.ACTIVE));
-        // 1 BUYER pregovor
-        InterbankOtcNegotiation buyer = buildSellerSideNegotiation(
-                "neg-b1", "MSFT", new BigDecimal("15"), InterbankOtcNegotiationStatus.ACTIVE);
-        buyer.setLocalPartyType(InterbankPartyType.BUYER);
-        // BUYER varijanta: foreign negotiation ID generisan kod partner banke (111).
-        buyer.setForeignNegotiationRoutingNumber(111);
-        buyer.setForeignNegotiationIdString("partner-neg-b1");
-        repository.save(buyer);
-
-        List<InterbankOtcNegotiation> sellers = repository
-                .findByLocalPartyTypeAndStatus(InterbankPartyType.SELLER, InterbankOtcNegotiationStatus.ACTIVE);
-        List<InterbankOtcNegotiation> buyers = repository
-                .findByLocalPartyTypeAndStatus(InterbankPartyType.BUYER, InterbankOtcNegotiationStatus.ACTIVE);
-
-        assertThat(sellers).hasSize(2);
-        assertThat(buyers).hasSize(1);
-        assertThat(buyers.get(0).getTicker()).isEqualTo("MSFT");
-    }
-
-    @Test
     @DisplayName("sumActiveAmountForSellerAndTicker — sumira ACTIVE pregovore za par (seller, ticker)")
     void sumActiveAmountForSeller() {
         // 2 ACTIVE pregovora za AAPL kod istog seller-a

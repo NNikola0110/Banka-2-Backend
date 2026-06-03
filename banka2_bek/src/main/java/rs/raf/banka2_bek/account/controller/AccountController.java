@@ -128,13 +128,14 @@ public class AccountController {
             summary = "Update account limits",
             description = "Changes the daily and/or monthly spending limits for an account. "
                     + "Only the account owner can change limits. "
-                    + "Requires transaction verification (mobile app) — currently not implemented."
+                    + "ACCEPTED-DEVIATION (user-directed 03.06): no OTP/verification — limit "
+                    + "change applies directly. OTP applies only to payments and transfers."
     )
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "Limits updated",
                     content = @Content(schema = @Schema(implementation = AccountResponseDto.class))),
             @ApiResponse(responseCode = "400", description = "Validation error"),
-            @ApiResponse(responseCode = "403", description = "User is not the owner of this account"),
+            @ApiResponse(responseCode = "403", description = "User is not the owner"),
             @ApiResponse(responseCode = "404", description = "Account not found")
     })
     @PatchMapping("/{id}/limits")

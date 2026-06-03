@@ -345,4 +345,50 @@ class PortfolioControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.message").value("Javna kolicina mora biti izmedju 0 i 100"));
     }
+
+    // ── OT-1053: PortfolioService domenske greske -> jasni HTTP statusi ───────
+    //
+    // R1-422: setPublicQuantity baca EntityNotFoundException (not-found) i
+    // AccessDeniedException (no-access) umesto bare RuntimeException. Globalni
+    // handler ih mapira na 404 / 403 (NE na catch-all 400/500). Postojeci testovi
+    // su koristili generic RuntimeException (-> 400); ovde pinujemo prave tipove.
+    @Test
+    @DisplayName("OT-1053: setPublicQuantity EntityNotFoundException -> 404 (ne 400/500)")
+    void setPublicQuantity_entityNotFound_maps404() throws Exception {
+        when(portfolioService.setPublicQuantity(eq(99L), eq(10)))
+                .thenThrow(new jakarta.persistence.EntityNotFoundException(
+                        "Portfolio stavka nije pronadjena: 99"));
+
+        String payload = """
+                {
+                  "quantity": 10
+                }
+                """;
+
+        mockMvc.perform(patch("/portfolio/99/public")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.message").value("Portfolio stavka nije pronadjena: 99"));
+    }
+
+    @Test
+    @DisplayName("OT-1053: setPublicQuantity AccessDeniedException -> 403 (ne 400/500)")
+    void setPublicQuantity_accessDenied_maps403() throws Exception {
+        when(portfolioService.setPublicQuantity(eq(1L), eq(10)))
+                .thenThrow(new org.springframework.security.access.AccessDeniedException(
+                        "Nemate pristup ovoj portfolio stavci."));
+
+        String payload = """
+                {
+                  "quantity": 10
+                }
+                """;
+
+        mockMvc.perform(patch("/portfolio/1/public")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.message").value("Nemate pristup ovoj portfolio stavci."));
+    }
 }

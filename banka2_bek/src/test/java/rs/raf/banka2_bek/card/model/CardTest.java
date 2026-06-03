@@ -71,20 +71,38 @@ class CardTest {
     }
 
     // ================================================================
-    // generateCardNumber(MASTERCARD) — prefix 51-55, 16 digits, Luhn-valid
+    // generateCardNumber(MASTERCARD) — prefix 51-55 ILI 2221-2720 (Celina 2 §288),
+    // 16 digits, Luhn-valid
     // ================================================================
 
     @Test
     void generateCardNumber_mastercard_correctFormatAndLuhnValid() {
-        for (int i = 0; i < 50; i++) {
+        // R1-633: generator pokriva OBA validna MC opsega — 51-55 (legacy) i
+        // 2221-2720 (novi BIN opseg iz spec §288). Preko 400 iteracija oba
+        // opsega se gotovo sigurno pojave, i svaki broj mora biti u jednom od njih.
+        boolean sawLegacyRange = false;
+        boolean sawNewRange = false;
+        for (int i = 0; i < 400; i++) {
             String card = Card.generateCardNumber(CardType.MASTERCARD);
             assertEquals(16, card.length(), "Mastercard should be 16 digits");
-            assertTrue(card.startsWith("5"), "Mastercard should start with 5");
-            int secondDigit = Character.getNumericValue(card.charAt(1));
-            assertTrue(secondDigit >= 1 && secondDigit <= 5,
-                    "Mastercard second digit should be 1-5, got: " + secondDigit);
             assertTrue(Card.isValidLuhn(card), "Generated Mastercard should be Luhn-valid: " + card);
+            assertTrue(isValidMastercardPrefix(card),
+                    "Mastercard prefix should be 51-55 or 2221-2720, got: " + card.substring(0, 4));
+            int twoDigit = Integer.parseInt(card.substring(0, 2));
+            int fourDigit = Integer.parseInt(card.substring(0, 4));
+            if (twoDigit >= 51 && twoDigit <= 55) sawLegacyRange = true;
+            if (fourDigit >= 2221 && fourDigit <= 2720) sawNewRange = true;
         }
+        assertTrue(sawLegacyRange, "Generator mora proizvesti i 51-55 opseg");
+        assertTrue(sawNewRange, "Generator mora proizvesti i 2221-2720 opseg");
+    }
+
+    private static boolean isValidMastercardPrefix(String card) {
+        int twoDigit = Integer.parseInt(card.substring(0, 2));
+        int fourDigit = Integer.parseInt(card.substring(0, 4));
+        boolean legacy = twoDigit >= 51 && twoDigit <= 55;
+        boolean modern = fourDigit >= 2221 && fourDigit <= 2720;
+        return legacy || modern;
     }
 
     // ================================================================
@@ -124,18 +142,6 @@ class CardTest {
         // With 100 iterations and 50/50 chance, probability of not seeing both is negligible
         assertTrue(saw34, "Expected at least one AmEx with prefix 34");
         assertTrue(saw37, "Expected at least one AmEx with prefix 37");
-    }
-
-    // ================================================================
-    // generateCardNumber() default overload — should produce VISA
-    // ================================================================
-
-    @Test
-    void generateCardNumber_defaultOverload_producesVisa() {
-        String card = Card.generateCardNumber();
-        assertEquals(16, card.length());
-        assertTrue(card.startsWith("422200"));
-        assertTrue(Card.isValidLuhn(card));
     }
 
     // ================================================================

@@ -137,6 +137,33 @@ class ActuaryProfitServiceTest {
     }
 
     @Test
+    void eurListing_convertsRealizedProfitToRsd_singleConvertCall() {
+        // OT-1167 (TEST-tr-funds-dividends-profitbank-1): non-USD strana valuta
+        // (EUR-listing) se konvertuje u RSD jednim convert(EUR->RSD) pozivom.
+        // CurrencyConversionService apstrakuje eventualnu triangulaciju (EUR->RSD
+        // direktno ili preko medjuvalute) — servis joj prosledjuje (amount, EUR, RSD)
+        // i sabira vraceni RSD iznos. Pinujemo da se valuta listinga (EUR) prosledjuje
+        // tacno, da se ne mesa sa drugom valutom, i da rezultat ulazi u total.
+        Listing xetra = listing(30L, "XETRA"); // EUR listing (non-USD)
+        // BUY 5 @ 80 = 400 EUR cost; SELL 5 @ 130 = 650 EUR; realizovan profit = 250 EUR
+        when(orderRepository.findByIsDoneTrue()).thenReturn(List.of(
+                order(40L, UserRole.EMPLOYEE, xetra, OrderDirection.BUY, 5, "80.00"),
+                order(40L, UserRole.EMPLOYEE, xetra, OrderDirection.SELL, 5, "130.00")));
+        mockEmployee(40L, "Euro", "Trejder", "euro@test.com", List.of("SUPERVISOR"));
+        // 250 EUR -> 29250 RSD (kurs 117)
+        when(currencyConversionService.convert(new BigDecimal("250.00"), "EUR", "RSD"))
+                .thenReturn(new BigDecimal("29250.00"));
+
+        List<ActuaryProfitDto> result = service.listAllActuariesProfit();
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getTotalProfitRsd()).isEqualByComparingTo("29250.00");
+        // tacno jedan FX poziv, sa EUR->RSD (ne USD)
+        verify(currencyConversionService).convert(new BigDecimal("250.00"), "EUR", "RSD");
+        verify(currencyConversionService, never()).convert(any(), eq("USD"), anyString());
+    }
+
+    @Test
     void clientAndFundOrders_areIgnored() {
         Listing belex = listing(3L, "BELEX");
         when(orderRepository.findByIsDoneTrue()).thenReturn(List.of(
@@ -244,17 +271,87 @@ class ActuaryProfitServiceTest {
     }
 
     @Test
-    void fxConversionFailure_fallsBackToRawAmount() {
+    void fxConversionFailure_excludesLegFromRsdTotal_noCurrencyMixing() {
+        // R1 509: FX fail -> taj leg se ISKLJUCUJE iz RSD sume (sa indikacijom u logu),
+        // NE sabira se sirov USD broj kao RSD (sto je davalo pogresan, valutno-pomesan total).
         Listing nasdaq = listing(10L, "NASDAQ"); // USD
         when(orderRepository.findByIsDoneTrue()).thenReturn(List.of(
                 order(13L, UserRole.EMPLOYEE, nasdaq, OrderDirection.SELL, 3, "100.00")));
         mockEmployee(13L, "Fx", "Fail", "fx@test.com", List.of("AGENT"));
-        // 300 USD profit; konverzija puca -> koristi se raw 300
+        // 300 USD realizovan; konverzija puca -> leg iskljucen, total ostaje 0 (ne 300).
         when(currencyConversionService.convert(eq(new BigDecimal("300.00")), eq("USD"), eq("RSD")))
                 .thenThrow(new RuntimeException("exchange unreachable"));
 
         List<ActuaryProfitDto> result = service.listAllActuariesProfit();
 
-        assertThat(result.get(0).getTotalProfitRsd()).isEqualByComparingTo("300.00");
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getTotalProfitRsd())
+                .as("FX-fail leg iskljucen iz RSD totala (ne sabira se sirov USD kao RSD)")
+                .isEqualByComparingTo("0.00");
+    }
+
+    // ── R1 507: FIFO realized P/L — otvorena pozicija NE pravi lazni gubitak ──
+
+    @Test
+    void buyOnlyOpenPosition_yieldsZeroRealized_notFalseLoss() {
+        // R1 507 KLJUC: otvorena DUGA pozicija (samo BUY, jos neprodato) =
+        // 0 realizovan profit, NE -1000 (stari Σ SELL − Σ BUY je davao lazni gubitak).
+        Listing belex = listing(20L, "BELEX"); // RSD
+        when(orderRepository.findByIsDoneTrue()).thenReturn(List.of(
+                order(21L, UserRole.EMPLOYEE, belex, OrderDirection.BUY, 10, "100.00")));
+        mockEmployee(21L, "Open", "Long", "open@test.com", List.of("AGENT"));
+
+        List<ActuaryProfitDto> result = service.listAllActuariesProfit();
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getTotalProfitRsd())
+                .as("BUY-only otvorena pozicija = 0 realizovan, NE lazni gubitak")
+                .isEqualByComparingTo("0.00");
+        assertThat(result.get(0).getOrdersDone()).isEqualTo(1);
+    }
+
+    @Test
+    void partiallyClosedPosition_realizesOnlyMatchedLot() {
+        // BUY 10 @ 100, SELL 4 @ 150 -> realizovano samo na 4 sparene: (150-100)*4 = 200.
+        // Ostatak 6 BUY ostaje otvoren -> 0 (NE -600 gubitak).
+        Listing belex = listing(22L, "BELEX"); // RSD
+        when(orderRepository.findByIsDoneTrue()).thenReturn(List.of(
+                order(23L, UserRole.EMPLOYEE, belex, OrderDirection.BUY, 10, "100.00"),
+                order(23L, UserRole.EMPLOYEE, belex, OrderDirection.SELL, 4, "150.00")));
+        mockEmployee(23L, "Part", "Closed", "part@test.com", List.of("AGENT"));
+
+        List<ActuaryProfitDto> result = service.listAllActuariesProfit();
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getTotalProfitRsd())
+                .as("Realizovan samo sparen lot (4×50=200); otvoreni ostatak ne pravi gubitak")
+                .isEqualByComparingTo("200.00");
+    }
+
+    @Test
+    void fifoMatching_usesOldestBuyLotFirst() {
+        // BUY 5 @ 100 (stariji), BUY 5 @ 200 (noviji), SELL 5 @ 150.
+        // FIFO: SELL sparuje najstariji BUY (100) -> (150-100)*5 = 250.
+        // (Da koristi noviji BUY @200 bilo bi -250 — pogresno.)
+        // Ostatak BUY 5 @ 200 otvoren -> 0.
+        Listing belex = listing(24L, "BELEX"); // RSD
+        Order olderBuy = order(25L, UserRole.EMPLOYEE, belex, OrderDirection.BUY, 5, "100.00");
+        olderBuy.setCreatedAt(java.time.LocalDateTime.of(2026, 1, 1, 9, 0));
+        olderBuy.setId(1L);
+        Order newerBuy = order(25L, UserRole.EMPLOYEE, belex, OrderDirection.BUY, 5, "200.00");
+        newerBuy.setCreatedAt(java.time.LocalDateTime.of(2026, 1, 2, 9, 0));
+        newerBuy.setId(2L);
+        Order sell = order(25L, UserRole.EMPLOYEE, belex, OrderDirection.SELL, 5, "150.00");
+        sell.setCreatedAt(java.time.LocalDateTime.of(2026, 1, 3, 9, 0));
+        sell.setId(3L);
+        when(orderRepository.findByIsDoneTrue()).thenReturn(List.of(newerBuy, sell, olderBuy));
+        mockEmployee(25L, "Fifo", "Order", "fifo@test.com", List.of("AGENT"));
+
+        List<ActuaryProfitDto> result = service.listAllActuariesProfit();
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getTotalProfitRsd())
+                .as("FIFO: SELL sparuje najstariji BUY (100), ne noviji (200)")
+                .isEqualByComparingTo("250.00");
     }
 }

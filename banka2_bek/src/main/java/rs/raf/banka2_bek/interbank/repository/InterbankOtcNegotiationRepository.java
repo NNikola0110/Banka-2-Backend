@@ -5,7 +5,6 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import rs.raf.banka2_bek.interbank.model.InterbankOtcNegotiation;
 import rs.raf.banka2_bek.interbank.model.InterbankOtcNegotiationStatus;
-import rs.raf.banka2_bek.interbank.model.InterbankPartyType;
 
 import java.util.List;
 import java.util.Optional;
@@ -19,7 +18,8 @@ import java.util.Optional;
  *   T2 outbound — `findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString`
  *                 za sync sa partner bankom (createNegotiation, postCounterOffer)
  *   T3 inbound  — isto za POST/PUT/GET/DELETE/accept handler-e
- *   FE          — `findByLocalParty...` za UI prikaz "Aktivne ponude" tab-a
+ *   FE          — `findByLocalPartyIdAndLocalPartyRoleAndStatus` za UI prikaz
+ *                 "Aktivne ponude" tab-a
  */
 public interface InterbankOtcNegotiationRepository extends JpaRepository<InterbankOtcNegotiation, Long> {
 
@@ -42,13 +42,6 @@ public interface InterbankOtcNegotiationRepository extends JpaRepository<Interba
      */
     List<InterbankOtcNegotiation> findByLocalPartyIdAndLocalPartyRoleAndStatus(
             Long localPartyId, String localPartyRole, InterbankOtcNegotiationStatus status);
-
-    /**
-     * Sve aktivne pregovore u kojima smo BUYER ili SELLER, bez obzira na
-     * konkretnog korisnika — supervisor view.
-     */
-    List<InterbankOtcNegotiation> findByLocalPartyTypeAndStatus(
-            InterbankPartyType localPartyType, InterbankOtcNegotiationStatus status);
 
     /**
      * Provera kvota/ovecounting: pri prihvatanju nove ponude moramo

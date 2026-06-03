@@ -20,6 +20,7 @@
 
     <properties>
         <java.version>25</java.version>
+        <jacoco.version>0.8.14</jacoco.version>
     </properties>
 
     <dependencies>
@@ -63,6 +64,79 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!-- JaCoCo coverage gate (paritet sa banka2_bek / trading-service).
+                 Trenutno izmereno pokrice (121 testova): LINE 81.88%, INSTRUCTION 75.99%.
+                 Prag je postavljen tik ispod izmerenog (LINE 0.78, INSTRUCTION 0.72) sa
+                 malom marzom za CI varijacije — sluzi kao REGRESIONI gate: ako neko izbaci
+                 ili iskljuci testove i pokrice padne ispod praga, build PUCA. Nije forsiran
+                 refaktor; sledeci ciklus moze postepeno podici prag ka stvarnom nivou. -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco.version}</version>
+                <configuration>
+                    <excludes>
+                        <exclude>sun/**</exclude>
+                        <exclude>jdk/**</exclude>
+                        <exclude>com/sun/**</exclude>
+                        <!-- App entrypoint / config nisu meta za coverage
+                             (paritet sa banka2_bek / trading-service). -->
+                        <exclude>rs/raf/notification/NotificationServiceApplication.class</exclude>
+                        <exclude>rs/raf/notification/**/config/**</exclude>
+                    </excludes>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                        <configuration>
+                            <inclBootstrapClasses>false</inclBootstrapClasses>
+                            <excludes>
+                                <exclude>sun.*</exclude>
+                                <exclude>jdk.*</exclude>
+                                <exclude>com.sun.*</exclude>
+                            </excludes>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>check</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <configuration>
+                            <haltOnFailure>true</haltOnFailure>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.78</minimum>
+                                        </limit>
+                                        <limit>
+                                            <counter>INSTRUCTION</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.72</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

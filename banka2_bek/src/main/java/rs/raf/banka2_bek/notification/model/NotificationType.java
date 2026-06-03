@@ -24,15 +24,28 @@ import lombok.Getter;
 @Getter
 public enum NotificationType {
 
-    // [B4 — Petar] Financial / account events — both channels
-    PAYMENT(true, true),
-    TRANSFER(true, true),
+    // [B4 — Petar] Financial / account events.
+    //
+    // <p><b>P2-notif-reliability-2 (R1 380): sendsEmail=false na tipovima koji vec
+    // imaju DEDIKOVANI email na pozivnom mestu.</b> Pre fix-a, npr. placanje je
+    // slalo DVA emaila: (1) {@code sendPaymentConfirmationMail} (branded payment
+    // template) na call-site-u + (2) {@code notify(PAYMENT)} koji je zbog
+    // {@code sendsEmail=true} dodatno publish-ovao {@code IN_APP_GENERIC} email.
+    // Isti dupli-email obrazac vazi za TRANSFER, CARD_BLOCKED/UNBLOCKED i sve
+    // LOAN_* (svaki ima svoj dedikovani template). Ovi tipovi sad samo persistuju
+    // in-app red (bell), a email salje iskljucivo dedikovani template → jedan email.
+    //
+    // <p>{@code LIMIT_CHANGE} ostaje {@code sendsEmail=true} — NEMA dedikovan
+    // email template, pa je {@code notify()}-okinut generic email JEDINI email
+    // kanal za promenu limita (uklanjanje bi ostavilo korisnika bez ikakvog mejla).
+    PAYMENT(false, true),
+    TRANSFER(false, true),
     LIMIT_CHANGE(true, true),
-    CARD_BLOCKED(true, true),
-    CARD_UNBLOCKED(true, true),
-    LOAN_CREATED(true, true),
-    LOAN_APPROVED(true, true),
-    LOAN_REJECTED(true, true),
+    CARD_BLOCKED(false, true),
+    CARD_UNBLOCKED(false, true),
+    LOAN_CREATED(false, true),
+    LOAN_APPROVED(false, true),
+    LOAN_REJECTED(false, true),
 
     // [B4 — Petar] Order lifecycle events — in-app only (no email noise per order tick)
     ORDER_PENDING(false, true),
@@ -54,8 +67,24 @@ public enum NotificationType {
     // [B5 — Aleksa Vucinic] Price alert triggered by scheduler when threshold crossed.
     PRICE_ALERT_TRIGGERED(true, true),
 
+    // P2-notif-reliability-2 (R1 381): margin-call blokada (cross-DB iz trading-a) —
+    // in-app only; branded email salje trading preko MARGIN_ACCOUNT_BLOCKED kind-a.
+    MARGIN_ACCOUNT_BLOCKED(false, true),
+
     // [B8 — Nikola Djurovic] Recurring order events — in-app only
     RECURRING_ORDER_SKIPPED(false, true),
+
+    // OT-1061: tax obracun preskocen (FX nedostupan) → supervizor alert iz
+    // trading-service-a (cross-DB in-app POST). In-app only (bell). Mora postojati
+    // u banka-core enum-u da se ne mapira u GENERAL fallback pri perzistenciji.
+    TAX_CALCULATION_FAILED(false, true),
+
+    // C-notif-email (02.06): isplata/likvidacija iz fonda (cross-DB in-app POST iz
+    // trading-service-a). In-app only ovde — email salje trading preko svog
+    // IN_APP_GENERIC kanala (FUND_PAYOUT sendsEmail=true u trading enum-u). Ovaj
+    // ulaz postoji samo da se in-app red perzistira pod tacnim tipom (ne GENERAL
+    // fallback). Spec TestoviCelina4 Sc35/36/49/50.
+    FUND_PAYOUT(false, true),
 
     // [B1] Fallback type for ad-hoc notifications — in-app default channel
     GENERAL(false, true);

@@ -52,4 +52,38 @@ class OrderExceptionHandlerTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
         assertThat(response.getBody()).containsEntry("error", "Order already processed");
     }
+
+    // ── P2-error-contract-2 ──────────────────────────────────────────────
+
+    // R1 410 — state-conflict (npr. approve nad ne-PENDING) je 409, ne 403.
+    @Test
+    void handleStateConflict_returns409_withMessageAndError() {
+        rs.raf.trading.order.exception.OrderStateConflictException ex =
+                new rs.raf.trading.order.exception.OrderStateConflictException(
+                        "Only PENDING orders can be approved");
+
+        ResponseEntity<Map<String, String>> response = handler.handleStateConflict(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        // FE/Mobile citaju message-first; legacy error zadrzan.
+        assertThat(response.getBody()).containsEntry("message", "Only PENDING orders can be approved");
+        assertThat(response.getBody()).containsEntry("error", "Only PENDING orders can be approved");
+    }
+
+    // R1 409 — nedovoljno sredstava/hartija je 409, ne 400.
+    @Test
+    void handleInsufficientFunds_returns409() {
+        ResponseEntity<Map<String, String>> response = handler.handleInsufficient(
+                new rs.raf.trading.order.exception.InsufficientFundsException("Nedovoljno sredstava"));
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody()).containsEntry("message", "Nedovoljno sredstava");
+    }
+
+    @Test
+    void handleInsufficientHoldings_returns409() {
+        ResponseEntity<Map<String, String>> response = handler.handleInsufficient(
+                new rs.raf.trading.order.exception.InsufficientHoldingsException("Nedovoljno hartija"));
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody()).containsEntry("message", "Nedovoljno hartija");
+    }
 }
