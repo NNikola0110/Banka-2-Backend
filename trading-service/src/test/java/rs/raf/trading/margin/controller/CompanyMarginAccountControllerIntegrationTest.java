@@ -99,17 +99,17 @@ class CompanyMarginAccountControllerIntegrationTest {
 
         lenient().when(bankaCoreClient.getUserByEmail("client@test.com")).thenReturn(
                 new InternalUserDto(CLIENT_ID, "CLIENT", "client@test.com", "Client", "User", true, null));
-        lenient().when(bankaCoreClient.getUserByEmail("employee@test.com")).thenReturn(
-                new InternalUserDto(EMPLOYEE_ID, "EMPLOYEE", "employee@test.com", "Emp", "Loyee", true, "Supervisor"));
-        lenient().when(bankaCoreClient.getUserByEmail("agent@test.com")).thenReturn(
-                new InternalUserDto(EMPLOYEE_ID, "EMPLOYEE", "agent@test.com", "Ag", "Ent", true, "Agent"));
+        lenient().when(bankaCoreClient.getUserByEmail("company.margin.emp@test.com")).thenReturn(
+                new InternalUserDto(EMPLOYEE_ID, "EMPLOYEE", "company.margin.emp@test.com", "Emp", "Loyee", true, "Supervisor"));
+        lenient().when(bankaCoreClient.getUserByEmail("company.margin.agent@test.com")).thenReturn(
+                new InternalUserDto(EMPLOYEE_ID, "EMPLOYEE", "company.margin.agent@test.com", "Ag", "Ent", true, "Agent"));
         // P2-authz-method-1 (R1 468/467): company-margin endpointi sad zahtevaju
         // SUPERVISOR/ADMIN authority koju TradingPermissionResolver razresava preko
         // banka-core getUserPermissions. employee@test.com je supervizor → dobija
         // SUPERVISOR; agent@test.com je agent → samo AGENT (NE sme company margin).
-        lenient().when(bankaCoreClient.getUserPermissions("employee@test.com"))
+        lenient().when(bankaCoreClient.getUserPermissions("company.margin.emp@test.com"))
                 .thenReturn(java.util.List.of("SUPERVISOR"));
-        lenient().when(bankaCoreClient.getUserPermissions("agent@test.com"))
+        lenient().when(bankaCoreClient.getUserPermissions("company.margin.agent@test.com"))
                 .thenReturn(java.util.List.of("AGENT"));
         // OT-1272: dedikovan, JEDINSTVEN email za deposit/withdraw nad company
         // racunom (CLIENT prolazi security gate pa userId resolve VAZI). Generican
@@ -142,7 +142,7 @@ class CompanyMarginAccountControllerIntegrationTest {
 
         ResponseEntity<String> response = restTemplate.postForEntity(
                 url("/margin-accounts/company"),
-                new HttpEntity<>(payload, jsonHeaders(buildToken("employee@test.com", "EMPLOYEE"))),
+                new HttpEntity<>(payload, jsonHeaders(buildToken("company.margin.emp@test.com", "EMPLOYEE"))),
                 String.class
         );
 
@@ -211,7 +211,7 @@ class CompanyMarginAccountControllerIntegrationTest {
 
         ResponseEntity<String> response = restTemplate.postForEntity(
                 url("/margin-accounts/company"),
-                new HttpEntity<>(payload, jsonHeaders(buildToken("agent@test.com", "EMPLOYEE"))),
+                new HttpEntity<>(payload, jsonHeaders(buildToken("company.margin.agent@test.com", "EMPLOYEE"))),
                 String.class
         );
 
@@ -259,7 +259,7 @@ class CompanyMarginAccountControllerIntegrationTest {
 
         ResponseEntity<String> response = restTemplate.postForEntity(
                 url("/margin-accounts/company"),
-                new HttpEntity<>(payload, jsonHeaders(buildToken("employee@test.com", "EMPLOYEE"))),
+                new HttpEntity<>(payload, jsonHeaders(buildToken("company.margin.emp@test.com", "EMPLOYEE"))),
                 String.class
         );
 
@@ -286,7 +286,7 @@ class CompanyMarginAccountControllerIntegrationTest {
 
         ResponseEntity<String> response = restTemplate.postForEntity(
                 url("/margin-accounts/company"),
-                new HttpEntity<>(payload, jsonHeaders(buildToken("employee@test.com", "EMPLOYEE"))),
+                new HttpEntity<>(payload, jsonHeaders(buildToken("company.margin.emp@test.com", "EMPLOYEE"))),
                 String.class
         );
 
@@ -312,7 +312,7 @@ class CompanyMarginAccountControllerIntegrationTest {
 
         ResponseEntity<String> response = restTemplate.postForEntity(
                 url("/margin-accounts/company"),
-                new HttpEntity<>(payload, jsonHeaders(buildToken("employee@test.com", "EMPLOYEE"))),
+                new HttpEntity<>(payload, jsonHeaders(buildToken("company.margin.emp@test.com", "EMPLOYEE"))),
                 String.class
         );
 
@@ -340,7 +340,7 @@ class CompanyMarginAccountControllerIntegrationTest {
 
         ResponseEntity<String> response = restTemplate.postForEntity(
                 url("/margin-accounts/company"),
-                new HttpEntity<>(payload, jsonHeaders(buildToken("employee@test.com", "EMPLOYEE"))),
+                new HttpEntity<>(payload, jsonHeaders(buildToken("company.margin.emp@test.com", "EMPLOYEE"))),
                 String.class
         );
 
@@ -358,7 +358,7 @@ class CompanyMarginAccountControllerIntegrationTest {
         ResponseEntity<String> response = restTemplate.exchange(
                 url("/margin-accounts/company/" + COMPANY_ID),
                 HttpMethod.GET,
-                new HttpEntity<>(jsonHeaders(buildToken("employee@test.com", "EMPLOYEE"))),
+                new HttpEntity<>(jsonHeaders(buildToken("company.margin.emp@test.com", "EMPLOYEE"))),
                 String.class
         );
 
@@ -374,7 +374,7 @@ class CompanyMarginAccountControllerIntegrationTest {
         ResponseEntity<String> response = restTemplate.exchange(
                 url("/margin-accounts/company/" + COMPANY_ID),
                 HttpMethod.GET,
-                new HttpEntity<>(jsonHeaders(buildToken("employee@test.com", "EMPLOYEE"))),
+                new HttpEntity<>(jsonHeaders(buildToken("company.margin.emp@test.com", "EMPLOYEE"))),
                 String.class
         );
 
@@ -405,7 +405,7 @@ class CompanyMarginAccountControllerIntegrationTest {
         ResponseEntity<String> response = restTemplate.exchange(
                 url("/margin-accounts/company/" + COMPANY_ID),
                 HttpMethod.GET,
-                new HttpEntity<>(jsonHeaders(buildToken("agent@test.com", "EMPLOYEE"))),
+                new HttpEntity<>(jsonHeaders(buildToken("company.margin.agent@test.com", "EMPLOYEE"))),
                 String.class
         );
 
