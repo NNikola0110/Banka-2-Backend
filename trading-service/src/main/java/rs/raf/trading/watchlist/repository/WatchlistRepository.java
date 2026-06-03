@@ -14,4 +14,7 @@ public interface WatchlistRepository extends JpaRepository<Watchlist, Long> {
     Optional<Watchlist> findByIdAndOwnerIdAndOwnerType(Long id, Long ownerId, WatchlistOwnerType ownerType);
 
     boolean existsByOwnerIdAndOwnerTypeAndName(Long ownerId, WatchlistOwnerType ownerType, String name);
+
+    /** [P2-input-validation-1 / R1 517] broj listi po korisniku (DoS limit guard). */
+    long countByOwnerIdAndOwnerType(Long ownerId, WatchlistOwnerType ownerType);
 }

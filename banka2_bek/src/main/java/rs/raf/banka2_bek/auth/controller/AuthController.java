@@ -46,15 +46,26 @@ public class AuthController {
     }
 
     /**
-     * Opciono.1 — Logout. Povlaci access token iz Authorization headera i
-     * stavlja ga na blacklist do isteka TTL-a (15 min). Frontend treba
-     * dodatno da obrise sessionStorage.
+     * Opciono.1 / N3 — Logout. Povlaci access token iz Authorization headera i,
+     * ako je prosledjen, refresh token iz body-ja, pa ih stavlja na blacklist do
+     * isteka TTL-a. Frontend treba dodatno da obrise sessionStorage.
+     *
+     * <p>N3 fix: pre ove izmene logout je blacklist-ovao SAMO access token. Posto
+     * refresh token ima 7-dnevni TTL, ukraden refresh token je ostajao upotrebljiv
+     * ceo taj period i posle logout-a (napadac bi /auth/refresh-ovao nove access
+     * tokene). Sada se blacklist-uju i access i refresh. Body je opcioni — legacy
+     * klijenti bez refresh tokena i dalje rade (blacklist-uje se samo access).</p>
      */
     @PostMapping("/logout")
-    public ResponseEntity<MessageResponseDto> logout(HttpServletRequest request) {
+    public ResponseEntity<MessageResponseDto> logout(
+            HttpServletRequest request,
+            @RequestBody(required = false) LogoutRequestDto body) {
         String authHeader = request.getHeader("Authorization");
         if (authHeader != null && authHeader.startsWith("Bearer ")) {
             blacklistService.blacklist(authHeader.substring(7));
+        }
+        if (body != null && body.getRefreshToken() != null && !body.getRefreshToken().isBlank()) {
+            blacklistService.blacklist(body.getRefreshToken());
         }
         return ResponseEntity.ok(new MessageResponseDto("Uspesno odjavljen."));
     }

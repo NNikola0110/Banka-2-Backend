@@ -132,6 +132,27 @@ class PriceAlertServiceTest {
         verify(alertRepository, never()).save(any());
     }
 
+    // ── [P2-input-validation-1 / R1 517] DoS limit ──────────────────────────
+
+    @Test
+    @DisplayName("createAlert_rejectedWhenMaxAlertsReached")
+    void createAlert_rejectedWhenMaxAlertsReached() {
+        when(userResolver.resolveCurrent()).thenReturn(clientCtx);
+        when(alertRepository.countByOwnerIdAndOwnerTypeAndActiveTrue(42L, UserRole.CLIENT))
+                .thenReturn((long) PriceAlertService.MAX_ACTIVE_ALERTS_PER_USER);
+
+        CreatePriceAlertDto dto = CreatePriceAlertDto.builder()
+                .listingId(10L)
+                .condition(PriceAlertCondition.ABOVE)
+                .threshold(new BigDecimal("160.00"))
+                .build();
+
+        assertThatThrownBy(() -> priceAlertService.createAlert(dto))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("maksimalan broj aktivnih alarma");
+        verify(alertRepository, never()).save(any());
+    }
+
     @Test
     @DisplayName("createAlert_thresholdZero_throwsIllegalArgument")
     void createAlert_thresholdZero_throwsIllegalArgument() {
@@ -487,5 +508,95 @@ class PriceAlertServiceTest {
 
         assertThat(triggered).isEqualTo(0);
         verify(alertRepository, never()).save(any());
+    }
+
+    // ---------- R2-1382: lost-notification — publish fail re-aktivira alarm ----------
+
+    @Test
+    @DisplayName("checkAlerts_publishFails_reactivatesAlertSoItRefires")
+    void checkAlerts_publishFails_reactivatesAlertSoItRefires() {
+        // R2-1382: alarm se atomicno deaktivira (dedup), pa publish padne (RabbitMQ down).
+        // Pre fix-a: korisnik NIKAD ne dobije notifikaciju, a alarm ostaje deaktiviran
+        // (vise se ne okida). Posle fix-a: publish-fail RE-AKTIVIRA alarm → re-okida se
+        // sledeci ciklus (at-least-once isporuka notifikacije).
+        aapl.setPrice(new BigDecimal("160.00"));
+        PriceAlert alert = PriceAlert.builder()
+                .id(11L).ownerId(42L).ownerType(UserRole.CLIENT)
+                .listingId(10L).condition(PriceAlertCondition.ABOVE)
+                .threshold(new BigDecimal("150.00")).active(true).build();
+        when(alertRepository.findByActiveTrueAndListingIdIn(List.of(10L)))
+                .thenReturn(List.of(alert));
+        when(alertRepository.deactivateAlertIfActive(eq(11L), ArgumentMatchers.any()))
+                .thenReturn(1);
+        // Publish puca (broker down).
+        org.mockito.Mockito.doThrow(new RuntimeException("RabbitMQ down"))
+                .when(notificationService).notify(anyLong(), anyString(), any(), anyString(), anyString(), anyString(), anyLong());
+
+        int triggered = priceAlertService.checkAlerts(List.of(aapl));
+
+        // Nije se uspesno okidalo (notifikacija nije isporucena).
+        assertThat(triggered).isEqualTo(0);
+        // Alarm se RE-AKTIVIRA (kompenzacija) da bi se ponovo okidao.
+        verify(alertRepository).reactivateAlert(eq(11L));
+    }
+
+    @Test
+    @DisplayName("checkAlerts_publishSucceeds_doesNotReactivate")
+    void checkAlerts_publishSucceeds_doesNotReactivate() {
+        aapl.setPrice(new BigDecimal("160.00"));
+        PriceAlert alert = PriceAlert.builder()
+                .id(12L).ownerId(42L).ownerType(UserRole.CLIENT)
+                .listingId(10L).condition(PriceAlertCondition.ABOVE)
+                .threshold(new BigDecimal("150.00")).active(true).build();
+        when(alertRepository.findByActiveTrueAndListingIdIn(List.of(10L)))
+                .thenReturn(List.of(alert));
+        when(alertRepository.deactivateAlertIfActive(eq(12L), ArgumentMatchers.any()))
+                .thenReturn(1);
+
+        int triggered = priceAlertService.checkAlerts(List.of(aapl));
+
+        assertThat(triggered).isEqualTo(1);
+        verify(alertRepository, never()).reactivateAlert(anyLong());
+    }
+
+    // ---------- R2-1384: stale-price — checkAlertsForListings cita svezu cenu u svojoj tx ----------
+
+    @Test
+    @DisplayName("checkAlertsForListings_readsFreshPriceWithinTransaction")
+    void checkAlertsForListings_readsFreshPriceWithinTransaction() {
+        // R2-1384: scheduler prosledjuje listingId-eve; service cita SVEZU cenu unutar
+        // svoje tx (ne radi na stale detached entitetu procitanom u zasebnoj tx).
+        Listing fresh = new Listing();
+        fresh.setId(10L);
+        fresh.setTicker("AAPL");
+        fresh.setListingType(ListingType.STOCK);
+        fresh.setPrice(new BigDecimal("160.00")); // sveza cena prelazi prag
+        when(listingRepository.findAllById(List.of(10L))).thenReturn(List.of(fresh));
+
+        PriceAlert alert = PriceAlert.builder()
+                .id(13L).ownerId(42L).ownerType(UserRole.CLIENT)
+                .listingId(10L).condition(PriceAlertCondition.ABOVE)
+                .threshold(new BigDecimal("150.00")).active(true).build();
+        when(alertRepository.findByActiveTrueAndListingIdIn(List.of(10L)))
+                .thenReturn(List.of(alert));
+        when(alertRepository.deactivateAlertIfActive(eq(13L), ArgumentMatchers.any()))
+                .thenReturn(1);
+
+        int triggered = priceAlertService.checkAlertsForListings(List.of(10L));
+
+        assertThat(triggered).isEqualTo(1);
+        // Sveza cena je procitana iz repo-a unutar checkAlertsForListings tx.
+        verify(listingRepository).findAllById(List.of(10L));
+        verify(notificationService).notify(eq(42L), eq(UserRole.CLIENT),
+                eq(NotificationType.PRICE_ALERT_TRIGGERED), anyString(), anyString(),
+                anyString(), eq(13L));
+    }
+
+    @Test
+    @DisplayName("checkAlertsForListings_emptyOrNull_returnsZero")
+    void checkAlertsForListings_emptyOrNull_returnsZero() {
+        assertThat(priceAlertService.checkAlertsForListings(Collections.emptyList())).isEqualTo(0);
+        assertThat(priceAlertService.checkAlertsForListings(null)).isEqualTo(0);
+        verifyNoInteractions(listingRepository);
     }
 }

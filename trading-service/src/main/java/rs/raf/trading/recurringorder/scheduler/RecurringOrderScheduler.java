@@ -2,6 +2,7 @@ package rs.raf.trading.recurringorder.scheduler;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import rs.raf.trading.recurringorder.model.RecurringOrder;
@@ -34,7 +35,15 @@ public class RecurringOrderScheduler {
     private final RecurringOrderRepository recurringOrderRepo;
     private final RecurringOrderService recurringOrderService;
 
-    @Scheduled(fixedRate = 60_000)
+    // R1 820: interval eksternalizovan (default 60s) — fixedRateString cita property
+    // trading.recurring-order.cron-interval-ms (override bez rekompajliranja).
+    @Scheduled(fixedRateString = "${trading.recurring-order.cron-interval-ms:60000}")
+    // N3 FIX: dupli-DCA-buy guard na vise k8s replika — samo jedna replika obradi
+    // dospele trajne naloge po ciklusu. lockAtMostFor 55s < fixedRate 60s (oslobodi
+    // pre sledeceg tika / pri crash-u). @Version je in-process backup ako lock istekne
+    // usred dugog ciklusa.
+    @SchedulerLock(name = "RecurringOrderScheduler_processRecurringOrders",
+            lockAtMostFor = "PT55S", lockAtLeastFor = "PT0S")
     public void processRecurringOrders() {
         runCycle();
     }

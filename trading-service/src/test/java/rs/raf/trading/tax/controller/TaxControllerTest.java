@@ -227,15 +227,135 @@ class TaxControllerTest {
     }
 
     @Test
-    @DisplayName("POST /tax/calculate - 400 when service throws")
+    @DisplayName("POST /tax/calculate - 400 when service throws (hard non-FX failure still propagates)")
     void triggerCalculation_serviceThrows() throws Exception {
         doThrow(new RuntimeException("Calculation failed"))
                 .when(taxService).calculateTaxForAllUsers();
 
         mockMvc.perform(post("/tax/calculate")
+                        .principal(createAuth("admin@banka.rs"))
                         .contentType(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.message").value("Calculation failed"));
+
+        // R1 429: hard (non-TaxCalculation) failure → audit NOT emitted (genuine error,
+        // run did not complete in any meaningful way), exception propagates to 400.
+        verify(auditLogService, never()).record(anyLong(), anyString(), any(), anyString(), any(), any());
+    }
+
+    @Test
+    @DisplayName("R1 429: POST /tax/calculate - partial FX failure → 200 + audit still emitted")
+    void triggerCalculation_partialFxFailure_returns200AndAudits() throws Exception {
+        // TaxCalculationException = partial failure (some users computed+persisted, some skipped
+        // for missing FX). Must NOT 400; must still write TAX_RUN_TRIGGERED audit.
+        doThrow(new rs.raf.trading.tax.service.TaxCalculationException(
+                42L, "CLIENT", "FX rate unavailable for USD, cannot compute tax in RSD", null))
+                .when(taxService).calculateTaxForAllUsers();
+        when(bankaCoreClient.getUserByEmail("admin@banka.rs"))
+                .thenReturn(new rs.raf.banka2.contracts.internal.InternalUserDto(
+                        7L, "EMPLOYEE", "admin@banka.rs", "Adm", "In", true, null));
+
+        mockMvc.perform(post("/tax/calculate")
+                        .principal(createAuth("admin@banka.rs"))
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message", org.hamcrest.Matchers.containsString("delimicnim")));
+
+        // audit IS emitted (run was triggered) with actorId resolved + PARTIAL note
+        verify(auditLogService).record(
+                eq(7L), eq("EMPLOYEE"),
+                eq(rs.raf.trading.audit.model.AuditActionType.TAX_RUN_TRIGGERED),
+                org.mockito.ArgumentMatchers.contains("PARTIAL"),
+                any(), any());
+    }
+
+    @Test
+    @DisplayName("R1 429: POST /tax/calculate - full success → 200 + audit emitted")
+    void triggerCalculation_fullSuccess_returns200AndAudits() throws Exception {
+        doNothing().when(taxService).calculateTaxForAllUsers();
+        when(bankaCoreClient.getUserByEmail("admin@banka.rs"))
+                .thenReturn(new rs.raf.banka2.contracts.internal.InternalUserDto(
+                        7L, "EMPLOYEE", "admin@banka.rs", "Adm", "In", true, null));
+
+        mockMvc.perform(post("/tax/calculate")
+                        .principal(createAuth("admin@banka.rs"))
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        verify(auditLogService).record(
+                eq(7L), eq("EMPLOYEE"),
+                eq(rs.raf.trading.audit.model.AuditActionType.TAX_RUN_TRIGGERED),
+                anyString(), any(), any());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  OT-1064 (TEST-tr-tax-actuary-exchange-1) — audit best-effort + actor fallback.
+    //  triggerCalculation NE sme da pretvori pad audit-a / pad actor-lookup-a u
+    //  gresku: tax-run je VEC izvrsen (calculateTaxForAllUsers persistuje per-user
+    //  REQUIRES_NEW), pa odgovor mora ostati 200.
+    // ══════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("OT-1064: pad audit log-a NE obara vec-zavrsen tax-run (200, best-effort)")
+    void triggerCalculation_auditFailure_stillReturns200() throws Exception {
+        // Tax run uspeo; ali auditLogService.record pukne — kontroler mora i dalje 200.
+        doNothing().when(taxService).calculateTaxForAllUsers();
+        when(bankaCoreClient.getUserByEmail("admin@banka.rs"))
+                .thenReturn(new rs.raf.banka2.contracts.internal.InternalUserDto(
+                        7L, "EMPLOYEE", "admin@banka.rs", "Adm", "In", true, null));
+        doThrow(new RuntimeException("audit DB down"))
+                .when(auditLogService).record(anyLong(), anyString(), any(), anyString(), any(), any());
+
+        mockMvc.perform(post("/tax/calculate")
+                        .principal(createAuth("admin@banka.rs"))
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Obracun poreza uspesno zavrsen."));
+
+        // audit JE pokusan (best-effort) — pad se proguta.
+        verify(auditLogService).record(anyLong(), anyString(),
+                eq(rs.raf.trading.audit.model.AuditActionType.TAX_RUN_TRIGGERED),
+                anyString(), any(), any());
+    }
+
+    @Test
+    @DisplayName("OT-1064: actor lookup pad → audit sa fallback actorId=0, run i dalje 200")
+    void triggerCalculation_actorLookupFails_auditsWithFallbackActor() throws Exception {
+        // banka-core getUserByEmail pukne → actorId fallback 0; run i dalje uspeo (200)
+        // i audit se i dalje emituje (sa actorId=0).
+        doNothing().when(taxService).calculateTaxForAllUsers();
+        when(bankaCoreClient.getUserByEmail("admin@banka.rs"))
+                .thenThrow(new rs.raf.trading.client.BankaCoreClientException(503, "banka-core down"));
+
+        mockMvc.perform(post("/tax/calculate")
+                        .principal(createAuth("admin@banka.rs"))
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Obracun poreza uspesno zavrsen."));
+
+        verify(auditLogService).record(
+                eq(0L), eq("EMPLOYEE"),
+                eq(rs.raf.trading.audit.model.AuditActionType.TAX_RUN_TRIGGERED),
+                anyString(), any(), any());
+    }
+
+    @Test
+    @DisplayName("OT-1064: null Authentication → actor 'UNKNOWN' email, run 200, audit emitovan")
+    void triggerCalculation_nullAuthentication_returns200() throws Exception {
+        // Kontroler dozvoljava null Authentication (email='UNKNOWN'); run uspeo → 200.
+        doNothing().when(taxService).calculateTaxForAllUsers();
+        when(bankaCoreClient.getUserByEmail("UNKNOWN"))
+                .thenThrow(new rs.raf.trading.client.BankaCoreClientException(404, "no such user"));
+
+        mockMvc.perform(post("/tax/calculate")
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        verify(taxService).calculateTaxForAllUsers();
+        verify(auditLogService).record(
+                eq(0L), eq("EMPLOYEE"),
+                eq(rs.raf.trading.audit.model.AuditActionType.TAX_RUN_TRIGGERED),
+                org.mockito.ArgumentMatchers.contains("UNKNOWN"), any(), any());
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -281,13 +401,13 @@ class TaxControllerTest {
     @Test
     @DisplayName("GET /tax/my/breakdown - 200 OK with authenticated user's breakdown")
     void getMyBreakdown_returnsItems() throws Exception {
-        when(taxService.getMyTaxRecord("marko@banka.rs")).thenReturn(testRecord);
+        // R2-1448: kontroler sada zove jedan single-pass servis poziv getMyTaxBreakdown(email).
         TaxBreakdownItemDto item = new TaxBreakdownItemDto(
                 5L, "MSFT", "RSD",
                 new BigDecimal("5000.0000"),
                 new BigDecimal("5000.0000"),
                 new BigDecimal("750.0000"));
-        when(taxService.getTaxBreakdownForUser(10L, "CLIENT")).thenReturn(List.of(item));
+        when(taxService.getMyTaxBreakdown("marko@banka.rs")).thenReturn(List.of(item));
 
         mockMvc.perform(get("/tax/my/breakdown")
                         .principal(createAuth("marko@banka.rs"))
@@ -296,16 +416,16 @@ class TaxControllerTest {
                 .andExpect(jsonPath("$", hasSize(1)))
                 .andExpect(jsonPath("$[0].ticker").value("MSFT"));
 
-        verify(taxService).getTaxBreakdownForUser(10L, "CLIENT");
+        verify(taxService).getMyTaxBreakdown("marko@banka.rs");
+        // R2-1448: vise NE poziva getMyTaxRecord + getTaxBreakdownForUser (3 lookupa).
+        verify(taxService, never()).getMyTaxRecord(anyString());
+        verify(taxService, never()).getTaxBreakdownForUser(anyLong(), anyString());
     }
 
     @Test
     @DisplayName("GET /tax/my/breakdown - 200 OK with empty list when user has no tax record")
     void getMyBreakdown_noRecord() throws Exception {
-        TaxRecordDto emptyRecord = new TaxRecordDto(
-                null, 0L, "Nepoznat", "CLIENT",
-                BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, "RSD");
-        when(taxService.getMyTaxRecord("novi@banka.rs")).thenReturn(emptyRecord);
+        when(taxService.getMyTaxBreakdown("novi@banka.rs")).thenReturn(java.util.List.of());
 
         mockMvc.perform(get("/tax/my/breakdown")
                         .principal(createAuth("novi@banka.rs"))
@@ -313,7 +433,7 @@ class TaxControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$", hasSize(0)));
 
-        // record.id == null → ne poziva getTaxBreakdownForUser
+        verify(taxService).getMyTaxBreakdown("novi@banka.rs");
         verify(taxService, never()).getTaxBreakdownForUser(anyLong(), anyString());
     }
 

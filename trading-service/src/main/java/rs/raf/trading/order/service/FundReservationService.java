@@ -12,7 +12,6 @@ import rs.raf.trading.client.BankaCoreClientException;
 import rs.raf.trading.order.exception.InsufficientFundsException;
 import rs.raf.trading.order.exception.InsufficientHoldingsException;
 import rs.raf.trading.order.model.Order;
-import rs.raf.trading.order.model.SagaState;
 import rs.raf.trading.portfolio.model.Portfolio;
 import rs.raf.trading.portfolio.repository.PortfolioRepository;
 
@@ -49,8 +48,9 @@ public class FundReservationService {
 
     /**
      * Rezervise {@code order.reservedAmount} na racunu (banka-core
-     * {@code /internal/funds/reserve}). Cuva {@code reservationId} koji
-     * banka-core vrati i postavlja SAGA stanje na {@code FUNDS_RESERVED}.
+     * {@code /internal/funds/reserve}) i cuva {@code reservationId} koji
+     * banka-core vrati u {@code order.bankaCoreReservationId} (potreban za
+     * kasniji commit/release).
      */
     @Transactional
     public void reserveForBuy(Order order) {
@@ -74,7 +74,6 @@ public class FundReservationService {
                     "order-" + order.getId() + "-reserve",
                     new ReserveFundsRequest(order.getReservedAccountId(), amount, currencyCode));
             order.setBankaCoreReservationId(response.reservationId());
-            order.setSagaState(SagaState.FUNDS_RESERVED);
         } catch (BankaCoreClientException ex) {
             if (ex.getHttpStatus() == 409) {
                 // banka-core odbio rezervaciju zbog nedovoljnih sredstava.
@@ -114,7 +113,6 @@ public class FundReservationService {
                 new ReleaseFundsRequest("Oslobadjanje rezervacije za order " + order.getId()));
 
         order.setReservationReleased(true);
-        order.setSagaState(SagaState.COMPENSATED);
     }
 
     /**

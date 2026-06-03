@@ -6,6 +6,7 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.hibernate.annotations.ColumnDefault;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 /*
@@ -97,6 +98,19 @@ public class InterbankTransaction {
     /** Razlog ROLLED_BACK ili STUCK statusa. */
     @Column(name = "failure_reason", length = 1024)
     private String failureReason;
+
+    /**
+     * N5 — FX rate-pinning za cross-currency inbound settlement (§Celina 5 §40-66).
+     *
+     * <p>Kad smo RECIPIENT (Banka B) i primimo cross-currency NEW_TX, izracunamo i
+     * <b>zakljucamo (pin)</b> mid-rate source→target u VOTE fazi. Commit faza MORA
+     * koristiti ovaj pinned kurs umesto da re-racuna po live rate-u — inace FX drift
+     * izmedju vote-a i commit-a moze da pomeri isplatu izvan provere stanja
+     * obavljene pri glasanju (overdraft / leak). Null za same-currency ili
+     * non-recipient transakcije.
+     */
+    @Column(name = "pinned_fx_rate", precision = 38, scale = 18)
+    private BigDecimal pinnedFxRate;
 
     @Column(name = "retry_count", nullable = false)
     @ColumnDefault("0")

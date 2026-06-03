@@ -18,18 +18,15 @@ public interface OtcNegotiationHistoryRepository
 
     List<OtcNegotiationHistory> findByNegotiationIdOrderByCreatedAtAsc(Long negotiationId);
 
-    List<OtcNegotiationHistory> findByModifiedByIdOrderByCreatedAtDesc(Long modifiedById);
-
-    List<OtcNegotiationHistory> findByStatusOrderByCreatedAtDesc(String status);
-
-    List<OtcNegotiationHistory> findByCreatedAtBetweenOrderByCreatedAtDesc(
-            LocalDateTime from, LocalDateTime to);
-
+    // Faza G (live-smoke fix): cast(:p as tip) na null-check strani — bez njega PG
+    // ne moze da zakljuci tip null parametra (ERROR: could not determine data type
+    // of parameter $N). status/modifiedById su String/Long (ne enum), pa je cast
+    // dovoljan; isti PG-safe obrazac kao TransactionRepository/PaymentRepository.
     @Query("SELECT h FROM OtcNegotiationHistory h " +
-            "WHERE (:status IS NULL OR h.status = :status) " +
-            "  AND (:modifiedById IS NULL OR h.modifiedById = :modifiedById) " +
-            "  AND (:from IS NULL OR h.createdAt >= :from) " +
-            "  AND (:to IS NULL OR h.createdAt <= :to) " +
+            "WHERE (cast(:status as string) IS NULL OR h.status = :status) " +
+            "  AND (cast(:modifiedById as long) IS NULL OR h.modifiedById = :modifiedById) " +
+            "  AND (cast(:from as timestamp) IS NULL OR h.createdAt >= :from) " +
+            "  AND (cast(:to as timestamp) IS NULL OR h.createdAt <= :to) " +
             "ORDER BY h.createdAt DESC")
     Page<OtcNegotiationHistory> findWithFilters(
             @Param("status") String status,

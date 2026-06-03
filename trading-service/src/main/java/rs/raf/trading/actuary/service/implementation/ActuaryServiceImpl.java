@@ -78,8 +78,9 @@ public class ActuaryServiceImpl implements ActuaryService {
 
     @Override
     public ActuaryInfoDto getActuaryInfo(Long employeeId) {
+        // R1-186: genuini "ne postoji" → EntityNotFoundException (404), ne IAE.
         ActuaryInfo info = actuaryInfoRepository.findByEmployeeId(employeeId)
-                .orElseThrow(() -> new IllegalArgumentException(
+                .orElseThrow(() -> new EntityNotFoundException(
                         "Actuary info for employee with ID " + employeeId + " not found."
                 ));
 
@@ -103,32 +104,106 @@ public class ActuaryServiceImpl implements ActuaryService {
             throw new IllegalStateException("Cannot change own actuary info.");
         }
 
+        // R1-186: ciljani zaposleni ne postoji kao aktuar → 404 (EntityNotFound),
+        // ne 400/404-IAE. Validaciona greska (below-used-limit) i dalje 400-IAE.
         ActuaryInfo targetUserInfo = actuaryInfoRepository.findByEmployeeId(employeeId)
-                .orElseThrow(() -> new IllegalArgumentException("User does not exist or isn't an actuary."));
+                .orElseThrow(() -> new EntityNotFoundException("User does not exist or isn't an actuary."));
 
         if(targetUserInfo.getActuaryType() != ActuaryType.AGENT) {
-            throw new RuntimeException("Limits can only be updated for agents.");
+            // R1-744: pre je bio bare RuntimeException → fall-through na globalni handler
+            // (HTTP 500). Ovo je VALIDACIONA greska pozivaoca (cilj je supervizor, ne
+            // agent), pa domenski tip {@link IllegalArgumentException} mapira na 400
+            // (ActuaryExceptionHandler), paritet sa below-used-limit validacijom.
+            throw new IllegalArgumentException("Limits can only be updated for agents.");
         }
 
-        BigDecimal oldLimit = targetUserInfo.getDailyLimit();
-        Boolean oldNeedApproval = targetUserInfo.isNeedApproval();
+        // R2-1357: supervizorov save dailyLimit-a/needApproval-a moze da se preplete
+        // sa konkurentnim order-increment-om usedLimit-a (OrderServiceImpl
+        // mutateActuaryWithRetry). Bez retry-ja, @Version-protected save puca
+        // OptimisticLockingFailureException ILI (bez svezeg read-a) pregazi
+        // konkurentni increment (lost update). Retry: re-citaj svez red, re-validiraj
+        // below-used-limit (usedLimit se mogao promeniti), pa re-apply + save.
+        SavedLimit saved = updateAgentLimitWithRetry(employeeId, targetUserInfo, dto);
 
-        targetUserInfo.setDailyLimit(dto.getDailyLimit() != null ? dto.getDailyLimit() : targetUserInfo.getDailyLimit());
-        targetUserInfo.setNeedApproval(dto.getNeedApproval() != null ? dto.getNeedApproval() : targetUserInfo.isNeedApproval());
-
-        actuaryInfoRepository.save(targetUserInfo);
-
-        // B7 audit hook (port iz main PR #86): actorId iz trenutnog autentifikovanog supervizora
-        auditLogService.record(
+        // B7 audit hook (port iz main PR #86): actorId iz trenutnog autentifikovanog supervizora.
+        // R4 1780 + R1 394 (P2-audit-coverage-1): afterCommit + best-effort. Audit se pise
+        // SAMO ako updateAgentLimit tx commit-uje, i pad audit-a NE obara izmenu limita.
+        // (old/new vrednosti su u opisu — recordAfterCommit nosi single description string.)
+        auditLogService.recordAfterCommit(
                 currentUserInfo.getEmployeeId(), "EMPLOYEE", AuditActionType.LIMIT_CHANGED,
-                "Agent limit updated for employee " + employeeId,
-                "ACTUARY", employeeId,
-                "dailyLimit=" + oldLimit + ",needApproval=" + oldNeedApproval,
-                "dailyLimit=" + targetUserInfo.getDailyLimit() + ",needApproval=" + targetUserInfo.isNeedApproval()
+                "Agent limit updated for employee " + employeeId
+                        + " (old: dailyLimit=" + saved.getOldLimitAudit()
+                        + ",needApproval=" + saved.getOldNeedApprovalAudit()
+                        + " -> new: dailyLimit=" + saved.getInfo().getDailyLimit()
+                        + ",needApproval=" + saved.getInfo().isNeedApproval() + ")",
+                "ACTUARY", employeeId
         );
 
-        ActuaryInfoDto response = ActuaryMapper.toDto(targetUserInfo, resolveEmployee(targetUserInfo.getEmployeeId()));
+        ActuaryInfoDto response = ActuaryMapper.toDto(saved.getInfo(), resolveEmployee(saved.getInfo().getEmployeeId()));
         return response;
+    }
+
+    /** Max broj pokusaja za optimistic-lock retry pri updateAgentLimit. */
+    private static final int LIMIT_UPDATE_MAX_RETRIES = 3;
+
+    /**
+     * R2-1357: primenjuje supervizorovu izmenu (dailyLimit/needApproval) sa
+     * optimistic-lock retry-em. Na {@link org.springframework.dao.OptimisticLockingFailureException}
+     * re-citamo svez red (svez usedLimit) i ponavljamo — tako konkurentni
+     * order-increment ne biva pregazen, a below-used-limit validacija koristi
+     * najsveziji usedLimit. Validaciona greska (below-used-limit) NE retry-uje se.
+     */
+    private SavedLimit updateAgentLimitWithRetry(Long employeeId, ActuaryInfo initial, UpdateActuaryLimitDto dto) {
+        ActuaryInfo target = initial;
+        org.springframework.dao.OptimisticLockingFailureException last = null;
+        for (int attempt = 0; attempt < LIMIT_UPDATE_MAX_RETRIES; attempt++) {
+            BigDecimal oldLimit = target.getDailyLimit();
+            Boolean oldNeedApproval = target.isNeedApproval();
+
+            // P2-9 (Celina 3 S3): novi dnevni limit ne sme biti ispod vec
+            // potrosenog (usedLimit) iznosa agenta — IllegalArgumentException -> 400.
+            if (dto.getDailyLimit() != null) {
+                BigDecimal used = target.getUsedLimit() != null ? target.getUsedLimit() : BigDecimal.ZERO;
+                if (dto.getDailyLimit().compareTo(used) < 0) {
+                    throw new IllegalArgumentException(
+                            "New daily limit (" + dto.getDailyLimit()
+                                    + ") cannot be below already used limit (" + used + ").");
+                }
+            }
+
+            target.setDailyLimit(dto.getDailyLimit() != null ? dto.getDailyLimit() : target.getDailyLimit());
+            target.setNeedApproval(dto.getNeedApproval() != null ? dto.getNeedApproval() : target.isNeedApproval());
+
+            try {
+                ActuaryInfo persisted = actuaryInfoRepository.saveAndFlush(target);
+                return new SavedLimit(persisted, oldLimit, oldNeedApproval);
+            } catch (org.springframework.dao.OptimisticLockingFailureException ole) {
+                last = ole;
+                // Re-citaj svez red (svez usedLimit + version) i ponovi.
+                target = actuaryInfoRepository.findByEmployeeId(employeeId)
+                        .orElseThrow(() -> new EntityNotFoundException(
+                                "User does not exist or isn't an actuary."));
+            }
+        }
+        throw last != null ? last
+                : new IllegalStateException("Failed to update agent limit after retries.");
+    }
+
+    /** Nosi perzistovan ActuaryInfo + stare vrednosti za audit log. */
+    private static final class SavedLimit {
+        private final ActuaryInfo info;
+        private final BigDecimal oldLimitAudit;
+        private final Boolean oldNeedApprovalAudit;
+
+        SavedLimit(ActuaryInfo info, BigDecimal oldLimitAudit, Boolean oldNeedApprovalAudit) {
+            this.info = info;
+            this.oldLimitAudit = oldLimitAudit;
+            this.oldNeedApprovalAudit = oldNeedApprovalAudit;
+        }
+
+        ActuaryInfo getInfo() { return info; }
+        BigDecimal getOldLimitAudit() { return oldLimitAudit; }
+        Boolean getOldNeedApprovalAudit() { return oldNeedApprovalAudit; }
     }
 
 
@@ -168,12 +243,12 @@ public class ActuaryServiceImpl implements ActuaryService {
             actorType = "SCHEDULER";
         }
 
-        auditLogService.record(
+        // R4 1780 + R1 394 (P2-audit-coverage-1): afterCommit + best-effort. (old/new
+        // u opisu — recordAfterCommit nosi jedan description string.)
+        auditLogService.recordAfterCommit(
                 actorId, actorType, AuditActionType.USED_LIMIT_RESET,
-                "Used limit reset for agent " + employeeId,
-                "ACTUARY", employeeId,
-                String.valueOf(oldUsed),
-                "0"
+                "Used limit reset for agent " + employeeId + " (oldUsed=" + oldUsed + " -> 0)",
+                "ACTUARY", employeeId
         );
 
         return ActuaryMapper.toDto(updatedActuary, resolveEmployee(updatedActuary.getEmployeeId()));

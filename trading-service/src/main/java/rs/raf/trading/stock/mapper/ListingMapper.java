@@ -2,6 +2,7 @@ package rs.raf.trading.stock.mapper;
 
 import rs.raf.trading.stock.dto.ListingDailyPriceDto;
 import rs.raf.trading.stock.dto.ListingDto;
+import rs.raf.trading.stock.model.ContractSize;
 import rs.raf.trading.stock.model.Listing;
 import rs.raf.trading.stock.model.ListingDailyPriceInfo;
 import rs.raf.trading.stock.model.ListingType;
@@ -71,7 +72,13 @@ public final class ListingMapper {
 
     /**
      * Change Percent = (priceChange / (price - priceChange)) * 100
-     * Ako je prethodna cena (price - priceChange) nula ili null, vraca null.
+     *
+     * <p>R1-731: vraca null kad prethodna cena ({@code price - priceChange}) NIJE
+     * STRIKTNO POZITIVNA. Za nula-prethodnu cenu je % promena nedefinisana
+     * (deljenje nulom); za NEGATIVNU prethodnu cenu (npr. price=5, change=10 →
+     * previous=-5) je rezultat matematicki validan ali semanticki besmislen —
+     * negativan imenilac obrne znak pa rastuca cena daje negativan "%" promenu.
+     * Promena se moze izraziti u procentima samo u odnosu na pozitivnu bazu.</p>
      */
     public static BigDecimal calculateChangePercent(Listing listing) {
         BigDecimal price = listing.getPrice();
@@ -79,7 +86,7 @@ public final class ListingMapper {
         if (price == null || change == null) return null;
 
         BigDecimal previousPrice = price.subtract(change);
-        if (previousPrice.compareTo(BigDecimal.ZERO) == 0) return null;
+        if (previousPrice.compareTo(BigDecimal.ZERO) <= 0) return null;
 
         return change.multiply(BigDecimal.valueOf(100))
                 .divide(previousPrice, 2, RoundingMode.HALF_UP);
@@ -90,17 +97,22 @@ public final class ListingMapper {
      * - STOCK:   50% * price
      * - FOREX:   contractSize * price * 10%
      * - FUTURES: contractSize * price * 10%
+     *
+     * <p>OT-1048: {@code null} contractSize se razresava preko {@link ContractSize}
+     * po tipu hartije (FOREX → 1000 per spec §162, ne 1). Isti resolver koristi i
+     * order-engine ({@code OrderServiceImpl}) i porez ({@code TaxRealizedGainCalculator}),
+     * pa display margin nikad ne divergira od stvarno rezervisanog iznosa.
      */
     public static BigDecimal calculateMaintenanceMargin(Listing listing) {
         BigDecimal price = listing.getPrice();
         if (price == null || listing.getListingType() == null) return null;
 
-        if (listing.getListingType() == rs.raf.trading.stock.model.ListingType.STOCK) {
+        if (listing.getListingType() == ListingType.STOCK) {
             return price.multiply(BigDecimal.valueOf(0.5))
                     .setScale(4, RoundingMode.HALF_UP);
         }
         // FOREX or FUTURES
-        int cs = listing.getContractSize() != null ? listing.getContractSize() : 1;
+        int cs = ContractSize.resolve(listing.getContractSize(), listing.getListingType());
         return BigDecimal.valueOf(cs).multiply(price)
                 .multiply(BigDecimal.valueOf(0.1))
                 .setScale(4, RoundingMode.HALF_UP);

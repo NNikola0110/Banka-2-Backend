@@ -120,6 +120,42 @@ class OptionServiceTest {
         return option;
     }
 
+    /** Bankin racun u proizvoljnoj valuti (za ne-USD listing FX-magnitudni test). */
+    private InternalAccountDto bankAccountInCurrency(String currencyCode, BigDecimal balance) {
+        return new InternalAccountDto(77L, "333000000000000099", "Banka 2025",
+                balance, balance, BigDecimal.ZERO, currencyCode, "ACTIVE",
+                null, null, "BANK_TRADING");
+    }
+
+    /**
+     * Opcija na ne-USD listingu (eksplicitan exchangeAcronym → valuta) — koristi se
+     * za P1-options-tax-1 (1546/1332) FX-magnitudni test.
+     */
+    private Option buildOptionOnExchange(OptionType optionType,
+                                         String exchangeAcronym,
+                                         BigDecimal currentStockPrice,
+                                         BigDecimal strikePrice,
+                                         int openInterest) {
+        Listing listing = new Listing();
+        listing.setId(55L);
+        listing.setTicker("RAIFRS");
+        listing.setName("Raiffeisen banka a.d.");
+        listing.setListingType(ListingType.STOCK);
+        listing.setExchangeAcronym(exchangeAcronym);
+        listing.setPrice(currentStockPrice);
+
+        Option option = new Option();
+        option.setId(1L);
+        option.setTicker("RAIFRS260402C00005000");
+        option.setStockListing(listing);
+        option.setOptionType(optionType);
+        option.setStrikePrice(strikePrice);
+        option.setSettlementDate(LocalDate.now().plusDays(5));
+        option.setOpenInterest(openInterest);
+        option.setContractSize(100);
+        return option;
+    }
+
     // ── exercise authorization ───────────────────────────────────────────────
 
     @Test
@@ -178,6 +214,67 @@ class OptionServiceTest {
         assertThatThrownBy(() -> optionService.exerciseOption(1L, "agent@test.com"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("istekla");
+    }
+
+    @Test
+    void exerciseOption_allowedOnExpiryDay_R3_1623() {
+        // R3 1623: gate je `settlementDate.isBefore(now)` → exercise je DOZVOLJEN na
+        // sam dan isteka (settlement == danas). `cleanupExpiredOptions` brise samo
+        // `settlementDate < danas`, pa se opcija NE brise istog dana kad je jos
+        // exercisable — granica je usklajena (exercisable do ukljucujuci dan isteka,
+        // brisanje tek sledeci dan).
+        mockAuthorizedActuary("agent@test.com", 12L);
+
+        Option option = buildOption(
+                1L, OptionType.CALL,
+                new BigDecimal("210.00"), new BigDecimal("180.00"),
+                LocalDate.now() /* settlement == DANAS */, 3);
+        when(optionRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(option));
+        when(bankaCoreClient.getBankTradingAccount("USD"))
+                .thenReturn(bankAccount(new BigDecimal("100000")));
+
+        optionService.exerciseOption(1L, "agent@test.com");
+
+        // Exercise je prosao (nije bacio "istekla") → openInterest dekrementiran.
+        assertThat(option.getOpenInterest()).isEqualTo(2);
+    }
+
+    // ── [P2-input-validation-1 / R1 461] money-leg guards (NPE→400) ────────────
+
+    @Test
+    void exerciseOption_nullCurrentPrice_throws400NotNpe() {
+        mockAuthorizedActuary("agent@test.com", 12L);
+
+        Option option = buildOption(
+                1L, OptionType.CALL,
+                null /* currentPrice nedostupan */, new BigDecimal("180.00"),
+                LocalDate.now().plusDays(5), 3);
+        when(optionRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(option));
+
+        assertThatThrownBy(() -> optionService.exerciseOption(1L, "agent@test.com"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("cena");
+        // Novcana noga ne sme da se pozove.
+        verify(bankaCoreClient, never()).debitFunds(any(), any());
+        verify(bankaCoreClient, never()).creditFunds(any(), any());
+    }
+
+    @Test
+    void exerciseOption_nonPositiveContractSize_throws400() {
+        mockAuthorizedActuary("agent@test.com", 12L);
+
+        Option option = buildOption(
+                1L, OptionType.CALL,
+                new BigDecimal("210.00"), new BigDecimal("180.00"),
+                LocalDate.now().plusDays(5), 3);
+        option.setContractSize(0);
+        when(optionRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(option));
+
+        assertThatThrownBy(() -> optionService.exerciseOption(1L, "agent@test.com"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("contractSize");
+        verify(bankaCoreClient, never()).debitFunds(any(), any());
+        verify(bankaCoreClient, never()).creditFunds(any(), any());
     }
 
     @Test
@@ -348,5 +445,200 @@ class OptionServiceTest {
         assertThatThrownBy(() -> optionService.exerciseOption(1L, "agent@test.com"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Nedovoljno sredstava");
+    }
+
+    // ── [W1.11] money-leg-last ordering ──────────────────────────────────────
+
+    @Test
+    void exerciseOption_callRunsMoneyLegLast_localMutationsBeforeDebit() {
+        // [W1.11] Nepovratna banka-core novcana noga (debitFunds) mora ici POSLEDNJA —
+        // posle svih lokalnih JPA mutacija (portfolio save + openInterest save). Tako
+        // pad debit-a cini da @Transactional cisto rollback-uje lokalne izmene umesto
+        // da novac bude skinut bez isporucenih akcija.
+        mockAuthorizedActuary("agent@test.com", 12L);
+
+        Option option = buildOption(
+                1L, OptionType.CALL,
+                new BigDecimal("210.00"), new BigDecimal("180.00"),
+                LocalDate.now().plusDays(5), 4);
+
+        when(optionRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(option));
+        when(bankaCoreClient.getBankTradingAccount("USD"))
+                .thenReturn(bankAccount(new BigDecimal("10000000.00")));
+        when(portfolioRepository.findByUserIdAndUserRole(12L, "EMPLOYEE"))
+                .thenReturn(java.util.Collections.emptyList());
+
+        optionService.exerciseOption(1L, "agent@test.com");
+
+        // Obe lokalne mutacije (portfolio save + openInterest save) MORAJU se desiti
+        // PRE novcane noge (debitFunds) — to je sustina money-leg-last fixa.
+        org.mockito.InOrder inOrder = inOrder(portfolioRepository, optionRepository, bankaCoreClient);
+        inOrder.verify(portfolioRepository).save(any(rs.raf.trading.portfolio.model.Portfolio.class));
+        inOrder.verify(optionRepository).save(option);
+        inOrder.verify(bankaCoreClient).debitFunds(any(), any(DebitFundsRequest.class));
+    }
+
+    @Test
+    void exerciseOption_putRunsMoneyLegLast_localMutationsBeforeCredit() {
+        // [W1.11] PUT analogno: portfolio sell + openInterest save PRE creditFunds.
+        // Pre fixa je openInterest save dolazio POSLE credit-a → ako save padne,
+        // novac bi bio kreiran (banka kreditovana, akcije vracene).
+        mockAuthorizedActuary("agent@test.com", 12L);
+
+        Option option = buildOption(
+                1L, OptionType.PUT,
+                new BigDecimal("150.00"), new BigDecimal("180.00"),
+                LocalDate.now().plusDays(5), 3);
+
+        rs.raf.trading.portfolio.model.Portfolio portfolio = new rs.raf.trading.portfolio.model.Portfolio();
+        portfolio.setUserId(12L);
+        portfolio.setUserRole("EMPLOYEE");
+        portfolio.setListingId(55L);
+        portfolio.setQuantity(200);
+        portfolio.setAverageBuyPrice(new BigDecimal("170.00"));
+
+        when(optionRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(option));
+        when(bankaCoreClient.getBankTradingAccount("USD"))
+                .thenReturn(bankAccount(new BigDecimal("100000.00")));
+        when(portfolioRepository.findByUserIdAndUserRole(12L, "EMPLOYEE"))
+                .thenReturn(List.of(portfolio));
+
+        optionService.exerciseOption(1L, "agent@test.com");
+
+        // openInterest save MORA pre creditFunds (novcana noga POSLEDNJA).
+        org.mockito.InOrder inOrder = inOrder(portfolioRepository, optionRepository, bankaCoreClient);
+        inOrder.verify(portfolioRepository).save(portfolio);
+        inOrder.verify(optionRepository).save(option);
+        inOrder.verify(bankaCoreClient).creditFunds(any(), any(CreditFundsRequest.class));
+    }
+
+    // ── P1-options-tax-1: FX-magnituda (1546/1332) ───────────────────────────
+
+    @Test
+    void exerciseOption_call_nonUsdListing_debitsBankAccountInListingCurrency_notUsd() {
+        // P1-options-tax-1 (1546/1332): za BELEX/RSD listing (strike 5000 RSD,
+        // contractSize 100 = 500000 RSD) novcana noga MORA ici na RSD bankin racun
+        // u RSD iznosu — NE na USD racun (pre fix-a se 500000 RSD slalo na USD racun
+        // → ~120× pogresna magnituda, konzervacija razbijena).
+        mockAuthorizedActuary("agent@test.com", 12L);
+
+        Option option = buildOptionOnExchange(
+                OptionType.CALL, "BELEX",
+                new BigDecimal("6000.00"), new BigDecimal("5000.00"), 4);
+
+        when(optionRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(option));
+        when(bankaCoreClient.getBankTradingAccount("RSD"))
+                .thenReturn(bankAccountInCurrency("RSD", new BigDecimal("100000000.00")));
+        when(portfolioRepository.findByUserIdAndUserRole(12L, "EMPLOYEE"))
+                .thenReturn(java.util.Collections.emptyList());
+
+        optionService.exerciseOption(1L, "agent@test.com");
+
+        // Bankin racun se razresava u RSD (valuta listinga), NE u USD.
+        verify(bankaCoreClient).getBankTradingAccount("RSD");
+        verify(bankaCoreClient, never()).getBankTradingAccount("USD");
+        // Debit ide na RSD racun (id 77), iznos 5000 × 100 = 500000 RSD, valuta RSD.
+        verify(bankaCoreClient).debitFunds(
+                eq("option-exercise-1-4"),
+                eq(new DebitFundsRequest(77L, new BigDecimal("500000.0000"), BigDecimal.ZERO,
+                        "RSD", "Izvrsavanje CALL opcije RAIFRS260402C00005000")));
+    }
+
+    @Test
+    void exerciseOption_put_nonUsdListing_creditsBankAccountInListingCurrency() {
+        // P1-options-tax-1 (1546/1332): PUT analogno — credit ide na racun u valuti
+        // listinga (XETRA → EUR), ne na USD racun.
+        mockAuthorizedActuary("agent@test.com", 12L);
+
+        Option option = buildOptionOnExchange(
+                OptionType.PUT, "XETRA",
+                new BigDecimal("80.00"), new BigDecimal("100.00"), 3);
+
+        rs.raf.trading.portfolio.model.Portfolio portfolio = new rs.raf.trading.portfolio.model.Portfolio();
+        portfolio.setUserId(12L);
+        portfolio.setUserRole("EMPLOYEE");
+        portfolio.setListingId(55L);
+        portfolio.setQuantity(200);
+        portfolio.setAverageBuyPrice(new BigDecimal("90.00"));
+
+        when(optionRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(option));
+        when(bankaCoreClient.getBankTradingAccount("EUR"))
+                .thenReturn(bankAccountInCurrency("EUR", new BigDecimal("1000000.00")));
+        when(portfolioRepository.findByUserIdAndUserRole(12L, "EMPLOYEE"))
+                .thenReturn(List.of(portfolio));
+
+        optionService.exerciseOption(1L, "agent@test.com");
+
+        verify(bankaCoreClient).getBankTradingAccount("EUR");
+        verify(bankaCoreClient, never()).getBankTradingAccount("USD");
+        // strike 100 × contractSize 100 = 10000 EUR.
+        verify(bankaCoreClient).creditFunds(
+                eq("option-exercise-1-3"),
+                eq(new CreditFundsRequest(77L, new BigDecimal("10000.0000"), BigDecimal.ZERO,
+                        "EUR", "Izvrsavanje PUT opcije RAIFRS260402C00005000")));
+    }
+
+    // ── P1-options-tax-1: CALL cost-basis = strikePrice (1547/196) ───────────
+
+    @Test
+    void exerciseOption_callCostBasis_usesStrikePriceNotCurrentPrice() {
+        // P1-options-tax-1 (1547/196): nove akcije iz CALL exercise-a se upisuju u
+        // portfolio sa averageBuyPrice = STRIKE (180), NE currentPrice (210). Pre
+        // fix-a je cost-basis bio currentPrice → precenjen → kasniji SELL prikazuje
+        // lazno manji realizovani profit (porez potcenjen).
+        mockAuthorizedActuary("agent@test.com", 12L);
+
+        Option option = buildOption(
+                1L, OptionType.CALL,
+                new BigDecimal("210.00"), new BigDecimal("180.00"),
+                LocalDate.now().plusDays(5), 4);
+
+        when(optionRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(option));
+        when(bankaCoreClient.getBankTradingAccount("USD"))
+                .thenReturn(bankAccount(new BigDecimal("10000000.00")));
+        when(portfolioRepository.findByUserIdAndUserRole(12L, "EMPLOYEE"))
+                .thenReturn(java.util.Collections.emptyList());
+
+        org.mockito.ArgumentCaptor<rs.raf.trading.portfolio.model.Portfolio> captor =
+                org.mockito.ArgumentCaptor.forClass(rs.raf.trading.portfolio.model.Portfolio.class);
+
+        optionService.exerciseOption(1L, "agent@test.com");
+
+        verify(portfolioRepository).save(captor.capture());
+        rs.raf.trading.portfolio.model.Portfolio saved = captor.getValue();
+        // averageBuyPrice = strike 180.00, NE currentPrice 210.00.
+        assertThat(saved.getAverageBuyPrice()).isEqualByComparingTo(new BigDecimal("180.00"));
+        assertThat(saved.getQuantity()).isEqualTo(100);
+    }
+
+    @Test
+    void exerciseOption_callCostBasis_blendsStrikeIntoExistingPosition() {
+        // Postojeca pozicija (100 @ 100) + CALL exercise (100 @ strike 180) →
+        // novi avg = (100×100 + 100×180)/200 = 140, NE (100×100 + 100×210)/200 = 155
+        // (sto bi bilo da se koristi currentPrice 210).
+        mockAuthorizedActuary("agent@test.com", 12L);
+
+        Option option = buildOption(
+                1L, OptionType.CALL,
+                new BigDecimal("210.00"), new BigDecimal("180.00"),
+                LocalDate.now().plusDays(5), 4);
+
+        rs.raf.trading.portfolio.model.Portfolio existing = new rs.raf.trading.portfolio.model.Portfolio();
+        existing.setUserId(12L);
+        existing.setUserRole("EMPLOYEE");
+        existing.setListingId(55L);
+        existing.setQuantity(100);
+        existing.setAverageBuyPrice(new BigDecimal("100.00"));
+
+        when(optionRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(option));
+        when(bankaCoreClient.getBankTradingAccount("USD"))
+                .thenReturn(bankAccount(new BigDecimal("10000000.00")));
+        when(portfolioRepository.findByUserIdAndUserRole(12L, "EMPLOYEE"))
+                .thenReturn(List.of(existing));
+
+        optionService.exerciseOption(1L, "agent@test.com");
+
+        assertThat(existing.getQuantity()).isEqualTo(200);
+        assertThat(existing.getAverageBuyPrice()).isEqualByComparingTo(new BigDecimal("140.0000"));
     }
 }

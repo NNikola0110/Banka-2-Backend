@@ -12,7 +12,6 @@ import rs.raf.banka2_bek.account.model.AccountStatus;
 import rs.raf.banka2_bek.notification.model.NotificationType;
 import rs.raf.banka2_bek.notification.service.NotificationService;
 import rs.raf.banka2_bek.client.model.Client;
-import rs.raf.banka2_bek.exchange.dto.CalculateExchangeResponseDto;
 import rs.raf.banka2_bek.payment.model.PaymentStatus;
 import rs.raf.banka2_bek.transfers.model.Transfer;
 import rs.raf.banka2_bek.transfers.model.TransferType;
@@ -26,7 +25,6 @@ import rs.raf.banka2_bek.exchange.ExchangeService;
 import rs.raf.banka2_bek.audit.model.AuditActionType;
 import rs.raf.banka2_bek.audit.service.AuditLogService;
 import java.math.BigDecimal;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -93,30 +91,70 @@ public class TransferService {
     }
 
 
-    @Transactional
-    public TransferResponseDto internalTransfer(TransferInternalRequestDto request) {
-
-        // Pessimistic lock to prevent double-spending
-        Account fromAccount = accountRepository.findForUpdateByAccountNumber(request.getFromAccountNumber())
-                .orElseThrow(() -> new RuntimeException("From account not found"));
-
-        Account toAccount = accountRepository.findForUpdateByAccountNumber(request.getToAccountNumber())
-                .orElseThrow(() -> new RuntimeException("To account not found"));
-
-        if (request.getFromAccountNumber().equals(request.getToAccountNumber())) {
-            throw new RuntimeException("Accounts must be different");
+    /**
+     * P2-concurrency-locks-1 (R3-1581): zakljucava dva racuna pesimisticki u KANONSKOM
+     * redosledu (po account-number-u) i vraca ih u (from, to) orijentaciji da bi se
+     * izbegao ABBA DB deadlock (transfer A→B + paralelno B→A bi lock-ovao racune u
+     * suprotnim redosledima). Mirror-uje {@code InternalFundsService.transfer}
+     * (sort-po-kljucu pre lock-a). Same-account zahtev se odbija pre lock-a.
+     *
+     * @return niz {@code [fromAccount, toAccount]} — oba pesimisticki zakljucana.
+     */
+    private Account[] lockTwoAccountsCanonically(String fromAccountNumber, String toAccountNumber) {
+        if (fromAccountNumber.equals(toAccountNumber)) {
+            throw new IllegalArgumentException("Accounts must be different");
         }
+        String firstNum = fromAccountNumber.compareTo(toAccountNumber) <= 0 ? fromAccountNumber : toAccountNumber;
+        String secondNum = firstNum.equals(fromAccountNumber) ? toAccountNumber : fromAccountNumber;
+
+        Account first = accountRepository.findForUpdateByAccountNumber(firstNum)
+                .orElseThrow(() -> new jakarta.persistence.EntityNotFoundException(
+                        firstNum.equals(fromAccountNumber) ? "From account not found" : "To account not found"));
+        Account second = accountRepository.findForUpdateByAccountNumber(secondNum)
+                .orElseThrow(() -> new jakarta.persistence.EntityNotFoundException(
+                        secondNum.equals(fromAccountNumber) ? "From account not found" : "To account not found"));
+
+        Account fromAccount = first.getAccountNumber().equals(fromAccountNumber) ? first : second;
+        Account toAccount = first.getAccountNumber().equals(toAccountNumber) ? first : second;
+        return new Account[]{fromAccount, toAccount};
+    }
+
+    /**
+     * R1-651: zajednicki preambl koji su {@link #internalTransfer} i {@link #fxTransfer}
+     * imali duplirano (~18 linija svaki): pesimisticki lock dva racuna u kanonskom
+     * redosledu, provera da su oba ACTIVE, provera pristupa autentifikovanog klijenta
+     * i provera istog vlasnika (interni/FX transfer ide samo izmedju sopstvenih racuna).
+     *
+     * @return niz {@code [actor, fromAccount, toAccount]} — racuni pesimisticki zakljucani.
+     */
+    private Object[] lockAndAuthorizeTransfer(String fromAccountNumber, String toAccountNumber) {
+        Account[] locked = lockTwoAccountsCanonically(fromAccountNumber, toAccountNumber);
+        Account fromAccount = locked[0];
+        Account toAccount = locked[1];
 
         if (fromAccount.getStatus() != AccountStatus.ACTIVE) {
-            throw new RuntimeException("Source account is not active");
+            throw new IllegalArgumentException("Source account is not active");
         }
         if (toAccount.getStatus() != AccountStatus.ACTIVE) {
-            throw new RuntimeException("Destination account is not active");
+            throw new IllegalArgumentException("Destination account is not active");
         }
 
         Client actor = getAuthenticatedClient();
         ensureAccess(actor, fromAccount);
         ensureAccess(actor, toAccount);
+        ensureSameOwner(fromAccount, toAccount);
+        return new Object[]{actor, fromAccount, toAccount};
+    }
+
+    @Transactional
+    public TransferResponseDto internalTransfer(TransferInternalRequestDto request) {
+
+        // R1-651: lock (deadlock-free kanonski redosled) + ACTIVE + access + same-owner.
+        Object[] prepared = lockAndAuthorizeTransfer(
+                request.getFromAccountNumber(), request.getToAccountNumber());
+        Client actor = (Client) prepared[0];
+        Account fromAccount = (Account) prepared[1];
+        Account toAccount = (Account) prepared[2];
 
         // Auto-detect FX: ako su razlicite valute, preusmeri na FX transfer
         if (!fromAccount.getCurrency().getId().equals(toAccount.getCurrency().getId())) {
@@ -128,7 +166,7 @@ public class TransferService {
         }
 
         if (fromAccount.getAvailableBalance().compareTo(request.getAmount()) < 0) {
-            throw new RuntimeException("Insufficient funds");
+            throw new IllegalArgumentException("Insufficient funds");
         }
 
         fromAccount.setBalance(fromAccount.getBalance().subtract(request.getAmount()));
@@ -183,40 +221,26 @@ public class TransferService {
     @Transactional
     public TransferResponseDto fxTransfer(TransferFxRequestDto request) {
 
-        // Pessimistic lock on client accounts
-        Account fromAccount = accountRepository.findForUpdateByAccountNumber(request.getFromAccountNumber())
-                .orElseThrow(() -> new RuntimeException("From account not found"));
-
-        Account toAccount = accountRepository.findForUpdateByAccountNumber(request.getToAccountNumber())
-                .orElseThrow(() -> new RuntimeException("To account not found"));
-
-        if (request.getFromAccountNumber().equals(request.getToAccountNumber())) {
-            throw new RuntimeException("Accounts must be different");
-        }
-
-        if (fromAccount.getStatus() != AccountStatus.ACTIVE) {
-            throw new RuntimeException("Source account is not active");
-        }
-        if (toAccount.getStatus() != AccountStatus.ACTIVE) {
-            throw new RuntimeException("Destination account is not active");
-        }
-
-        Client actor = getAuthenticatedClient();
-        ensureAccess(actor, fromAccount);
-        ensureAccess(actor, toAccount);
+        // R1-651: lock (deadlock-free kanonski redosled, R3-1581) + ACTIVE + access + same-owner.
+        Object[] prepared = lockAndAuthorizeTransfer(
+                request.getFromAccountNumber(), request.getToAccountNumber());
+        Client actor = (Client) prepared[0];
+        Account fromAccount = (Account) prepared[1];
+        Account toAccount = (Account) prepared[2];
 
         if (fromAccount.getCurrency().getId().equals(toAccount.getCurrency().getId())) {
-            throw new RuntimeException("Accounts must have different currencies");
+            throw new IllegalArgumentException("Accounts must have different currencies");
         }
 
-        // Calculate commission: 0.5% of transfer amount
-        BigDecimal commissionRate = new BigDecimal("0.005");
+        // Calculate commission: 0.5% of transfer amount (R1-650: jedinstven izvor istine
+        // — ExchangeService.COMMISSION_RATE_BD; pre je 0.005 bilo duplirano kao goli literal).
+        BigDecimal commissionRate = ExchangeService.COMMISSION_RATE_BD;
         BigDecimal commissionAmount = request.getAmount().multiply(commissionRate).setScale(2, java.math.RoundingMode.HALF_UP);
         BigDecimal totalDebit = request.getAmount().add(commissionAmount);
 
         // Check client can pay amount + commission
         if (fromAccount.getAvailableBalance().compareTo(totalDebit) < 0) {
-            throw new RuntimeException("Nedovoljno sredstava. Potrebno: " + totalDebit + " " +
+            throw new IllegalArgumentException("Nedovoljno sredstava. Potrebno: " + totalDebit + " " +
                     fromAccount.getCurrency().getCode() + " (iznos + provizija 0.5%)");
         }
 
@@ -225,23 +249,24 @@ public class TransferService {
         String toCurrencyCode = toAccount.getCurrency().getCode();
 
         Account bankFromAccount = accountRepository.findBankAccountForUpdateByCurrency(bankRegistrationNumber, fromCurrencyCode)
-                .orElseThrow(() -> new RuntimeException("Bank account for " + fromCurrencyCode + " not found"));
+                .orElseThrow(() -> new jakarta.persistence.EntityNotFoundException("Bank account for " + fromCurrencyCode + " not found"));
         Account bankToAccount = accountRepository.findBankAccountForUpdateByCurrency(bankRegistrationNumber, toCurrencyCode)
-                .orElseThrow(() -> new RuntimeException("Bank account for " + toCurrencyCode + " not found"));
+                .orElseThrow(() -> new jakarta.persistence.EntityNotFoundException("Bank account for " + toCurrencyCode + " not found"));
 
+        // P0-B4: BigDecimal FX put — conservation-exact (nema double round-greske u knjizi).
         // Calculate exchange (includes 2% markup in rate)
-        CalculateExchangeResponseDto exchangeResult = exchangeService.calculateCross(
-                request.getAmount().doubleValue(),
+        ExchangeService.FxConversionResult exchangeResult = exchangeService.calculateCrossExact(
+                request.getAmount(),
                 fromCurrencyCode,
                 toCurrencyCode
         );
 
-        BigDecimal toAmount = BigDecimal.valueOf(exchangeResult.getConvertedAmount());
-        BigDecimal exchangeRate = BigDecimal.valueOf(exchangeResult.getExchangeRate());
+        BigDecimal toAmount = exchangeResult.convertedAmount();
+        BigDecimal exchangeRate = exchangeResult.exchangeRate();
 
         // Check bank has enough of the target currency
         if (bankToAccount.getAvailableBalance().compareTo(toAmount) < 0) {
-            throw new RuntimeException("Bank does not have enough " + toCurrencyCode + " reserves");
+            throw new IllegalArgumentException("Bank does not have enough " + toCurrencyCode + " reserves");
         }
 
         // 1. Client pays source currency + commission
@@ -308,37 +333,80 @@ public class TransferService {
     }
 
     public List<TransferResponseDto> getAllTransfers(Client client, String accountNumber, java.time.LocalDate fromDate, java.time.LocalDate toDate) {
-        List<Transfer> transfers = transferRepository.findByCreatedByOrderByCreatedAtDesc(client);
-
+        // R1-653 (perf): jedan fetch-join upit (filteri u WHERE) umesto ucitaj-sve +
+        // in-memory filter + N+1 lazy fetch. Blank accountNumber -> null (ignorise se).
+        String acc = (accountNumber != null && !accountNumber.isBlank()) ? accountNumber : null;
         java.time.LocalDateTime fromDateTime = fromDate != null ? fromDate.atStartOfDay() : null;
         java.time.LocalDateTime toDateTime = toDate != null ? toDate.atTime(23, 59, 59) : null;
 
-        List<TransferResponseDto> result = new ArrayList<>();
-        for (Transfer transfer : transfers) {
-            if (accountNumber != null && !accountNumber.isBlank()) {
-                String fromAcc = transfer.getFromAccount().getAccountNumber();
-                String toAcc = transfer.getToAccount().getAccountNumber();
-                if (!accountNumber.equals(fromAcc) && !accountNumber.equals(toAcc)) {
-                    continue;
-                }
-            }
-            if (fromDateTime != null && transfer.getCreatedAt().isBefore(fromDateTime)) continue;
-            if (toDateTime != null && transfer.getCreatedAt().isAfter(toDateTime)) continue;
-            result.add(mapToDto(transfer));
-        }
-        return result;
+        return transferRepository.findForClientWithFilters(client, acc, fromDateTime, toDateTime)
+                .stream()
+                .map(this::mapToDto)
+                .toList();
     }
 
     public TransferResponseDto getTransferById(Long id) {
         Transfer transfer = transferRepository.findById(id)
-                .orElseThrow(() -> new RuntimeException("Transfer not found"));
+                .orElseThrow(() -> new jakarta.persistence.EntityNotFoundException("Transfer not found"));
+        // P0-B9 N4 (IDOR): bez owner-check-a bilo koji autentifikovani klijent je
+        // mogao da procita TUDJI transfer (racuni, iznosi, valute, provizija)
+        // sekvencijalnim id-em. CLIENT sme samo transfer u kojem je strana
+        // (kreator ILI vlasnik from/to racuna); EMPLOYEE/ADMIN bilo koji; no-auth
+        // interni poziv (unit/scheduler) prolazi nepromenjen.
+        assertTransferAccessibleByCaller(transfer);
         return mapToDto(transfer);
+    }
+
+    /**
+     * P0-B9 N4 ownership guard: baca {@link org.springframework.security.access.AccessDeniedException}
+     * (-&gt; HTTP 403) ako je pozivalac CLIENT a nije strana u transferu. Zaposleni
+     * (ROLE_EMPLOYEE/ROLE_ADMIN/SUPERVISOR) i nezasticeni interni pozivi (bez auth
+     * konteksta — unit testovi/scheduleri) prolaze.
+     */
+    private void assertTransferAccessibleByCaller(Transfer transfer) {
+        if (isCallerEmployeeOrAdmin()) return;
+        Client client = currentClientOrNull();
+        if (client == null) return; // no-auth / interni — ne diramo
+        Long clientId = client.getId();
+        boolean isCreator = transfer.getCreatedBy() != null
+                && transfer.getCreatedBy().getId() != null
+                && transfer.getCreatedBy().getId().equals(clientId);
+        boolean ownsFrom = transfer.getFromAccount() != null
+                && transfer.getFromAccount().getClient() != null
+                && transfer.getFromAccount().getClient().getId().equals(clientId);
+        boolean ownsTo = transfer.getToAccount() != null
+                && transfer.getToAccount().getClient() != null
+                && transfer.getToAccount().getClient().getId().equals(clientId);
+        if (!isCreator && !ownsFrom && !ownsTo) {
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "Transfer ne pripada korisniku.");
+        }
+    }
+
+    private boolean isCallerEmployeeOrAdmin() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || auth.getAuthorities() == null) return false;
+        return auth.getAuthorities().stream().anyMatch(a -> {
+            String role = a.getAuthority();
+            return "ROLE_ADMIN".equals(role) || "ROLE_EMPLOYEE".equals(role)
+                    || "ADMIN".equals(role) || "EMPLOYEE".equals(role) || "SUPERVISOR".equals(role);
+        });
+    }
+
+    private Client currentClientOrNull() {
+        try {
+            Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+            if (auth == null || auth.getName() == null) return null;
+            return clientRepository.findByEmail(auth.getName()).orElse(null);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     // ---------- Helpers ----------
 
     private void ensureAccess(Client actor, Account account) {
-        if (actor == null) throw new RuntimeException("Authenticated client not found");
+        if (actor == null) throw new TransferAuthException("Authenticated client not found");
 
         if (account.getClient() != null && account.getClient().getId().equals(actor.getId())) {
             return;
@@ -348,19 +416,44 @@ public class TransferService {
                     .anyMatch(ap -> ap.getClient() != null && ap.getClient().getId().equals(actor.getId()));
             if (authorized) return;
         }
-        throw new RuntimeException("You do not have access to the specified account");
+        throw new org.springframework.security.access.AccessDeniedException("You do not have access to the specified account");
+    }
+
+    /**
+     * P1-authz-idor-1 (R2 1371): interni transfer je SAMO izmedju racuna istog
+     * vlasnika (Sc17 — premestanje sopstvenih sredstava bez provizije/limita).
+     * Bez ove provere {@code ensureAccess} pojedinacno dozvoljava i ovlascenom
+     * licu firme da "internim" transferom (bez provizije/limita) prebaci firmin
+     * novac sa firminog racuna na svoj licni racun — zaobilazi placanje (koje
+     * ima proviziju + dnevni limit). Tu deli istog vlasnika racuni moraju imati:
+     * isti {@code client} ILI istu {@code company}.
+     */
+    private void ensureSameOwner(Account fromAccount, Account toAccount) {
+        Long fromClientId = fromAccount.getClient() != null ? fromAccount.getClient().getId() : null;
+        Long toClientId = toAccount.getClient() != null ? toAccount.getClient().getId() : null;
+        if (fromClientId != null && fromClientId.equals(toClientId)) {
+            return;
+        }
+        Long fromCompanyId = fromAccount.getCompany() != null ? fromAccount.getCompany().getId() : null;
+        Long toCompanyId = toAccount.getCompany() != null ? toAccount.getCompany().getId() : null;
+        if (fromCompanyId != null && fromCompanyId.equals(toCompanyId)) {
+            return;
+        }
+        throw new org.springframework.security.access.AccessDeniedException(
+                "Interni transfer je dozvoljen samo izmedju racuna istog vlasnika. "
+                        + "Za prenos na tudji racun koristite placanje.");
     }
 
     private Client getAuthenticatedClient() {
         String email = getAuthenticatedEmail();
         return clientRepository.findByEmail(email).orElseThrow(() ->
-                new RuntimeException("Client not found for authenticated user"));
+                new TransferAuthException("Client not found for authenticated user"));
     }
 
     private String getAuthenticatedEmail() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
         if (auth == null || !auth.isAuthenticated()) {
-            throw new RuntimeException("User is not authenticated");
+            throw new TransferAuthException("User is not authenticated");
         }
         Object principal = auth.getPrincipal();
         if (principal instanceof UserDetails userDetails) {
@@ -369,6 +462,6 @@ public class TransferService {
         if (principal instanceof String s) {
             return s;
         }
-        throw new RuntimeException("Unable to resolve user email");
+        throw new TransferAuthException("Unable to resolve user email");
     }
 }

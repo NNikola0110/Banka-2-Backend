@@ -58,7 +58,7 @@ class LoanServiceImplExtendedTest {
     @Mock private NotificationService notificationService;
     @Mock private rs.raf.banka2_bek.audit.service.AuditLogService auditLogService;
     @Mock private rs.raf.banka2_bek.employee.repository.EmployeeRepository employeeRepository;
-    @Mock private rs.raf.banka2_bek.otp.service.OtpService otpService;
+    @Mock private rs.raf.banka2_bek.exchange.CurrencyConversionService currencyConversionService;
 
     private LoanServiceImpl loanService;
 
@@ -73,13 +73,7 @@ class LoanServiceImplExtendedTest {
                 loanRequestRepository, loanRepository, installmentRepository,
                 accountRepository, clientRepository, currencyRepository,
                 notificationPublisher, "22200022", notificationService,
-                auditLogService, employeeRepository, otpService);
-
-        // BE-PAY-06: default OTP verify -> ok.
-        org.mockito.Mockito.lenient().when(otpService.verify(
-                        org.mockito.ArgumentMatchers.anyString(),
-                        org.mockito.ArgumentMatchers.anyString()))
-                .thenReturn(java.util.Map.of("verified", true));
+                auditLogService, employeeRepository, currencyConversionService);
 
         rsd = new Currency();
         rsd.setId(8L);
@@ -125,7 +119,9 @@ class LoanServiceImplExtendedTest {
             dto.setAmount(BigDecimal.valueOf(200000));
             dto.setCurrency("RSD");
             dto.setLoanPurpose("Test " + loanType);
-            dto.setRepaymentPeriod(12);
+            // [P2-input-validation-1 / R1 344] period mora pripadati dozvoljenom
+            // skupu po tipu: MORTGAGE 60..360, ostali 12..84.
+            dto.setRepaymentPeriod(loanType == LoanType.MORTGAGE ? 60 : 12);
             dto.setAccountNumber("222000112345678911");
 
             when(clientRepository.findByEmail("stefan@test.com")).thenReturn(Optional.of(client));
@@ -153,7 +149,8 @@ class LoanServiceImplExtendedTest {
             dto.setInterestType("VARIABLE");
             dto.setAmount(BigDecimal.valueOf(50000));
             dto.setCurrency("RSD");
-            dto.setRepaymentPeriod(6);
+            // [P2-input-validation-1 / R1 344] 12 je validan period za CASH (6 nije).
+            dto.setRepaymentPeriod(12);
             dto.setAccountNumber("222000112345678911");
 
             when(clientRepository.findByEmail("stefan@test.com")).thenReturn(Optional.of(client));
@@ -250,6 +247,50 @@ class LoanServiceImplExtendedTest {
             assertThatThrownBy(() -> loanService.createLoanRequest(dto, "stefan@test.com"))
                     .isInstanceOf(RuntimeException.class)
                     .hasMessageContaining("Valuta nije podrzana");
+        }
+
+        // ── [P2-input-validation-1 / R1 344] period otplate po tipu kredita ──
+
+        @Test
+        @DisplayName("throws for repaymentPeriod not in allowed set for CASH (e.g. 13)")
+        void invalidRepaymentPeriodForCash() {
+            LoanRequestDto dto = new LoanRequestDto();
+            dto.setOtpCode("123456");
+            dto.setLoanType("CASH");
+            dto.setInterestType("FIXED");
+            dto.setAmount(BigDecimal.valueOf(50000));
+            dto.setCurrency("RSD");
+            dto.setRepaymentPeriod(13); // nije u {12,24,36,48,60,72,84}
+            dto.setAccountNumber("222000112345678911");
+
+            when(clientRepository.findByEmail("stefan@test.com")).thenReturn(Optional.of(client));
+            when(accountRepository.findByAccountNumber("222000112345678911")).thenReturn(Optional.of(account));
+            when(currencyRepository.findByCode("RSD")).thenReturn(Optional.of(rsd));
+
+            assertThatThrownBy(() -> loanService.createLoanRequest(dto, "stefan@test.com"))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("Rok otplate");
+        }
+
+        @Test
+        @DisplayName("throws for mortgage with non-mortgage period (e.g. 12)")
+        void invalidRepaymentPeriodForMortgage() {
+            LoanRequestDto dto = new LoanRequestDto();
+            dto.setOtpCode("123456");
+            dto.setLoanType("MORTGAGE");
+            dto.setInterestType("FIXED");
+            dto.setAmount(BigDecimal.valueOf(5000000));
+            dto.setCurrency("RSD");
+            dto.setRepaymentPeriod(12); // mortgage dozvoljava 60..360
+            dto.setAccountNumber("222000112345678911");
+
+            when(clientRepository.findByEmail("stefan@test.com")).thenReturn(Optional.of(client));
+            when(accountRepository.findByAccountNumber("222000112345678911")).thenReturn(Optional.of(account));
+            when(currencyRepository.findByCode("RSD")).thenReturn(Optional.of(rsd));
+
+            assertThatThrownBy(() -> loanService.createLoanRequest(dto, "stefan@test.com"))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("MORTGAGE");
         }
     }
 
@@ -706,7 +747,7 @@ class LoanServiceImplExtendedTest {
             when(installmentRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
             when(loanRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-            LoanResponseDto result = loanService.earlyRepayment(1L, "stefan@test.com", "123456");
+            LoanResponseDto result = loanService.earlyRepayment(1L, "stefan@test.com");
             assertThat(result.getStatus()).isEqualTo("PAID_OFF");
             assertThat(result.getRemainingDebt()).isEqualByComparingTo(BigDecimal.ZERO);
         }
@@ -715,7 +756,7 @@ class LoanServiceImplExtendedTest {
         @DisplayName("throws when loan not found")
         void loanNotFound() {
             when(loanRepository.findById(999L)).thenReturn(Optional.empty());
-            assertThatThrownBy(() -> loanService.earlyRepayment(999L, "stefan@test.com", "123456"))
+            assertThatThrownBy(() -> loanService.earlyRepayment(999L, "stefan@test.com"))
                     .isInstanceOf(RuntimeException.class);
         }
 
@@ -725,7 +766,7 @@ class LoanServiceImplExtendedTest {
             Loan loan = Loan.builder().id(1L).status(LoanStatus.PENDING).build();
             when(loanRepository.findById(1L)).thenReturn(Optional.of(loan));
 
-            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com", "123456"))
+            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com"))
                     .isInstanceOf(RuntimeException.class)
                     .hasMessageContaining("nije aktivan");
         }
@@ -736,7 +777,7 @@ class LoanServiceImplExtendedTest {
             Loan loan = Loan.builder().id(1L).status(LoanStatus.PAID_OFF).build();
             when(loanRepository.findById(1L)).thenReturn(Optional.of(loan));
 
-            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com", "123456"))
+            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com"))
                     .isInstanceOf(RuntimeException.class)
                     .hasMessageContaining("vec otplacen");
         }
@@ -757,7 +798,7 @@ class LoanServiceImplExtendedTest {
             when(loanRepository.findById(1L)).thenReturn(Optional.of(loan));
             when(clientRepository.findByEmail("stefan@test.com")).thenReturn(Optional.of(client));
 
-            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com", "123456"))
+            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com"))
                     .isInstanceOf(RuntimeException.class)
                     .hasMessageContaining("ne pripada");
         }
@@ -786,7 +827,7 @@ class LoanServiceImplExtendedTest {
             when(installmentRepository.findByLoanIdOrderByExpectedDueDateAsc(1L)).thenReturn(List.of(inst));
             when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
 
-            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com", "123456"))
+            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com"))
                     .isInstanceOf(RuntimeException.class)
                     .hasMessageContaining("Nedovoljno sredstava");
         }
@@ -797,7 +838,7 @@ class LoanServiceImplExtendedTest {
             Loan loan = Loan.builder().id(1L).status(LoanStatus.REJECTED).build();
             when(loanRepository.findById(1L)).thenReturn(Optional.of(loan));
 
-            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com", "123456"))
+            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com"))
                     .isInstanceOf(RuntimeException.class)
                     .hasMessageContaining("nije aktivan");
         }
@@ -808,7 +849,7 @@ class LoanServiceImplExtendedTest {
             Loan loan = Loan.builder().id(1L).status(LoanStatus.PAID).build();
             when(loanRepository.findById(1L)).thenReturn(Optional.of(loan));
 
-            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com", "123456"))
+            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com"))
                     .isInstanceOf(RuntimeException.class)
                     .hasMessageContaining("vec otplacen");
         }
@@ -836,7 +877,7 @@ class LoanServiceImplExtendedTest {
             when(installmentRepository.findByLoanIdOrderByExpectedDueDateAsc(1L)).thenReturn(List.of(paidInst));
             when(loanRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-            LoanResponseDto result = loanService.earlyRepayment(1L, "stefan@test.com", "123456");
+            LoanResponseDto result = loanService.earlyRepayment(1L, "stefan@test.com");
             assertThat(result.getStatus()).isEqualTo("PAID_OFF");
         }
 
@@ -872,7 +913,7 @@ class LoanServiceImplExtendedTest {
             when(installmentRepository.findByLoanIdOrderByExpectedDueDateAsc(1L)).thenReturn(List.of(inst));
             when(accountRepository.findForUpdateById(2L)).thenReturn(Optional.of(eurAccount));
 
-            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com", "123456"))
+            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com"))
                     .isInstanceOf(RuntimeException.class)
                     .hasMessageContaining("Valuta racuna i kredita se razlikuju");
         }
@@ -900,7 +941,7 @@ class LoanServiceImplExtendedTest {
             when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.empty());
 
-            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com", "123456"))
+            assertThatThrownBy(() -> loanService.earlyRepayment(1L, "stefan@test.com"))
                     .isInstanceOf(RuntimeException.class)
                     .hasMessageContaining("Bankovski racun");
         }
@@ -931,7 +972,7 @@ class LoanServiceImplExtendedTest {
             when(installmentRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
             when(loanRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-            LoanResponseDto result = loanService.earlyRepayment(1L, "stefan@test.com", "123456");
+            LoanResponseDto result = loanService.earlyRepayment(1L, "stefan@test.com");
             assertThat(result.getStatus()).isEqualTo("PAID_OFF");
         }
     }

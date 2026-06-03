@@ -29,4 +29,24 @@ public interface EmployeeAuthService {
      * jer ga zove neaktivirani zaposleni preko email linka.
      */
     ActivationTokenStatusDto getTokenStatus(String tokenValue);
+
+    /**
+     * Spec Celina 1 Sc 9: kad je aktivacioni token zaposlenog istekao, sistem
+     * "omogucava slanje novog aktivacionog linka". Na osnovu starog (najcesce
+     * isteklog) aktivacionog tokena pronadje zaposlenog i, ako jos nije aktivan,
+     * invalidira sve njegove aktivne tokene, generise svez token (isti TTL kao
+     * pri kreiranju naloga — 24h) i salje nov aktivacioni email.
+     *
+     * <p>Anti-enumeration (mirror {@code AuthService.requestPasswordReset}):
+     * metoda NIKAD ne baca izuzetak i ne otkriva da li token/zaposleni postoji
+     * niti da li je nalog vec aktivan. Ako token ne postoji ili je nalog vec
+     * aktivan — tiho se vraca bez ikakve izmene. Caller (controller) uvek vraca
+     * istu generic poruku.
+     *
+     * <p>Idempotentno: ponovni poziv samo invalidira prethodno generisani token
+     * i salje jos jedan svez link.
+     *
+     * @param tokenValue stari/istekli aktivacioni token (identifikuje zaposlenog)
+     */
+    void resendActivation(String tokenValue);
 }

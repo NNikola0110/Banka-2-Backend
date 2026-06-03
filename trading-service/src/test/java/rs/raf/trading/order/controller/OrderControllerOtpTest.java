@@ -11,34 +11,31 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
-import rs.raf.banka2.contracts.internal.InternalOtpVerifyResponse;
-import rs.raf.trading.client.BankaCoreClient;
 import rs.raf.trading.order.dto.CreateOrderDto;
 import rs.raf.trading.order.dto.OrderDto;
 import rs.raf.trading.order.service.OrderService;
 
 import java.util.Collections;
-import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 /**
- * Unit testovi za OTP integraciju u {@link OrderController#createOrder} —
- * adaptacija monolitnog testa (faza 2c). Monolit je verifikovao OTP preko
- * lokalnog {@code OtpService}; trading-service ide preko banka-core internog
- * seam-a ({@link BankaCoreClient#verifyOtp} -> {@link InternalOtpVerifyResponse}).
+ * Unit testovi za {@link OrderController#createOrder} bez OTP gate-a.
+ *
+ * <p><b>ACCEPTED-DEVIATION (user-directed 03.06):</b> OTP/verifikacioni kod je
+ * UKLONJEN sa kreiranja ordera (berza/trading) — OTP ostaje ISKLJUCIVO na
+ * money-out flow-ovima (placanja + transferi). Raniji testovi ovde su asertovali
+ * "OTP required → 403 na missing/invalid code" preko {@code BankaCoreClient.verifyOtp};
+ * sada asertuju da kreiranje ordera USPEVA BEZ koda i da kontroler vise NE radi
+ * nikakvu OTP verifikaciju (nema {@code BankaCoreClient} dependency-ja).
  */
 @ExtendWith(MockitoExtension.class)
 class OrderControllerOtpTest {
 
     @Mock
     private OrderService orderService;
-
-    @Mock
-    private BankaCoreClient bankaCoreClient;
 
     @InjectMocks
     private OrderController orderController;
@@ -60,49 +57,15 @@ class OrderControllerOtpTest {
         dto.setContractSize(1);
         dto.setDirection("BUY");
         dto.setAccountId(10L);
-        dto.setOtpCode("123456");
         return dto;
     }
 
     @Test
-    void createOrder_withInvalidOtp_returns403() {
+    void createOrder_withoutOtpCode_succeeds_noVerification() {
+        // ACCEPTED-DEVIATION (03.06): nema OTP koda → nalog se kreira direktno.
         CreateOrderDto dto = validDto();
-        when(bankaCoreClient.verifyOtp(eq(EMAIL), eq("123456")))
-                .thenReturn(new InternalOtpVerifyResponse(false, false));
-
-        ResponseEntity<?> response = orderController.createOrder(dto);
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(response.getBody()).isInstanceOf(Map.class);
-        @SuppressWarnings("unchecked")
-        Map<String, Object> body = (Map<String, Object>) response.getBody();
-        assertThat(body.get("verified")).isEqualTo(false);
-        assertThat(body.get("error")).isEqualTo("Verifikacija neuspesna");
-        verify(orderService, never()).createOrder(any());
-    }
-
-    @Test
-    void createOrder_withBlockedOtp_returns403_withBlockedMessage() {
-        CreateOrderDto dto = validDto();
-        when(bankaCoreClient.verifyOtp(eq(EMAIL), eq("123456")))
-                .thenReturn(new InternalOtpVerifyResponse(false, true));
-
-        ResponseEntity<?> response = orderController.createOrder(dto);
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
-        @SuppressWarnings("unchecked")
-        Map<String, Object> body = (Map<String, Object>) response.getBody();
-        assertThat(body.get("blocked")).isEqualTo(true);
-        assertThat((String) body.get("message")).contains("blokirana");
-        verify(orderService, never()).createOrder(any());
-    }
-
-    @Test
-    void createOrder_withValidOtp_callsService_returns200() {
-        CreateOrderDto dto = validDto();
+        // NE postavljamo otpCode — OTP gate vise ne postoji.
         OrderDto created = new OrderDto();
-        when(bankaCoreClient.verifyOtp(eq(EMAIL), eq("123456")))
-                .thenReturn(new InternalOtpVerifyResponse(true, false));
         when(orderService.createOrder(any(CreateOrderDto.class))).thenReturn(created);
 
         ResponseEntity<?> response = orderController.createOrder(dto);
@@ -110,20 +73,34 @@ class OrderControllerOtpTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).isSameAs(created);
         verify(orderService, times(1)).createOrder(dto);
-        verify(bankaCoreClient, times(1)).verifyOtp(EMAIL, "123456");
     }
 
     @Test
-    void createOrder_withMissingOtp_returns403AndDoesNotCallService() {
+    void createOrder_withOtpCodePresent_isIgnored_andSucceeds() {
+        // Back-compat: FE sme da posalje otpCode, BE ga ignorise — i dalje uspeh.
         CreateOrderDto dto = validDto();
-        dto.setOtpCode("");
-        when(bankaCoreClient.verifyOtp(eq(EMAIL), eq("")))
-                .thenReturn(new InternalOtpVerifyResponse(false, false));
+        dto.setOtpCode("123456");
+        OrderDto created = new OrderDto();
+        when(orderService.createOrder(any(CreateOrderDto.class))).thenReturn(created);
 
         ResponseEntity<?> response = orderController.createOrder(dto);
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
-        verify(orderService, never()).createOrder(any());
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isSameAs(created);
+        verify(orderService, times(1)).createOrder(dto);
+    }
+
+    @Test
+    void createOrder_callsServiceDirectly_noOtpRoundTrip() {
+        // Pin invariant: kontroler poziva orderService.createOrder direktno,
+        // bez ikakvog OTP round-trip-a (nema vise BankaCoreClient dependency-ja).
+        CreateOrderDto dto = validDto();
+        when(orderService.createOrder(any(CreateOrderDto.class))).thenReturn(new OrderDto());
+
+        orderController.createOrder(dto);
+
+        verify(orderService, times(1)).createOrder(dto);
+        verifyNoMoreInteractions(orderService);
     }
 
     @Test
@@ -134,7 +111,6 @@ class OrderControllerOtpTest {
         ResponseEntity<?> response = orderController.createOrder(dto);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
-        verifyNoInteractions(bankaCoreClient);
         verifyNoInteractions(orderService);
     }
 }

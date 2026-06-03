@@ -4,6 +4,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ControllerAdvice;
 import org.springframework.web.bind.annotation.ExceptionHandler;
+import rs.raf.banka2_bek.assistant.agentic.service.AgentActionGateway.AgenticActionForbiddenException;
 import rs.raf.banka2_bek.assistant.agentic.service.AgentActionGateway.AgenticDisabledException;
 import rs.raf.banka2_bek.assistant.agentic.service.AgentActionGateway.AgenticRateLimitedException;
 
@@ -30,6 +31,17 @@ public class AgentActionExceptionHandler {
                 .body(Map.of(
                         "error", "AGENTIC_DISABLED",
                         "message", ex.getMessage() == null ? "Agentic mode nije aktivan" : ex.getMessage()
+                ));
+    }
+
+    @ExceptionHandler(AgenticActionForbiddenException.class)
+    public ResponseEntity<Map<String, Object>> handleForbidden(AgenticActionForbiddenException ex) {
+        return ResponseEntity
+                .status(HttpStatus.FORBIDDEN)
+                .body(Map.of(
+                        "error", "AGENTIC_ACTION_FORBIDDEN",
+                        "message", ex.getMessage() == null
+                                ? "Akcija nije dozvoljena za vasu ulogu." : ex.getMessage()
                 ));
     }
 

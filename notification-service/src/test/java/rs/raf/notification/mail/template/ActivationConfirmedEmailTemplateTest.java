@@ -43,4 +43,19 @@ class ActivationConfirmedEmailTemplateTest {
         String body = template.buildBody("   ");
         assertThat(body).contains("Zdravo");
     }
+
+    // ── [P2-input-validation-1 / R1 385] HTML injection u firstName ──────────
+
+    @Test
+    void buildBody_escapesHtmlInFirstName() {
+        String body = template.buildBody("<img src=x onerror=alert(1)>");
+        assertThat(body).doesNotContain("<img src=x");
+        assertThat(body).contains("&lt;img");
+    }
+
+    @Test
+    void buildBody_preservesSerbianLatinInFirstName() {
+        String body = template.buildBody("Đorđe čćšžđ");
+        assertThat(body).contains("Đorđe čćšžđ");
+    }
 }

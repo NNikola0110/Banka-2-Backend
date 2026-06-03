@@ -1,6 +1,7 @@
 package rs.raf.banka2_bek.interbank.model;
 
 import jakarta.persistence.*;
+import jakarta.validation.constraints.AssertTrue;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -88,7 +89,20 @@ public class InterbankOtcContract {
     @Column(nullable = false, length = 16)
     private String ticker;
 
-    /** Broj akcija (integer > 0 po protokolu §2.7.2). */
+    /**
+     * Broj akcija (integer &gt; 0 po protokolu §2.7.2).
+     *
+     * <p>R4-1773: tip ostaje {@link BigDecimal} (ne menjamo na Integer/Long) jer
+     * se {@code quantity} mnozi sa {@code strikePrice} u novcanoj matematici
+     * ({@code InterbankOtcWrapperService}/{@code TransactionExecutorService}),
+     * poredi sa {@code SharePosition.amount()} (BigDecimal) i set-uje iz
+     * {@code InterbankOtcNegotiation.getAmount()} (BigDecimal) — promena tipa bi
+     * iznudila refaktor svih tih call-site-ova. Umesto toga, integer-invarijanta
+     * (ceo broj akcija) se enforce-uje bean-validacijom {@link #isQuantityWholeShares()}
+     * na svakom persist/merge, paralelno sa postojecim {@code validateIntegerAmount}
+     * guard-om na inbound wrapper putu. Scale ostaje 4 radi kompatibilnosti sa
+     * postojecom kolonom {@code interbank_otc_negotiations.amount}.
+     */
     @Column(nullable = false, precision = 19, scale = 4)
     private BigDecimal quantity;
 
@@ -129,5 +143,22 @@ public class InterbankOtcContract {
     void onCreate() {
         if (createdAt == null) createdAt = LocalDateTime.now();
         if (status == null) status = InterbankOtcContractStatus.ACTIVE;
+    }
+
+    /**
+     * R4-1773: {@code quantity} mora biti ceo, pozitivan broj akcija (§2.7.2).
+     * Validira se na svakom persist/merge (bean-validation kroz Hibernate
+     * {@code ddl.auto}/integration listener), nezavisno od putanje kreiranja —
+     * dopuna postojecem {@code validateIntegerAmount} guard-u koji je pokrivao
+     * samo inbound wrapper put. Null prolazi (NotNull kolona ce ga uhvatiti
+     * zasebno) da ne bismo udvostrucili poruke.
+     */
+    @AssertTrue(message = "Broj akcija (quantity) mora biti ceo broj > 0 (protokol §2.7.2).")
+    @Transient
+    public boolean isQuantityWholeShares() {
+        if (quantity == null) {
+            return true;
+        }
+        return quantity.signum() > 0 && quantity.stripTrailingZeros().scale() <= 0;
     }
 }

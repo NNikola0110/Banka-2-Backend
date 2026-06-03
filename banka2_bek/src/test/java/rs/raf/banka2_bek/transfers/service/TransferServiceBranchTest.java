@@ -20,7 +20,6 @@ import rs.raf.banka2_bek.company.model.AuthorizedPerson;
 import rs.raf.banka2_bek.company.model.Company;
 import rs.raf.banka2_bek.currency.model.Currency;
 import rs.raf.banka2_bek.exchange.ExchangeService;
-import rs.raf.banka2_bek.exchange.dto.CalculateExchangeResponseDto;
 import rs.raf.banka2_bek.payment.model.PaymentStatus;
 import rs.raf.banka2_bek.transfers.dto.TransferFxRequestDto;
 import rs.raf.banka2_bek.transfers.dto.TransferInternalRequestDto;
@@ -198,8 +197,8 @@ class TransferServiceBranchTest {
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD"))
                     .thenReturn(Optional.of(bankUsd));
             // 1000 EUR -> 1085 USD at rate 1.085
-            when(exchangeService.calculateCross(1000.0, "EUR", "USD"))
-                    .thenReturn(new CalculateExchangeResponseDto(1085.0, 1.085, "EUR", "USD"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("1000"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("1085.00"), new BigDecimal("1.085")));
             when(transferRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
             TransferFxRequestDto request = new TransferFxRequestDto();
@@ -239,8 +238,8 @@ class TransferServiceBranchTest {
                     .thenReturn(Optional.of(bankEur));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD"))
                     .thenReturn(Optional.of(bankUsd));
-            when(exchangeService.calculateCross(333.0, "EUR", "USD"))
-                    .thenReturn(new CalculateExchangeResponseDto(361.3, 1.085, "EUR", "USD"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("333"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("361.30"), new BigDecimal("1.085")));
             when(transferRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
             TransferFxRequestDto request = new TransferFxRequestDto();
@@ -279,8 +278,8 @@ class TransferServiceBranchTest {
                     .thenReturn(Optional.of(bankEur));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD"))
                     .thenReturn(Optional.of(bankUsd));
-            when(exchangeService.calculateCross(2000.0, "EUR", "USD"))
-                    .thenReturn(new CalculateExchangeResponseDto(2170.0, 1.085, "EUR", "USD"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("2000"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("2170.00"), new BigDecimal("1.085")));
             when(transferRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
             TransferInternalRequestDto request = new TransferInternalRequestDto();
@@ -291,7 +290,7 @@ class TransferServiceBranchTest {
             TransferResponseDto response = transferService.internalTransfer(request);
 
             // Verify exchange service was called (FX path used)
-            verify(exchangeService).calculateCross(2000.0, "EUR", "USD");
+            verify(exchangeService).calculateCrossExact(new BigDecimal("2000"), "EUR", "USD");
             assertThat(response.getStatus()).isEqualTo(PaymentStatus.COMPLETED);
             // Commission should be present (FX path)
             assertThat(response.getCommission()).isEqualByComparingTo("10.00");
@@ -314,7 +313,7 @@ class TransferServiceBranchTest {
             TransferResponseDto response = transferService.internalTransfer(request);
 
             // Exchange service should NOT be called
-            verify(exchangeService, never()).calculateCross(anyDouble(), anyString(), anyString());
+            verify(exchangeService, never()).calculateCrossExact(any(), anyString(), anyString());
             assertThat(response.getCommission()).isEqualByComparingTo("0");
         }
     }
@@ -364,8 +363,8 @@ class TransferServiceBranchTest {
                     .thenReturn(Optional.of(bankEur));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD"))
                     .thenReturn(Optional.of(bankUsd));
-            when(exchangeService.calculateCross(1000.0, "EUR", "USD"))
-                    .thenReturn(new CalculateExchangeResponseDto(1085.0, 1.085, "EUR", "USD"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("1000"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("1085.00"), new BigDecimal("1.085")));
             when(transferRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
             TransferFxRequestDto request = new TransferFxRequestDto();
@@ -410,8 +409,8 @@ class TransferServiceBranchTest {
                     .thenReturn(Optional.of(bankEur));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD"))
                     .thenReturn(Optional.of(bankUsd));
-            when(exchangeService.calculateCross(5000.0, "EUR", "USD"))
-                    .thenReturn(new CalculateExchangeResponseDto(5425.0, 1.085, "EUR", "USD"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("5000"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("5425.00"), new BigDecimal("1.085")));
 
             TransferFxRequestDto request = new TransferFxRequestDto();
             request.setFromAccountNumber("333333333333333333");
@@ -442,8 +441,8 @@ class TransferServiceBranchTest {
                     .thenReturn(Optional.of(bankEur));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "USD"))
                     .thenReturn(Optional.of(bankUsd));
-            when(exchangeService.calculateCross(1000.0, "EUR", "USD"))
-                    .thenReturn(new CalculateExchangeResponseDto(1085.0, 1.085, "EUR", "USD"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("1000"), "EUR", "USD"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("1085.00"), new BigDecimal("1.085")));
 
             TransferFxRequestDto request = new TransferFxRequestDto();
             request.setFromAccountNumber("333333333333333333");
@@ -465,9 +464,8 @@ class TransferServiceBranchTest {
         @Test
         @DisplayName("internalTransfer rejects same source and destination")
         void sameAccountInternal() {
-            when(accountRepository.findForUpdateByAccountNumber("111111111111111111"))
-                    .thenReturn(Optional.of(fromAccountRsd));
-
+            // P2-concurrency-locks-1 (R3-1581): same-account zahtev se odbija PRE lock-a
+            // (u lockTwoAccountsCanonically) → nema findForUpdate stub-a.
             TransferInternalRequestDto request = new TransferInternalRequestDto();
             request.setFromAccountNumber("111111111111111111");
             request.setToAccountNumber("111111111111111111");
@@ -481,9 +479,7 @@ class TransferServiceBranchTest {
         @Test
         @DisplayName("fxTransfer rejects same source and destination")
         void sameAccountFx() {
-            when(accountRepository.findForUpdateByAccountNumber("111111111111111111"))
-                    .thenReturn(Optional.of(fromAccountRsd));
-
+            // P2-concurrency-locks-1 (R3-1581): same-account zahtev se odbija PRE lock-a.
             TransferFxRequestDto request = new TransferFxRequestDto();
             request.setFromAccountNumber("111111111111111111");
             request.setToAccountNumber("111111111111111111");

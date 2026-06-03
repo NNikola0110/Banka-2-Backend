@@ -15,6 +15,7 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import rs.raf.banka2_bek.interbank.config.InterbankProperties;
 import rs.raf.banka2_bek.interbank.exception.InterbankExceptionHandler;
 import rs.raf.banka2_bek.interbank.exception.InterbankExceptions;
+import rs.raf.banka2_bek.interbank.model.InterbankMessage;
 import rs.raf.banka2_bek.interbank.protocol.*;
 import rs.raf.banka2_bek.interbank.service.InterbankMessageService;
 import rs.raf.banka2_bek.interbank.service.TransactionExecutorService;
@@ -39,6 +40,8 @@ class InterbankInboundControllerTest {
     private InterbankMessageService messageService;
     @Mock
     private TransactionExecutorService executorService;
+    @Mock
+    private rs.raf.banka2_bek.monitoring.BusinessMetrics businessMetrics;
 
     private MockMvc mockMvc;
     private ObjectMapper objectMapper;
@@ -53,7 +56,7 @@ class InterbankInboundControllerTest {
                 .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
         InterbankInboundController controller =
-                new InterbankInboundController(properties, objectMapper, messageService, executorService);
+                new InterbankInboundController(properties, objectMapper, messageService, executorService, businessMetrics);
 
         mockMvc = MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new InterbankExceptionHandler())
@@ -143,7 +146,7 @@ class InterbankInboundControllerTest {
     @Test
     @DisplayName("POST /interbank returns 500 when executor throws unexpected exception")
     void receiveMessage_executorThrows_returns500() throws Exception {
-        when(messageService.findCachedResponse(any())).thenReturn(Optional.empty());
+        when(messageService.findCachedMessage(any())).thenReturn(Optional.empty());
         when(executorService.handleNewTx(any(Transaction.class), any(IdempotenceKey.class)))
                 .thenThrow(new RuntimeException("unexpected error"));
 
@@ -163,7 +166,10 @@ class InterbankInboundControllerTest {
     @Test
     @DisplayName("Cache hit with response body returns 200 with cached body")
     void receiveMessage_cacheHitWithBody_returns200() throws Exception {
-        when(messageService.findCachedResponse(any())).thenReturn(Optional.of("{\"vote\":\"YES\"}"));
+        // 1377: kesirana poruka mora biti istog tipa kao dolazeca (NEW_TX) da bi se
+        // vratio kesiran odgovor.
+        when(messageService.findCachedMessage(any()))
+                .thenReturn(Optional.of(cachedMessage(MessageType.NEW_TX, "{\"vote\":\"YES\"}")));
 
         mockMvc.perform(post("/interbank")
                         .header("X-Api-Key", VALID_INBOUND_TOKEN)
@@ -177,7 +183,8 @@ class InterbankInboundControllerTest {
     @Test
     @DisplayName("Cache hit with blank body returns 204")
     void receiveMessage_cacheHitBlankBody_returns204() throws Exception {
-        when(messageService.findCachedResponse(any())).thenReturn(Optional.of(""));
+        when(messageService.findCachedMessage(any()))
+                .thenReturn(Optional.of(cachedMessage(MessageType.NEW_TX, "")));
 
         mockMvc.perform(post("/interbank")
                         .header("X-Api-Key", VALID_INBOUND_TOKEN)
@@ -188,6 +195,32 @@ class InterbankInboundControllerTest {
         verifyNoInteractions(executorService);
     }
 
+    @Test
+    @DisplayName("1377: cache hit with MISMATCHED message type (cached NEW_TX, incoming COMMIT_TX) "
+            + "→ 400 protocol error, NOT cached vote (commit would never execute)")
+    void receiveMessage_cacheTypeMismatch_returns400() throws Exception {
+        // 1377: posiljalac generise svez kljuc po poruci, ali se branimo od
+        // key-collision-a. COMMIT_TX pod kljucem koji vec ima kesiran NEW_TX vote
+        // NE sme da vrati taj vote (commit se nikad ne bi izvrsio, novac zaglavljen).
+        when(messageService.findCachedMessage(any()))
+                .thenReturn(Optional.of(cachedMessage(MessageType.NEW_TX, "{\"vote\":\"YES\"}")));
+
+        mockMvc.perform(post("/interbank")
+                        .header("X-Api-Key", VALID_INBOUND_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(buildCommitTxEnvelope())) // dolazeci tip = COMMIT_TX
+                .andExpect(status().isBadRequest());
+
+        verifyNoInteractions(executorService);
+    }
+
+    private InterbankMessage cachedMessage(MessageType type, String responseBody) {
+        return InterbankMessage.builder()
+                .messageType(type)
+                .responseBody(responseBody)
+                .build();
+    }
+
     // -------------------------------------------------------------------------
     // Dispatch paths (cache miss)
     // -------------------------------------------------------------------------
@@ -195,7 +228,7 @@ class InterbankInboundControllerTest {
     @Test
     @DisplayName("Cache miss + NEW_TX dispatches to handleNewTx and returns 200")
     void receiveMessage_newTxCacheMiss_dispatches() throws Exception {
-        when(messageService.findCachedResponse(any())).thenReturn(Optional.empty());
+        when(messageService.findCachedMessage(any())).thenReturn(Optional.empty());
         TransactionVote vote = new TransactionVote(TransactionVote.Vote.YES, List.of());
         when(executorService.handleNewTx(any(), any())).thenReturn(vote);
 
@@ -211,7 +244,7 @@ class InterbankInboundControllerTest {
     @Test
     @DisplayName("Cache miss + COMMIT_TX dispatches to handleCommitTx and returns 204")
     void receiveMessage_commitTxCacheMiss_dispatches() throws Exception {
-        when(messageService.findCachedResponse(any())).thenReturn(Optional.empty());
+        when(messageService.findCachedMessage(any())).thenReturn(Optional.empty());
         doNothing().when(executorService).handleCommitTx(any(), any());
 
         mockMvc.perform(post("/interbank")
@@ -226,7 +259,7 @@ class InterbankInboundControllerTest {
     @Test
     @DisplayName("Cache miss + ROLLBACK_TX dispatches to handleRollbackTx and returns 204")
     void receiveMessage_rollbackTxCacheMiss_dispatches() throws Exception {
-        when(messageService.findCachedResponse(any())).thenReturn(Optional.empty());
+        when(messageService.findCachedMessage(any())).thenReturn(Optional.empty());
         doNothing().when(executorService).handleRollbackTx(any(), any());
 
         mockMvc.perform(post("/interbank")
@@ -264,7 +297,7 @@ class InterbankInboundControllerTest {
     @Test
     @DisplayName("InterbankProtocolException thrown by service maps to 400 via @RestControllerAdvice")
     void receiveMessage_serviceThrowsProtocolException_returns400() throws Exception {
-        when(messageService.findCachedResponse(any())).thenReturn(Optional.empty());
+        when(messageService.findCachedMessage(any())).thenReturn(Optional.empty());
         when(executorService.handleNewTx(any(Transaction.class), any(IdempotenceKey.class)))
                 .thenThrow(new InterbankExceptions.InterbankProtocolException("malformed transaction"));
 
@@ -273,6 +306,32 @@ class InterbankInboundControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(buildNewTxEnvelope()))
                 .andExpect(status().isBadRequest());
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST-interbank-3: NEW_TX sa null/empty postings → 400 (NE 500)
+    // handleNewTx baca IllegalArgumentException za malformed body (null tx /
+    // null transactionId / null|prazan postings). Po §6.1 mora biti 400, ne 500.
+    // Pre fix-a je IllegalArgumentException padao u handleGeneral(Exception) → 500.
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("TEST-interbank-3: NEW_TX null/empty postings (IllegalArgumentException) maps to 400, not 500")
+    void receiveMessage_newTxNullPostings_returns400_notInternalError() throws Exception {
+        when(messageService.findCachedMessage(any())).thenReturn(Optional.empty());
+        // Real handleNewTx baca IllegalArgumentException za null/empty postings
+        // ("transaction.postings is required ...").
+        when(executorService.handleNewTx(any(Transaction.class), any(IdempotenceKey.class)))
+                .thenThrow(new IllegalArgumentException(
+                        "transaction.postings is required and must contain at least one balanced double-entry pair"));
+
+        mockMvc.perform(post("/interbank")
+                        .header("X-Api-Key", VALID_INBOUND_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(buildNewTxEnvelope()))
+                .andExpect(status().isBadRequest());
+
+        verify(executorService).handleNewTx(any(Transaction.class), any(IdempotenceKey.class));
     }
 
     // -------------------------------------------------------------------------

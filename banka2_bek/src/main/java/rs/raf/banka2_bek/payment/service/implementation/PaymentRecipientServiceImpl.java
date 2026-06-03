@@ -34,6 +34,10 @@ public class PaymentRecipientServiceImpl implements PaymentRecipientService {
     @Transactional
     public PaymentRecipientResponseDto createPaymentRecipient(CreatePaymentRecipientRequestDto request, String clientEmail) {
         Client client = getClientByEmail(clientEmail);
+        // R1-647: spreci dupli unos istog primaoca (isti broj racuna za istog klijenta).
+        if (paymentRecipientRepository.existsByClientAndAccountNumber(client, request.getAccountNumber())) {
+            throw new IllegalArgumentException("Primalac sa ovim brojem racuna vec postoji.");
+        }
         PaymentRecipient recipient = PaymentRecipient.builder()
                 .client(client)
                 .name(request.getName())

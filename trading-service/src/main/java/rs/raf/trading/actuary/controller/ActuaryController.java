@@ -47,8 +47,17 @@ public class ActuaryController {
     /**
      * PATCH /actuaries/{employeeId}/limit - Promena limita i needApproval
      * Samo supervizor moze da menja, samo za agente.
+     *
+     * <p>P2-authz-method-1 (R1 442): method-level guard usaglasen sa
+     * {@link #resetUsedLimit}. {@code updateAgentLimit} mutira stanje (dnevni
+     * limit + needApproval) a ranije je imao SAMO HTTP-matcher zastitu
+     * ({@code /actuaries/** → ADMIN/SUPERVISOR} u {@code TradingSecurityConfig});
+     * sad nosi i {@code @PreAuthorize} (defense-in-depth) — identicno
+     * reset-limit-u — pa state-mutirajuci aktuar endpointi imaju konzistentan
+     * guard cak i ako bi neko bypass-ovao/promenio URL matcher.
      */
     @PatchMapping("/{employeeId}/limit")
+    @PreAuthorize("hasAuthority('SUPERVISOR') or hasRole('ADMIN')")
     public ResponseEntity<ActuaryInfoDto> updateAgentLimit(
             @PathVariable Long employeeId,
             @Valid @RequestBody UpdateActuaryLimitDto dto) {

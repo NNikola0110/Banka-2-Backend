@@ -31,6 +31,19 @@ public interface OptionRepository extends JpaRepository<Option, Long> {
     List<Option> findByStockListingId(Long listingId);
 
     /**
+     * [OT-896] Dohvata SVE opcije sa eager (JOIN FETCH) ucitanim
+     * {@code stockListing}-om u jednom upitu. {@code stockListing} je
+     * {@code @ManyToOne(fetch = LAZY)}, pa bi obican {@code findAll()} praćen
+     * iteracijom {@code option.getStockListing().getPrice()} (kao u
+     * {@code recalculatePrices}) okinuo N+1 (1 + N upita — jedan po opciji).
+     * Join-fetch ucitava opcije + njihove osnovne akcije u JEDNOM SELECT-u.
+     *
+     * @return sve opcije sa inicijalizovanim {@code stockListing}-om
+     */
+    @Query("SELECT o FROM Option o JOIN FETCH o.stockListing")
+    List<Option> findAllWithStockListing();
+
+    /**
      * Pesimisticki write-lock dohvat opcije po ID-u — koristi se u
      * {@code exerciseOption} flow-u da spreci lost-update trku: dva paralelna
      * exercise-a bi inace procitala isti {@code openInterest}, dvaput ga
@@ -46,15 +59,6 @@ public interface OptionRepository extends JpaRepository<Option, Long> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT o FROM Option o WHERE o.id = :id")
     Optional<Option> findByIdForUpdate(@Param("id") Long id);
-
-    /**
-     * Pronalazi opcije za odredjenu akciju i konkretan settlement datum.
-     *
-     * @param listingId ID Listing entiteta (akcije)
-     * @param date      settlement datum za filtriranje
-     * @return lista opcija za dati listing i datum
-     */
-    List<Option> findByStockListingIdAndSettlementDate(Long listingId, LocalDate date);
 
     /**
      * Pronalazi sve istekle opcije (settlement datum pre zadatog datuma).

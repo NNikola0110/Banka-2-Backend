@@ -24,13 +24,23 @@ import java.util.Optional;
  *
  * <p><b>Autoriteti (Faza 2f-5a):</b> JWT nosi samo {@code role} claim
  * ({@code ADMIN}/{@code EMPLOYEE}/{@code CLIENT}) — bez permisija. Filter uvek
- * postavlja {@code ROLE_<role>}; za zaposlene ({@code EMPLOYEE}/{@code ADMIN})
- * dodatno razresava per-permisija autoritete ({@code SUPERVISOR}, {@code AGENT},
- * {@code TRADE_STOCKS} ...) preko {@link TradingPermissionResolver} (banka-core
- * interni API + Caffeine kes). Bez toga bi supervizor — JWT {@code role=EMPLOYEE} —
- * dobijao 403 na supervizorske rute / {@code @PreAuthorize}. Razresavanje je
- * rezilijentno: pad lookup-a → samo {@code ROLE_<role>}, request ne puca.
- * Klijenti nemaju employee permisije pa se za njih lookup preskace.
+ * postavlja {@code ROLE_<role>}; za svaku ulogu dodatno razresava per-permisija
+ * autoritete preko {@link TradingPermissionResolver} (banka-core interni API +
+ * Caffeine kes): zaposleni dobijaju {@code SUPERVISOR}/{@code AGENT}/
+ * {@code TRADE_STOCKS} ..., a klijenti sa {@code canTradeStocks=true} dobijaju
+ * {@code TRADE_STOCKS} (P0-2). Bez razresavanja bi supervizor — JWT
+ * {@code role=EMPLOYEE} — dobijao 403 na supervizorske rute / {@code @PreAuthorize},
+ * a svaki klijent 403 na {@code POST /orders}. Razresavanje je rezilijentno:
+ * pad lookup-a → samo {@code ROLE_<role>}, request ne puca; banka-core vraca
+ * praznu listu za korisnike bez permisija.
+ *
+ * <p><b>Auth gating (P0-T4):</b> (N1) refresh token se odbija u
+ * {@link JwtValidator#validate} (type=refresh) → 7-dnevni refresh vise nije validan
+ * Bearer na trading rutama; (N2) access token sa {@code active=false} claim-om
+ * (deaktiviran nalog) se ovde odbija sa 401 pre postavljanja context-a (mirror
+ * banka-core {@code JwtAuthenticationFilter} {@code isEnabled()} provere). Locked
+ * status i banka-core blacklist consult (N3) ostaju P1 — nisu dostupni trading-u
+ * bez novog banka-core seam-a / deljenog store-a.
  */
 @Component
 public class TradingJwtAuthenticationFilter extends OncePerRequestFilter {
@@ -71,6 +81,22 @@ public class TradingJwtAuthenticationFilter extends OncePerRequestFilter {
             return;
         }
         Claims claims = claimsOpt.get();
+        // N2 (P0-T4, mirror B7 banka-core JwtAuthenticationFilter): deaktiviran
+        // nalog ne sme da zadrzi trading pristup. banka-core JwtService stavlja
+        // `active` flag na svaki access token; ako je EKSPLICITNO false, odbij sa
+        // 401 i ne razresavaj permisije ni postavljaj context. `active` je snapshot
+        // u trenutku izdavanja tokena (do 15min stale) — to je najjaca provera koju
+        // trading moze da uradi bez per-request banka-core lookup-a. Tokeni bez
+        // `active` claim-a (legacy/pre-B7) tretiraju se kao aktivni (backwards-compat).
+        // NAPOMENA: locked status NIJE dostupan trading-u (nema claim-a ni internal
+        // lookup polja) — vidi P1 napomenu; pun real-time enforce zahteva blacklist
+        // consult (N3, P1).
+        if (Boolean.FALSE.equals(claims.get("active", Boolean.class))) {
+            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+            response.setContentType("application/json");
+            response.getWriter().write("{\"error\":\"Nalog je deaktiviran\"}");
+            return;
+        }
         String email = claims.getSubject();
         String role = claims.get("role", String.class);
         var auth = new UsernamePasswordAuthenticationToken(
@@ -80,9 +106,13 @@ public class TradingJwtAuthenticationFilter extends OncePerRequestFilter {
     }
 
     /**
-     * Gradi autoritete: {@code ROLE_<role>} + (za zaposlene) per-permisija
-     * autoritete razresene preko banka-core. Klijentima ({@code role=CLIENT}) i
-     * tokenima bez {@code role} claim-a ne treba permisija lookup.
+     * Gradi autoritete: {@code ROLE_<role>} + per-permisija autoritete razresene
+     * preko banka-core. Lookup se radi za svaku poznatu ulogu — zaposleni dobijaju
+     * {@code SUPERVISOR}/{@code AGENT}/{@code TRADE_STOCKS} ..., a klijenti sa
+     * {@code canTradeStocks=true} dobijaju {@code TRADE_STOCKS} (P0-2). Resolver je
+     * rezilijentan (pad → prazna lista) pa klijent bez trade prava i nepoznat
+     * korisnik dobijaju samo {@code ROLE_<role>}. Tokeni bez {@code role} claim-a
+     * ne dobijaju nista.
      */
     private List<GrantedAuthority> buildAuthorities(String role, String email) {
         List<GrantedAuthority> authorities = new ArrayList<>();
@@ -90,13 +120,12 @@ public class TradingJwtAuthenticationFilter extends OncePerRequestFilter {
             return authorities;
         }
         authorities.add(new SimpleGrantedAuthority("ROLE_" + role));
-        // Permisije ima samo zaposleni — banka-core JWT role je ADMIN ili EMPLOYEE
-        // (CLIENT nema employee permisije).
-        if ("EMPLOYEE".equals(role) || "ADMIN".equals(role)) {
-            for (String permission : permissionResolver.resolvePermissions(email)) {
-                if (permission != null && !permission.isBlank()) {
-                    authorities.add(new SimpleGrantedAuthority(permission));
-                }
+        // Razresi permisije za svaku ulogu: zaposleni → SUPERVISOR/AGENT/TRADE_STOCKS,
+        // klijent sa canTradeStocks=true → TRADE_STOCKS. banka-core vraca praznu listu
+        // za korisnike bez permisija (resolver je rezilijentan na pad lookup-a).
+        for (String permission : permissionResolver.resolvePermissions(email)) {
+            if (permission != null && !permission.isBlank()) {
+                authorities.add(new SimpleGrantedAuthority(permission));
             }
         }
         return authorities;

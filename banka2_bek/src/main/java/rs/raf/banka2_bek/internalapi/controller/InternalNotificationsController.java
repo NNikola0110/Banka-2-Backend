@@ -1,7 +1,8 @@
 package rs.raf.banka2_bek.internalapi.controller;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.ConcurrencyFailureException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
@@ -14,8 +15,6 @@ import rs.raf.banka2.contracts.internal.InternalNotificationRequest;
 import rs.raf.banka2_bek.internalapi.service.InternalIdempotencyService;
 import rs.raf.banka2_bek.notification.service.NotificationService;
 
-import java.util.Optional;
-
 /**
  * Cross-DB ulaz za in-app notifikacije iz trading-service-a (i drugih
  * mikroservisa) — banka-core je vlasnik {@code notifications} tabele.
@@ -23,10 +22,14 @@ import java.util.Optional;
  * <p>{@code InternalAuthFilter} stiti {@code /internal/**} rute deljenim
  * {@code X-Internal-Key} kljucem; nije potrebna dodatna autentifikacija.
  *
- * <p>{@code idempotencyKey} u telu (UUID) sprecava dupli upis pri retry-u —
- * naredni POST sa istim kljucem vraca 200 OK bez ponovnog perzistiranja.
- * Ako kljuc nije prosledjen, idempotency provera se preskace (svaki poziv
- * je svez upis).
+ * <p><b>P2-notif-reliability-2 (R1 383): ATOMICAN dedup.</b> {@code idempotencyKey}
+ * u telu (UUID) sprecava dupli upis pri paralelnim retry-ima. Umesto starog
+ * "check-then-act" (koji je pri paralelnim dostavama dozvoljavao da OBE prodju
+ * read-proveru i obe upisu notifikaciju), kljuc se ATOMICNO rezervise PRE
+ * perzistencije notifikacije preko DB-level {@code UNIQUE(idempotency_key)}
+ * ({@link InternalIdempotencyService#tryReserve}). Tacno jedan paralelni
+ * pozivalac dobija rezervaciju i upisuje notifikaciju; drugi(i) dobijaju
+ * 200 OK bez upisa. Ako kljuc nije prosledjen, dedup se preskace.
  */
 @Slf4j
 @RestController
@@ -37,14 +40,11 @@ public class InternalNotificationsController {
 
     private final NotificationService notificationService;
     private final InternalIdempotencyService idempotencyService;
-    private final ObjectMapper objectMapper;
 
     public InternalNotificationsController(NotificationService notificationService,
-                                           InternalIdempotencyService idempotencyService,
-                                           ObjectMapper objectMapper) {
+                                           InternalIdempotencyService idempotencyService) {
         this.notificationService = notificationService;
         this.idempotencyService = idempotencyService;
-        this.objectMapper = objectMapper;
     }
 
     @PostMapping
@@ -59,27 +59,20 @@ public class InternalNotificationsController {
 
         String idempotencyKey = req.idempotencyKey();
         if (idempotencyKey != null && !idempotencyKey.isBlank()) {
-            Optional<rs.raf.banka2_bek.internalapi.model.InternalRequest> cached =
-                    idempotencyService.findCached(idempotencyKey);
-            if (cached.isPresent()) {
-                // Idempotent replay — vec smo upisali; vrati 200 bez novog reda.
+            // R1 383: atomicno rezervisi kljuc PRE perzistencije. reserveOrThrow je
+            // REQUIRES_NEW (pozvan kroz proxy ovde — NIJE self-invocation, pa nova
+            // tx zaista vazi). Drugi paralelni/sekvencijalni pozivalac sa istim
+            // kljucem dobija unique violation → 200 OK, bez duplog reda. Hvatanje
+            // je u ovoj (cistoj) outer tx — rollback je pogodio SAMO rezervacionu tx.
+            try {
+                idempotencyService.reserveOrThrow(idempotencyKey, ENDPOINT_PATH,
+                        HttpStatus.CREATED.value(), "");
+            } catch (DataIntegrityViolationException | ConcurrencyFailureException dup) {
                 return ResponseEntity.ok().build();
             }
         }
 
         notificationService.createInternalNotification(req);
-
-        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
-            try {
-                idempotencyService.store(idempotencyKey, ENDPOINT_PATH,
-                        HttpStatus.CREATED.value(), objectMapper.writeValueAsString(""));
-            } catch (Exception ex) {
-                // Idempotency store je best-effort — notifikacija je vec save-ovana
-                log.warn("Failed to store idempotency record for key {}: {}",
-                        idempotencyKey, ex.getMessage());
-            }
-        }
-
         return ResponseEntity.status(HttpStatus.CREATED).build();
     }
 }

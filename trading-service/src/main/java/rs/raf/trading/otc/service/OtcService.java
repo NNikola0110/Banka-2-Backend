@@ -5,13 +5,8 @@ import jakarta.persistence.EntityNotFoundException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.security.access.AccessDeniedException;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.core.GrantedAuthority;
-import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import rs.raf.banka2.contracts.internal.CommitFundsRequest;
-import rs.raf.banka2.contracts.internal.CreditFundsRequest;
 import rs.raf.banka2.contracts.internal.InternalAccountDto;
 import rs.raf.banka2.contracts.internal.ReleaseFundsRequest;
 import rs.raf.banka2.contracts.internal.ReserveFundsRequest;
@@ -46,12 +41,9 @@ import rs.raf.trading.stock.repository.ListingRepository;
 import rs.raf.trading.stock.util.ListingCurrencyResolver;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.time.LocalDate;
-import java.time.LocalDateTime;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Optional;
 
 /**
  * Servis za OTC (Over-the-Counter) trgovinu unutar iste banke.
@@ -146,15 +138,29 @@ public class OtcService {
         // P3 — Klijenti vide samo ponude klijenata, supervizori samo supervizora.
         // Spec Celina 4 (Nova) §822-826 + Celina 5 (Nova) §840-848.
         boolean meIsClient = UserRole.isClient(me.userRole());
-        List<Portfolio> publicPortfolios = portfolioRepository.findAll().stream()
-                .filter(p -> p.getPublicQuantity() != null && p.getPublicQuantity() > 0)
+        // P2-perf-nplus1-1 (R5 1898): DB-side filter (publicQuantity > 0) umesto
+        // findAll() + in-memory filter — izbegava pun-table-scan nad celom
+        // portfolios tabelom; materijalizuju se samo javne pozicije.
+        List<Portfolio> publicPortfolios = portfolioRepository.findAllWithPublicQuantity().stream()
                 .filter(p -> !(p.getUserId().equals(me.userId())
                         && me.userRole().equals(p.getUserRole())))
                 .filter(p -> meIsClient ? UserRole.isClient(p.getUserRole())
                                         : UserRole.isEmployee(p.getUserRole()))
                 .toList();
+
+        // P2-perf-nplus1-1 (R5 1898): batch-resolve listinga jednim findAllById
+        // umesto per-row findById (DB N+1). Distinct listingId set → jedan IN upit.
+        List<Long> distinctListingIds = publicPortfolios.stream()
+                .map(Portfolio::getListingId)
+                .filter(java.util.Objects::nonNull)
+                .distinct()
+                .toList();
+        java.util.Map<Long, Listing> listingsById = listingRepository.findAllById(distinctListingIds)
+                .stream()
+                .collect(java.util.stream.Collectors.toMap(Listing::getId, l -> l));
+
         return publicPortfolios.stream()
-                .map(this::toListingDto)
+                .map(p -> toListingDto(p, listingsById.get(p.getListingId())))
                 .filter(dto -> dto != null && dto.getAvailablePublicQuantity() > 0)
                 .sorted(Comparator.comparing(OtcListingDto::getListingTicker))
                 .toList();
@@ -243,12 +249,36 @@ public class OtcService {
         OtcOffer offer = loadActiveOfferForParticipant(offerId, me);
         ensureSameRoleParticipants(offer.getBuyerRole(), offer.getSellerRole());
 
+        // R2-1339 (CORRECTNESS) — defense-in-depth pozitivna validacija. Kontroler
+        // primenjuje @Valid (DTO ima @Min(1)/@Positive), ali servis se moze pozvati
+        // direktno (drugi servis/test) → bez ove provere bi qty=0 / negativna
+        // premija ili cena korumpirali ponudu (a kasniji accept bi kreirao
+        // ugovor sa 0 akcija / 0 strike). Inter-bank wrapper vec ima @Positive;
+        // intra ovde dobija ekvivalentnu service-level garanciju.
+        validateCounterTerms(dto);
+
         boolean isBuyer = offer.getBuyerId().equals(me.userId())
                 && offer.getBuyerRole().equals(me.userRole());
         boolean isSeller = offer.getSellerId().equals(me.userId())
                 && offer.getSellerRole().equals(me.userRole());
-        if (offer.getQuantity() > 0 && !isBuyer && !isSeller) {
+        // R2-1339 — uklonjen `offer.getQuantity() > 0 &&` guard: stara verzija je
+        // za korumpiranu ponudu (qty==0) PRESKAKALA participant check → ne-ucesnik
+        // je mogao da posalje kontraponudu. Participant check sad vazi bezuslovno.
+        // (loadActiveOfferForParticipant vec proverava ucesnistvo; ovo je dodatni
+        // eksplicitan sloj jer counterOffer menja sadrzaj ponude.)
+        if (!isBuyer && !isSeller) {
             throw new AccessDeniedException("Niste ucesnik u ovoj ponudi.");
+        }
+
+        // R2-1338 (CORRECTNESS/TURN-ORDER) — kontraponudu sme da posalje samo
+        // ucesnik kome je RED (kome je upucena prethodna ponuda: waitingOnUserId).
+        // Bez ove provere je strana koja je upravo poslala ponudu mogla odmah da
+        // posalje jos jednu (spam/race) ili da pregazi sopstvenu ponudu. acceptOffer
+        // vec ima isti turn-order guard; counterOffer ga je nedostajao.
+        if (offer.getWaitingOnUserId() != null
+                && !me.userId().equals(offer.getWaitingOnUserId())) {
+            throw new IllegalStateException(
+                    "Nije na vama red da odgovorite na ovu ponudu.");
         }
 
         // Prodavac mora i dalje da ima dovoljno javnih akcija za predlozenu kolicinu
@@ -365,10 +395,21 @@ public class OtcService {
             throw new IllegalStateException("Nije na vama red da odgovorite na ovu ponudu.");
         }
 
+        // P2-authz-method-1 (R1 474) — PESSIMISTIC LOCK na seller portfolio red.
+        // Ranije se seller portfolio citao plain {@code findByUserIdAndUserRole}
+        // (bez locka), pa avail-check ({@code availablePublicQty = publicQuantity −
+        // sumActiveReservedByListing}) i kasniji reservedQuantity++ (linija ~470)
+        // nisu bili serijalizovani. Dva konkurentna {@code acceptOffer} za ponude
+        // na ISTOM (seller, listing) bi oba procitala isti stale rezervisani-broj,
+        // oba prosla {@code avail >= quantity}, oba kreirala ACTIVE ugovor →
+        // OVER-COMMIT (prodavac obavezao vise akcija nego sto ima javno dostupno).
+        // {@code findByUserIdAndUserRoleAndListingIdForUpdate} zakljucava red →
+        // druga tx ceka prvu i u {@code sumActiveReservedByListing} vidi vec
+        // commit-ovani prvi ugovor → odbija se. Isti lock se koristi i u
+        // {@code releaseSellerReservation}.
         Portfolio sp = portfolioRepository
-                .findByUserIdAndUserRole(offer.getSellerId(), offer.getSellerRole()).stream()
-                .filter(p -> p.getListingId().equals(offer.getListing().getId()))
-                .findFirst()
+                .findByUserIdAndUserRoleAndListingIdForUpdate(
+                        offer.getSellerId(), offer.getSellerRole(), offer.getListing().getId())
                 .orElseThrow(() -> new EntityNotFoundException("Prodavac nema akcije za ovu ponudu."));
         int avail = availablePublicQty(sp);
         if (avail < offer.getQuantity()) {
@@ -383,9 +424,6 @@ public class OtcService {
                 offer.getBuyerId(), offer.getBuyerRole(), buyerAccountId, listingCurrency);
         InternalAccountDto sellerAccount = resolveSellerAccount(
                 offer.getSellerId(), offer.getSellerRole(), listingCurrency);
-
-        transferPremium(offer.getId(), "premium", buyerAccount, sellerAccount,
-                offer.getPremium(), listingCurrency, UserRole.isClient(offer.getBuyerRole()));
 
         // Rezervacija sredstava kupcu (strike × qty u njegovoj valuti) + akcija prodavcu
         // — spec: pri sklapanju kupac je solventan, prodavac ne moze prodati istu hartiju
@@ -403,8 +441,14 @@ public class OtcService {
                     strikeCostInListingCcy, listingCurrency, buyerCcy);
         }
 
-        // Rezervacija sredstava kupcu preko banka-core /internal/funds/reserve.
-        // banka-core odbija (409) ako racun nema dovoljno raspolozivih sredstava.
+        // P0-B6 (Nalaz 2) — ATOMICNOST: rezervacija sredstava MORA da prethodi
+        // transferu premije. Ranije je premija isla PRVA, pa ako bi reserveFunds
+        // vratio 409 (nedovoljno raspolozivih sredstava), premija bi vec bila
+        // TRAJNO premestena kupac->prodavac a ugovor ne bi nastao → money-loss.
+        // Sad: prvo rezervisemo (jeftino i bez novcanog kretanja — samo hold), pa
+        // tek onda premestamo premiju. Ako premija padne posle uspesne rezervacije,
+        // oslobadjamo rezervaciju (compensacija) tako da nijedan korak ne ostane
+        // delimicno primenjen (conservation: ili se sve desi, ili nista).
         String reservationId;
         try {
             ReserveFundsResponse reserveResponse = bankaCoreClient.reserveFunds(
@@ -419,6 +463,29 @@ public class OtcService {
                                 + "): potrebno " + reservedInBuyerCcy + " " + buyerCcy);
             }
             throw ex;
+        }
+
+        // Premija buyer -> seller. Ako padne (npr. nedovoljno za premiju POSLE
+        // rezervacije, ili banka-core 5xx), oslobadjamo upravo kreiranu rezervaciju
+        // pre nego sto propagiramo gresku — bez ovoga bi rezervacija ostala stranded
+        // a ugovor nikad ne nastaje (obrnuti leak).
+        try {
+            transferPremium(offer.getId(), "premium", buyerAccount, sellerAccount,
+                    offer.getPremium(), listingCurrency, UserRole.isClient(offer.getBuyerRole()));
+        } catch (RuntimeException premiumFail) {
+            try {
+                bankaCoreClient.releaseFunds(
+                        reservationId,
+                        "otc-accept-" + offer.getId() + "-reserve-compensate",
+                        new ReleaseFundsRequest(
+                                "Oslobadjanje OTC rezervacije — transfer premije nije uspeo (offer #"
+                                        + offer.getId() + ")"));
+            } catch (RuntimeException releaseFail) {
+                log.error("OTC accept #{}: transfer premije pao i kompenzacijski releaseFunds "
+                                + "(reservationId={}) takodje pao: {}",
+                        offer.getId(), reservationId, releaseFail.getMessage());
+            }
+            throw premiumFail;
         }
 
         // Rezervacija akcija prodavcu — povecava Portfolio.reservedQuantity
@@ -513,99 +580,6 @@ public class OtcService {
     }
 
     /**
-     * Iskoriscavanje opcionog ugovora — kupac placa strike*qty, seller predaje
-     * akcije. Moguce samo pre settlementDate-a i samo od strane kupca.
-     */
-    @Transactional
-    public OtcContractDto exerciseContract(Long contractId, Long buyerAccountId) {
-        UserContext me = resolveCurrentUser();
-        ensureOtcAccess(me);
-        OtcContract contract = contractRepository.findById(contractId)
-                .orElseThrow(() -> new EntityNotFoundException("OTC ugovor ne postoji: " + contractId));
-
-        if (!contract.getBuyerId().equals(me.userId())
-                || !contract.getBuyerRole().equals(me.userRole())) {
-            throw new AccessDeniedException("Samo kupac moze iskoristiti ugovor.");
-        }
-        if (contract.getStatus() != OtcContractStatus.ACTIVE) {
-            throw new IllegalStateException("Ugovor nije aktivan (status=" + contract.getStatus() + ").");
-        }
-        if (contract.getSettlementDate().isBefore(LocalDate.now())) {
-            throw new IllegalStateException("Settlement datum je prosao — ugovor je istekao.");
-        }
-
-        BigDecimal totalCost = contract.getStrikePrice().multiply(BigDecimal.valueOf(contract.getQuantity()))
-                .setScale(4, RoundingMode.HALF_UP);
-
-        String listingCurrency = resolveListingCurrency(contract.getListing());
-        InternalAccountDto buyerAccount = resolveBuyerAccount(
-                contract.getBuyerId(), contract.getBuyerRole(), buyerAccountId, listingCurrency);
-        InternalAccountDto sellerAccount = resolveSellerAccount(
-                contract.getSellerId(), contract.getSellerRole(), listingCurrency);
-
-        // 1. Iskoristi rezervisana sredstva kupca (postavljena pri accept-u) — strike × qty
-        //    se skida sa rezervacije i kreditira prodavcu (sa FX).
-        consumeBuyerReservation(contract, buyerAccount, sellerAccount, totalCost, listingCurrency);
-
-        // 2. Prebaci akcije: umanji seller portfolio (i njegovu rezervaciju), uvecaj buyer
-        Portfolio sellerPortfolio = portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                        contract.getSellerId(), contract.getSellerRole(), contract.getListing().getId())
-                .orElseThrow(() -> new IllegalStateException("Prodavac vise nema ovu hartiju u portfoliju."));
-        if (sellerPortfolio.getQuantity() < contract.getQuantity()) {
-            throw new IllegalStateException("Prodavac nema dovoljno akcija za izvrsavanje ugovora.");
-        }
-        sellerPortfolio.setQuantity(sellerPortfolio.getQuantity() - contract.getQuantity());
-        // Oslobodi rezervisanu kolicinu prodavca (vec je consumed kroz quantity smanjenje)
-        int newReserved = Math.max(0, sellerPortfolio.getReservedQuantity() - contract.getQuantity());
-        sellerPortfolio.setReservedQuantity(newReserved);
-        Integer currentPublic = sellerPortfolio.getPublicQuantity();
-        int newPublic = Math.max(0, (currentPublic != null ? currentPublic : 0) - contract.getQuantity());
-        sellerPortfolio.setPublicQuantity(newPublic);
-        if (sellerPortfolio.getQuantity() <= 0) {
-            portfolioRepository.delete(sellerPortfolio);
-        } else {
-            portfolioRepository.save(sellerPortfolio);
-        }
-
-        Optional<Portfolio> existingBuyer = portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                contract.getBuyerId(), contract.getBuyerRole(), contract.getListing().getId());
-        if (existingBuyer.isPresent()) {
-            Portfolio bp = existingBuyer.get();
-            int oldQty = bp.getQuantity();
-            BigDecimal oldTotal = bp.getAverageBuyPrice().multiply(BigDecimal.valueOf(oldQty));
-            BigDecimal addTotal = contract.getStrikePrice().multiply(BigDecimal.valueOf(contract.getQuantity()));
-            int newQty = oldQty + contract.getQuantity();
-            BigDecimal newAvg = oldTotal.add(addTotal)
-                    .divide(BigDecimal.valueOf(newQty), 4, RoundingMode.HALF_UP);
-            bp.setQuantity(newQty);
-            bp.setAverageBuyPrice(newAvg);
-            portfolioRepository.save(bp);
-        } else {
-            Portfolio bp = new Portfolio();
-            bp.setUserId(contract.getBuyerId());
-            bp.setUserRole(contract.getBuyerRole());
-            bp.setListingId(contract.getListing().getId());
-            bp.setListingTicker(contract.getListing().getTicker());
-            bp.setListingName(contract.getListing().getName());
-            bp.setListingType(contract.getListing().getListingType().name());
-            bp.setQuantity(contract.getQuantity());
-            bp.setAverageBuyPrice(contract.getStrikePrice());
-            bp.setPublicQuantity(0);
-            portfolioRepository.save(bp);
-        }
-
-        // 3. Mark contract exercised
-        contract.setStatus(OtcContractStatus.EXERCISED);
-        contract.setExercisedAt(LocalDateTime.now());
-        contractRepository.save(contract);
-
-        log.info("OTC contract #{} exercised by buyer {} — {} x {} @ strike {}",
-                contract.getId(), contract.getBuyerId(), contract.getQuantity(),
-                contract.getListing().getTicker(), contract.getStrikePrice());
-        return toContractDto(contract);
-    }
-
-    /**
      * Automatsko markiranje isteklih aktivnih ugovora kao EXPIRED.
      * Cist bookkeeping — publicQuantity prodavca se automatski vraca
      * jer availablePublicQty koristi samo ACTIVE ugovore.
@@ -662,61 +636,6 @@ public class OtcService {
     }
 
     /**
-     * Trosenje rezervisanih sredstava kupca pri exercise-u.
-     *
-     * <p>NAPOMENA (faza 2d-B money-seam): u monolitu je ovo direktno smanjivalo
-     * {@code buyer.balance + buyer.reservedAmount} i kreditiralo seller-a. U
-     * trading-service-u izvodimo dva jednostrana banka-core poziva (cross-currency
-     * {@code commit} nije podrzan — {@code commit} je iste valute):
-     * <ol>
-     *   <li>{@code commitFunds(reservationId, ...)} — debituje buyer-ovu
-     *       rezervaciju u njegovoj valuti, bez beneficiary-ja (seller noga ide
-     *       odvojeno);</li>
-     *   <li>{@code creditFunds(sellerAccount, ...)} — kreditira prodavca strike
-     *       trosak FX-konvertovan u njegovu valutu.</li>
-     * </ol>
-     * Ako iz nekog razloga nema rezervacije (legacy ugovor pre mikroservisne
-     * ekstrakcije), pada nazad na {@code transferFunds} buyer→seller iz
-     * available balance-a.
-     */
-    private void consumeBuyerReservation(OtcContract contract, InternalAccountDto buyerAccount,
-                                         InternalAccountDto sellerAccount,
-                                         BigDecimal totalCostInListingCcy, String listingCurrency) {
-        BigDecimal reserved = contract.getBuyerReservedAmount();
-        String reservationId = contract.getBankaCoreReservationId();
-        // Legacy ugovor bez rezervacije — fallback na klasicni transfer
-        if (reserved == null || reserved.signum() <= 0 || reservationId == null) {
-            transferPremium(contract.getId(), "exercise", buyerAccount, sellerAccount,
-                    totalCostInListingCcy, listingCurrency, UserRole.isClient(contract.getBuyerRole()));
-            return;
-        }
-
-        String buyerCcy = buyerAccount.currencyCode();
-        // 1. Naplata buyer-ove rezervacije (banka-core skida iz rezervacije; beneficiary
-        //    je null — seller noga se kreditira odvojeno jer commit ne radi cross-currency).
-        bankaCoreClient.commitFunds(
-                reservationId,
-                "otc-exercise-" + contract.getId() + "-commit",
-                new CommitFundsRequest(reserved, BigDecimal.ZERO, null,
-                        "OTC ugovor #" + contract.getId() + " exercise — naplata rezervacije"));
-
-        // 2. Konvertuj reserved iz buyer-ove valute u listing -> seller valutu
-        BigDecimal amountInListingCcy = buyerCcy.equals(listingCurrency)
-                ? reserved
-                : currencyConversionService.convert(reserved, buyerCcy, listingCurrency);
-        String sellerCcy = sellerAccount.currencyCode();
-        BigDecimal toSeller = listingCurrency.equals(sellerCcy)
-                ? amountInListingCcy
-                : currencyConversionService.convert(amountInListingCcy, listingCurrency, sellerCcy);
-
-        // 3. Kreditira prodavca strike trosak u njegovoj valuti.
-        bankaCoreClient.creditFunds(
-                "otc-exercise-" + contract.getId() + "-credit",
-                new CreditFundsRequest(sellerAccount.id(), toSeller, BigDecimal.ZERO, sellerCcy,
-                        "OTC ugovor #" + contract.getId() + " exercise — isplata prodavcu"));
-    }
-
-    /**
      * Oslobadja buyer-ovu rezervaciju (banka-core {@code /internal/funds/.../release}).
      * Idempotentno — banka-core release je idempotentan, plus preskace ako ugovor
      * nema {@code bankaCoreReservationId} (legacy).
@@ -742,6 +661,15 @@ public class OtcService {
                 .orElse(null);
         if (sp == null) return;
         int toRelease = Math.min(sp.getReservedQuantity(), contract.getQuantity());
+        // R2 1412: Math.min stiti od negativne reservedQuantity, ali tiho maskira
+        // drift — ako je rezervisana kolicina manja od kolicine ugovora, nesto je
+        // vec oslobodilo deo rezervacije (dupli release / nekonzistentno stanje).
+        // Logujemo WARN da drift ne ostane nevidljiv (umesto da se cisto proguta).
+        if (sp.getReservedQuantity() < contract.getQuantity()) {
+            log.warn("OTC contract #{} releaseSellerReservation drift: seller reservedQuantity={} < contract quantity={} "
+                            + "(oslobadja se samo {}). Moguc dupli release ili nekonzistentna rezervacija.",
+                    contract.getId(), sp.getReservedQuantity(), contract.getQuantity(), toRelease);
+        }
         sp.setReservedQuantity(sp.getReservedQuantity() - toRelease);
         portfolioRepository.save(sp);
     }
@@ -753,32 +681,12 @@ public class OtcService {
      * (od zaposlenih) i KLIJENTIMA. Agenti su eksplicitno iskljuceni.
      * Spring SecurityConfig vec hvata role; ovaj poziv je defense-in-depth
      * za slucaj da neko zaobidje filter (npr. test sa @WithMockUser).
+     *
+     * <p>R1 783 / R2 1443: logika je izdvojena u {@link OtcAccessPolicy}
+     * (deljena sa {@code OtcExerciseSagaOrchestrator}, bez duplikacije).
      */
     private void ensureOtcAccess(UserContext user) {
-        String role = user.userRole();
-        if (UserRole.isClient(role)) {
-            return;
-        }
-        // Za zaposlene: dozvoljeni samo supervizori (admini su uvek supervizori).
-        // Agent koji nema SUPERVISOR niti ADMIN authority dobija 403.
-        if (UserRole.isEmployee(role)) {
-            Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-            if (auth == null) {
-                throw new AccessDeniedException("Niste autentifikovani.");
-            }
-            boolean isSupervisor = auth.getAuthorities().stream()
-                    .map(GrantedAuthority::getAuthority)
-                    .anyMatch(a -> "ADMIN".equals(a)
-                            || "SUPERVISOR".equals(a)
-                            || "ROLE_ADMIN".equals(a)
-                            || "ROLE_SUPERVISOR".equals(a));
-            if (!isSupervisor) {
-                throw new AccessDeniedException(
-                        "OTC je dozvoljen samo supervizorima i klijentima (po Celini 4 Nova).");
-            }
-            return;
-        }
-        throw new AccessDeniedException("Nepoznata uloga ne moze pristupiti OTC-u.");
+        OtcAccessPolicy.ensureOtcAccess(user);
     }
 
     /**
@@ -792,6 +700,24 @@ public class OtcService {
             throw new IllegalArgumentException(
                     "OTC trgovina je dozvoljena samo izmedju ucesnika iste role "
                             + "(klijent-klijent ili supervizor-supervizor).");
+        }
+    }
+
+    /**
+     * R2-1339 — service-level pozitivna validacija kontraponude (paritet sa
+     * {@code @Positive}/{@code @Min(1)} na DTO-u + inter-bank wrapper-om). Stiti
+     * od korumpirane ponude (qty&lt;=0 / cena&lt;=0 / premija&lt;0) kad servis
+     * pozove neko ko ne prolazi kroz {@code @Valid} kontroler.
+     */
+    private void validateCounterTerms(CounterOtcOfferDto dto) {
+        if (dto.getQuantity() == null || dto.getQuantity() < 1) {
+            throw new IllegalArgumentException("Kolicina mora biti najmanje 1.");
+        }
+        if (dto.getPricePerStock() == null || dto.getPricePerStock().signum() <= 0) {
+            throw new IllegalArgumentException("Cena po akciji mora biti pozitivna.");
+        }
+        if (dto.getPremium() == null || dto.getPremium().signum() <= 0) {
+            throw new IllegalArgumentException("Premija mora biti pozitivna.");
         }
     }
 
@@ -829,9 +755,22 @@ public class OtcService {
         return offer;
     }
 
+    /**
+     * Single-arg varijanta — per-row {@code findById}. Koristi je
+     * {@code listMyPublicListings} (mali, sopstveni portfolio korisnika, bez N+1
+     * pritiska). Discovery koristi batch-aware {@link #toListingDto(Portfolio, Listing)}.
+     */
     private OtcListingDto toListingDto(Portfolio portfolio) {
         Listing listing = listingRepository.findById(portfolio.getListingId())
                 .orElse(null);
+        return toListingDto(portfolio, listing);
+    }
+
+    /**
+     * P2-perf-nplus1-1 (R5 1898): batch-aware varijanta — listing je vec
+     * razresen (iz {@code findAllById} mape), bez per-row DB lookup-a.
+     */
+    private OtcListingDto toListingDto(Portfolio portfolio, Listing listing) {
         if (listing == null) {
             return null;
         }

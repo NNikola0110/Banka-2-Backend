@@ -4,6 +4,7 @@ import jakarta.mail.internet.MimeMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.mail.javamail.JavaMailSender;
@@ -13,6 +14,7 @@ import rs.raf.notification.mail.template.InAppGenericEmailTemplate;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.*;
@@ -152,5 +154,22 @@ class MailNotificationServiceExtendedTest {
         when(inAppGenericEmailTemplate.buildBody(any(), any(), any())).thenReturn("<html></html>");
         service.sendInAppNotificationMail("u@b.rs", "Ana", "Moj naslov", "Sadrzaj.");
         verify(inAppGenericEmailTemplate).buildBody("Ana", "Moj naslov", "Sadrzaj.");
+    }
+
+    // ── [P1-notif-svc-1 / 1528 / 1742] CRLF header injection u subject ─────
+
+    @Test void sendInAppNotificationMail_stripsCrlfFromSubject() throws Exception {
+        when(inAppGenericEmailTemplate.buildBody(any(), any(), any())).thenReturn("<html></html>");
+        // Maliciozan title sa CRLF + ubacenim header-om (Bcc) — ne sme da pretece
+        // u dodatne mejl header-e.
+        service.sendInAppNotificationMail("u@b.rs", "Ana",
+                "Naslov\r\nBcc: attacker@evil.com\r\nX-Injected: 1", "Sadrzaj.");
+
+        ArgumentCaptor<String> subj = ArgumentCaptor.forClass(String.class);
+        verify(mimeMessage).setSubject(subj.capture(), any());
+        // CRLF uklonjen → nemoguce ubaciti dodatni mejl header (jedan-linijski subject).
+        // Literalni tekst "Bcc:" u jednoj liniji je bezopasan (nije header).
+        assertThat(subj.getValue()).doesNotContain("\r");
+        assertThat(subj.getValue()).doesNotContain("\n");
     }
 }

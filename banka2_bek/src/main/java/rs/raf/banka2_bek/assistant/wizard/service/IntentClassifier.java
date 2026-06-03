@@ -1,6 +1,5 @@
 package rs.raf.banka2_bek.assistant.wizard.service;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -13,8 +12,10 @@ import rs.raf.banka2_bek.assistant.dto.openai.OpenAiMessage;
 import rs.raf.banka2_bek.assistant.dto.openai.OpenAiToolCall;
 import rs.raf.banka2_bek.assistant.service.StructuredIntentClassifier;
 import rs.raf.banka2_bek.assistant.tool.client.LlmHttpClient;
+import rs.raf.banka2_bek.assistant.util.LogSanitizer;
 import rs.raf.banka2_bek.assistant.wizard.registry.WizardRegistry;
 import rs.raf.banka2_bek.auth.util.UserContext;
+import rs.raf.banka2_bek.auth.util.UserRole;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -57,8 +58,20 @@ public class IntentClassifier {
     /** Map<tool_name, jedna recenica opisa> — koriste se za minimalne schemas. */
     private static final Map<String, String> INTENT_DESCRIPTIONS = buildIntentDescriptions();
 
+    /**
+     * P0-B8 N3: EMPLOYEE-only intent-i. CLIENT-u se NE nude u tool katalogu
+     * (klasifikator ih ne sme izabrati), pa klijent ne moze da pokrene
+     * EMPLOYEE akciju kroz agenta. {@code unblock_card} je employee akcija
+     * (klijent moze samo blokirati svoju karticu, ne odblokirati je).
+     */
+    private static final java.util.Set<String> EMPLOYEE_ONLY_INTENTS =
+            java.util.Set.of("unblock_card");
+
     private final LlmHttpClient llmHttpClient;
     private final AssistantProperties properties;
+    // R1-880: mrtav `safeJson` helper uklonjen; mapper ostaje constructor-injected
+    // (Spring + unit-test wiring) — rezervisan za buduce structured-output logovanje.
+    @SuppressWarnings("unused")
     private final ObjectMapper assistantObjectMapper;
     private final WizardRegistry wizardRegistry;
     /**
@@ -100,7 +113,10 @@ public class IntentClassifier {
      */
     public Optional<String> classify(String userMessage, UserContext user) {
         if (userMessage == null || userMessage.isBlank()) return Optional.empty();
-        String key = userMessage.toLowerCase().trim();
+        // P0-B8 N3: cache key ukljucuje rolu da employee-only rezultat ne bi
+        // procurio CLIENT-u kroz cache (cache-poisoning izmedju rola).
+        String role = user == null || user.userRole() == null ? "?" : user.userRole();
+        String key = role + "|" + userMessage.toLowerCase().trim();
         String cached = cache.get(key);
         if (cached != null) {
             log.debug("ARBITRO IntentClassifier cache hit: {} -> {}", key, cached);
@@ -117,7 +133,8 @@ public class IntentClassifier {
                     sic.classify(userMessage, user);
             if (structuredHit.isPresent()) {
                 String tool = structuredHit.get().tool();
-                if (wizardRegistry.has(tool)) {
+                // P0-B8 N3: ne dozvoli employee-only intent za CLIENT-a (defense-in-depth).
+                if (wizardRegistry.has(tool) && isIntentAllowedForRole(tool, user)) {
                     cache.put(key, tool);
                     log.info("ARBITRO IntentClassifier structured picked tool='{}' conf={}",
                             tool, structuredHit.get().confidence());
@@ -129,7 +146,7 @@ public class IntentClassifier {
         }
 
         try {
-            List<Map<String, Object>> tools = buildMinimalTools();
+            List<Map<String, Object>> tools = buildMinimalTools(user);
             if (tools.isEmpty()) return Optional.empty();
 
             // Lean prompt — ne saljemo master prompt + role overlay + page fragment
@@ -166,22 +183,41 @@ public class IntentClassifier {
             OpenAiChatResponse resp = llmHttpClient.chatNonStream(req);
             String picked = extractFirstToolCallName(resp);
             if (picked == null) {
-                log.info("ARBITRO IntentClassifier no tool_calls in response for: {}", userMessage);
+                // [P2-input-validation-1 / R4 1782] sanitize CRLF iz user-input pre logovanja.
+                log.info("ARBITRO IntentClassifier no tool_calls in response for: {}",
+                        LogSanitizer.sanitize(userMessage));
                 return Optional.empty();
             }
             if (!wizardRegistry.has(picked)) {
                 log.info("ARBITRO IntentClassifier picked unknown tool '{}' for: {}",
-                        picked, userMessage);
+                        LogSanitizer.sanitize(picked), LogSanitizer.sanitize(userMessage));
+                return Optional.empty();
+            }
+            // P0-B8 N3: defense-in-depth — i ako model ipak emit-uje employee-only
+            // intent za klijenta (mada ga ne nudimo), odbij ga.
+            if (!isIntentAllowedForRole(picked, user)) {
+                log.info("ARBITRO IntentClassifier blocked employee-only intent '{}' for role {}",
+                        picked, user == null ? "?" : user.userRole());
                 return Optional.empty();
             }
             cache.put(key, picked);
-            log.info("ARBITRO IntentClassifier picked tool='{}' for msg='{}'", picked,
-                    userMessage.length() > 60 ? userMessage.substring(0, 60) + "..." : userMessage);
+            // [P2-input-validation-1 / R4 1782] sanitize CRLF + trunc na 60.
+            log.info("ARBITRO IntentClassifier picked tool='{}' for msg='{}'",
+                    LogSanitizer.sanitize(picked), LogSanitizer.sanitize(userMessage, 60));
             return Optional.of(picked);
         } catch (Exception e) {
             log.warn("ARBITRO IntentClassifier failed: {}", e.getMessage());
             return Optional.empty();
         }
+    }
+
+    /**
+     * P0-B8 N3: true ako data namera sme za korisnikovu rolu. EMPLOYEE-only
+     * intent-i ({@link #EMPLOYEE_ONLY_INTENTS}) su dozvoljeni samo zaposlenima.
+     */
+    private boolean isIntentAllowedForRole(String tool, UserContext user) {
+        if (!EMPLOYEE_ONLY_INTENTS.contains(tool)) return true;
+        return user != null && UserRole.isEmployee(user.userRole());
     }
 
     private String extractFirstToolCallName(OpenAiChatResponse resp) {
@@ -214,11 +250,18 @@ public class IntentClassifier {
     /**
      * Build minimal OpenAI tool schemas — only name + 1-sentence description,
      * with empty parameter object. Wizard handles parameters interactively.
+     *
+     * <p>P0-B8 N3: EMPLOYEE-only intent-i ({@link #EMPLOYEE_ONLY_INTENTS}) se
+     * NE nude CLIENT-u — klasifikator ih ne sme izabrati za klijenta, pa
+     * klijent ne moze da pokrene employee akciju kroz agenta.</p>
      */
-    private List<Map<String, Object>> buildMinimalTools() {
+    private List<Map<String, Object>> buildMinimalTools(UserContext user) {
+        boolean isEmployee = user != null && UserRole.isEmployee(user.userRole());
         List<Map<String, Object>> tools = new ArrayList<>(INTENT_DESCRIPTIONS.size());
         for (Map.Entry<String, String> e : INTENT_DESCRIPTIONS.entrySet()) {
             String name = e.getKey();
+            // P0-B8 N3: sakrij employee-only intent-e od klijenta.
+            if (!isEmployee && EMPLOYEE_ONLY_INTENTS.contains(name)) continue;
             // Filtruj na tool-ove koji imaju wizard template (sve ostale ce LLM
             // ipak ignorisati ali zasto da ih ucitavamo).
             if (!wizardRegistry.has(name)) continue;
@@ -279,11 +322,5 @@ public class IntentClassifier {
      */
     int registeredIntentCount() {
         return INTENT_DESCRIPTIONS.size();
-    }
-
-    @SuppressWarnings("unused")
-    private String safeJson(Object o) {
-        try { return assistantObjectMapper.writeValueAsString(o); }
-        catch (JsonProcessingException e) { return "{}"; }
     }
 }

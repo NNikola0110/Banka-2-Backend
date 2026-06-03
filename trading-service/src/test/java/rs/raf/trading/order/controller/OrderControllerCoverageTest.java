@@ -20,7 +20,6 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
-import rs.raf.trading.client.BankaCoreClient;
 import rs.raf.trading.common.TradingGlobalExceptionHandler;
 import rs.raf.trading.order.controller.exception_handler.OrderExceptionHandler;
 import rs.raf.trading.order.dto.OrderDto;
@@ -51,7 +50,6 @@ class OrderControllerCoverageTest {
     private MockMvc mockMvc;
 
     @Mock private OrderService orderService;
-    @Mock private BankaCoreClient bankaCoreClient;
 
     @InjectMocks private OrderController orderController;
 

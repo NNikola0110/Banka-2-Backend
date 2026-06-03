@@ -20,7 +20,10 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.core.context.SecurityContextImpl;
 import rs.raf.trading.otc.dto.OtcNegotiationHistoryDto;
 import rs.raf.trading.otc.model.OtcNegotiationHistory;
+import rs.raf.trading.otc.model.OtcOffer;
 import rs.raf.trading.otc.repository.OtcNegotiationHistoryRepository;
+import rs.raf.trading.otc.repository.OtcOfferRepository;
+import rs.raf.trading.otc.service.OtcAccessGuard;
 import rs.raf.trading.otc.service.OtcNegotiationHistoryService;
 
 import java.math.BigDecimal;
@@ -46,6 +49,12 @@ class OtcNegotiationHistoryServiceTest {
 
     @Mock
     private OtcNegotiationHistoryRepository repository;
+
+    @Mock
+    private OtcOfferRepository offerRepository;
+
+    @Mock
+    private OtcAccessGuard accessGuard;
 
     @InjectMocks
     private OtcNegotiationHistoryService service;
@@ -115,6 +124,7 @@ class OtcNegotiationHistoryServiceTest {
         OtcNegotiationHistory e3 = buildEntry(3L, 120, "ACCEPTED", LocalDateTime.of(2026, 1, 3, 10, 0));
         when(repository.findByNegotiationIdOrderByCreatedAtAsc(42L))
                 .thenReturn(List.of(e1, e2, e3));
+        when(offerRepository.findById(42L)).thenReturn(java.util.Optional.of(buildOffer(42L)));
 
         List<OtcNegotiationHistoryDto> result = service.getHistoryForNegotiation(42L);
 
@@ -152,6 +162,7 @@ class OtcNegotiationHistoryServiceTest {
                 .build();
         when(repository.findByNegotiationIdOrderByCreatedAtAsc(42L))
                 .thenReturn(List.of(entry));
+        when(offerRepository.findById(42L)).thenReturn(java.util.Optional.of(buildOffer(42L)));
 
         OtcNegotiationHistoryDto dto = service.getHistoryForNegotiation(42L).get(0);
 
@@ -165,6 +176,58 @@ class OtcNegotiationHistoryServiceTest {
         assertThat(dto.getModifiedById()).isEqualTo(33L);
         assertThat(dto.getModifiedByName()).isEqualTo("Ana Anic");
         assertThat(dto.getCreatedAt()).isEqualTo(created);
+    }
+
+    // ──────────────── getHistoryForNegotiation — IDOR guard (P1-authz-idor-1, R1 208) ────────────────
+
+    @Test
+    void getHistoryForNegotiation_deniedForNonParticipant() {
+        // RED pre fix-a: single-ID istorija je bila samo authenticated() → ne-ucesnik
+        // je enumeracijom citao tudje cene/premije.
+        when(repository.findByNegotiationIdOrderByCreatedAtAsc(42L))
+                .thenReturn(List.of(buildEntry(1L, 100, "ACTIVE", LocalDateTime.now())));
+        when(offerRepository.findById(42L)).thenReturn(java.util.Optional.of(buildOffer(42L)));
+        org.mockito.Mockito.doThrow(new AccessDeniedException("nije ucesnik"))
+                .when(accessGuard).ensureParticipantOrOversight(
+                        any(), any(), any(), any(), org.mockito.ArgumentMatchers.anyString());
+
+        assertThatThrownBy(() -> service.getHistoryForNegotiation(42L))
+                .isInstanceOf(AccessDeniedException.class);
+    }
+
+    @Test
+    void getHistoryForNegotiation_allowedForParticipant() {
+        when(repository.findByNegotiationIdOrderByCreatedAtAsc(42L))
+                .thenReturn(List.of(buildEntry(1L, 100, "ACTIVE", LocalDateTime.now())));
+        when(offerRepository.findById(42L)).thenReturn(java.util.Optional.of(buildOffer(42L)));
+        // guard no-op (ucesnik) → prolazi
+
+        assertThat(service.getHistoryForNegotiation(42L)).hasSize(1);
+        verify(accessGuard).ensureParticipantOrOversight(any(), any(), any(), any(),
+                org.mockito.ArgumentMatchers.anyString());
+    }
+
+    @Test
+    void getHistoryForNegotiation_offerDeleted_deniedForNonOversight() {
+        // Istorija prezivljava brisanje izvorne ponude — obican korisnik bez ponude
+        // za proveru ucesca mora dobiti 403; oversight (admin/supervisor) prolazi.
+        when(repository.findByNegotiationIdOrderByCreatedAtAsc(42L))
+                .thenReturn(List.of(buildEntry(1L, 100, "ACTIVE", LocalDateTime.now())));
+        when(offerRepository.findById(42L)).thenReturn(java.util.Optional.empty());
+        when(accessGuard.isAdminOrSupervisor()).thenReturn(false);
+
+        assertThatThrownBy(() -> service.getHistoryForNegotiation(42L))
+                .isInstanceOf(AccessDeniedException.class);
+    }
+
+    @Test
+    void getHistoryForNegotiation_offerDeleted_allowedForOversight() {
+        when(repository.findByNegotiationIdOrderByCreatedAtAsc(42L))
+                .thenReturn(List.of(buildEntry(1L, 100, "ACTIVE", LocalDateTime.now())));
+        when(offerRepository.findById(42L)).thenReturn(java.util.Optional.empty());
+        when(accessGuard.isAdminOrSupervisor()).thenReturn(true);
+
+        assertThat(service.getHistoryForNegotiation(42L)).hasSize(1);
     }
 
     // ──────────────────── findWithFilters — role check ────────────────────
@@ -244,6 +307,16 @@ class OtcNegotiationHistoryServiceTest {
                 .modifiedByName("Marko Markovic")
                 .createdAt(createdAt)
                 .build();
+    }
+
+    private OtcOffer buildOffer(Long id) {
+        OtcOffer offer = new OtcOffer();
+        offer.setId(id);
+        offer.setBuyerId(7L);
+        offer.setBuyerRole("CLIENT");
+        offer.setSellerId(8L);
+        offer.setSellerRole("CLIENT");
+        return offer;
     }
 
     private void authenticateAs(String... authorities) {

@@ -40,6 +40,18 @@ public class PaymentController {
     private final PaymentService paymentService;
     private final OtpService otpService;
 
+    /**
+     * P1-auth-2 (R1 105): {@code GET /payments/my-otp} vraca ZIVI 2FA kod u
+     * plaintext-u svakom autentifikovanom korisniku — to potpuno obesmisljava
+     * 2FA (svako ko procita response (ili ekran) zaobilazi OTP). U produkciji
+     * mora biti ugasen. Flag je default {@code false} (prod-safe); docker/dev
+     * profil ga moze ukljuciti sa {@code payments.expose-active-otp=true} za
+     * mobilni/dev mock flow. Kad je iskljucen, endpoint vraca 404 (kao da ne
+     * postoji — ne otkriva da je gejtovan).
+     */
+    @org.springframework.beans.factory.annotation.Value("${payments.expose-active-otp:false}")
+    private boolean exposeActiveOtp;
+
     @Operation(summary = "Create payment", description = "Creates a new payment for the authenticated client.")
     @ApiResponses({
             @ApiResponse(responseCode = "201", description = "Payment created", content = @Content(schema = @Schema(implementation = PaymentResponseDto.class))),
@@ -57,7 +69,9 @@ public class PaymentController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
 
-        // OTP verifikacija: verify atomicno proverava kod, inkrementuje attempts i markira used
+        // OTP verifikacija: verify atomicno proverava kod, inkrementuje attempts i
+        // SINGLE-USE potrosi kod (N2) — isti OTP ne moze da se replay-uje na drugo
+        // placanje. Replay vraca verified=false + replayed=true.
         String otpCode = request.getOtpCode();
         if (otpCode == null || otpCode.isBlank()) {
             return ResponseEntity.badRequest().build();
@@ -211,10 +225,18 @@ public class PaymentController {
                 "message", "Verifikacioni kod je poslat na vas email"));
     }
 
-    @Operation(summary = "Get active OTP", description = "Returns the active OTP code for the authenticated user (used by mobile app).")
+    @Operation(summary = "Get active OTP (DEV ONLY)",
+            description = "Returns the active OTP code for the authenticated user. DEV-only mock flow — "
+                    + "vraca 404 u produkciji (payments.expose-active-otp=false). Nikad ne sme da bude "
+                    + "ukljucen u produkciji jer plaintext-uje 2FA kod.")
     @GetMapping("/my-otp")
     public ResponseEntity<java.util.Map<String, Object>> getMyOtp(
             org.springframework.security.core.Authentication auth) {
+        // P1-auth-2 (R1 105): u produkciji endpoint ne postoji (404). Bez auth provere
+        // PRE flag-a — ne otkrivamo postojanje gejtovanog endpoint-a anonimnim/expired.
+        if (!exposeActiveOtp) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+        }
         String email = auth != null ? auth.getName() : null;
         if (email == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();

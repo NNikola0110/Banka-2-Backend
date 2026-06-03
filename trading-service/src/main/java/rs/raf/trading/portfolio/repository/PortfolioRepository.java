@@ -15,18 +15,10 @@ import java.util.Optional;
 public interface PortfolioRepository extends JpaRepository<Portfolio, Long> {
 
     /**
-     * Vraca sve portfolios za (userId, userRole). Koristiti ovu varijantu
-     * umesto {@link #findByUserId(Long)} kad je poznata uloga, posto
-     * clients.id i employees.id imaju preklapajuce prostore.
+     * Vraca sve portfolios za (userId, userRole). Posto clients.id i employees.id
+     * imaju preklapajuce prostore, uloga je obavezna da se izbegne cross-owner curenje.
      */
     List<Portfolio> findByUserIdAndUserRole(Long userId, String userRole);
-
-    /**
-     * @deprecated Moze vratiti portfolios za vise vlasnika razlicitih uloga
-     * ako se ID preklapa. Koristiti {@link #findByUserIdAndUserRole(Long, String)}.
-     */
-    @Deprecated
-    List<Portfolio> findByUserId(Long userId);
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT p FROM Portfolio p WHERE p.id = :id")
@@ -41,18 +33,18 @@ public interface PortfolioRepository extends JpaRepository<Portfolio, Long> {
                                                                     @Param("listingId") Long listingId);
 
     /**
-     * @deprecated Koristiti {@link #findByUserIdAndUserRoleAndListingIdForUpdate(Long, String, Long)}.
-     */
-    @Deprecated
-    @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @Query("SELECT p FROM Portfolio p WHERE p.userId = :userId AND p.listingId = :listingId")
-    Optional<Portfolio> findByUserIdAndListingIdForUpdate(@Param("userId") Long userId,
-                                                          @Param("listingId") Long listingId);
-
-    /**
      * Vraca sve Portfolio pozicije tipa STOCK sa quantity > 0.
      * Koristi ga DividendService za kvartalnu isplatu dividendi (B9).
      */
     @Query("SELECT p FROM Portfolio p WHERE p.quantity > 0 AND p.listingType = 'STOCK'")
     List<Portfolio> findAllStockPositionsWithQuantity();
+
+    /**
+     * P2-perf-nplus1-1 (R5 1898 / R5 1900): vraca SAMO pozicije sa
+     * {@code publicQuantity > 0} (DB-side filter). Zamenjuje {@code findAll()} +
+     * in-memory filter koji je bio pun-table-scan + GC pritisak nad CELOM
+     * {@code portfolios} tabelom (OTC discovery + interbank public-stock seam).
+     */
+    @Query("SELECT p FROM Portfolio p WHERE p.publicQuantity > 0")
+    List<Portfolio> findAllWithPublicQuantity();
 }

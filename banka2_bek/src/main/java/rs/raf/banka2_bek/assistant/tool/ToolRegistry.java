@@ -13,11 +13,10 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * Central registry svih ToolHandler bean-ova. Spring autowire-uje listu, mi
- * filtriramo po isEnabled() i exposujemo dispatch po imenu.
- *
- * Day 1 stub: skuplja sve handler-e koji su Spring bean-ovi, ali jos nema
- * konkretnih implementacija — ToolHandler bean-ovi se dodaju u Day 2-3.
+ * Central registry svih ToolHandler bean-ova. Spring autowire-uje listu svih
+ * {@code ToolHandler} (read i write/agentic) implementacija, mi filtriramo po
+ * {@code isEnabled()} i exposujemo dispatch po imenu (duplikati imena se loguju
+ * kao warning i poslednji pobedjuje).
  */
 @Component
 @RequiredArgsConstructor

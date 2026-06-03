@@ -104,8 +104,31 @@ public class OtcNegotiationService {
     @Autowired
     OtcNegotiationService self;
 
+    /**
+     * R7 observability: inkrementira {@code banka2_otc_contracts_created_total} kad se
+     * inter-bank OTC ugovor sklopi (accept → ACTIVE). Field injection sa
+     * {@code required=false} da se ne dira {@code @RequiredArgsConstructor} ni
+     * {@code @InjectMocks} unit-testovi; null-guard pri inkrementu.
+     */
+    @Autowired(required = false)
+    private rs.raf.banka2_bek.monitoring.BusinessMetrics businessMetrics;
+
     /** Cache po routing number-u partnerske banke. ConcurrentHashMap (low contention). */
     private final Map<Integer, CachedPublicStocks> publicStockCache = new ConcurrentHashMap<>();
+
+    /**
+     * R3 1539 — per-(seller,role,ticker) monitori za serijalizaciju seller-side
+     * kvote pri inbound kreiranju pregovora. Bez ovoga, dva partnera koja
+     * istovremeno kreiraju pregovor za istog prodavca/ticker citaju isti
+     * {@code available} i oba persist-uju → prodavac obecao vise akcija nego
+     * sto ima (over-allocation). Lock se uzima oko check+persist bloka.
+     *
+     * <p><b>Domet:</b> in-process (JVM) serijalizacija. Inter-bank inbound
+     * (/negotiations) je single-instance ulaz; cross-replica serijalizacija bi
+     * trazila DB advisory-lock (pg_advisory_xact_lock) — namerno odlozeno (PG-only,
+     * van H2 test-portabilnosti, bez DDL-a u ovom batch-u).
+     */
+    private final Map<String, Object> sellerQuotaLocks = new ConcurrentHashMap<>();
 
     // ────────────────────────── outbound (T2 / T5) ────────────────────────────
 
@@ -259,9 +282,38 @@ public class OtcNegotiationService {
      * §3.2 — partner banka inicira pregovor (kupac u partner banci, prodavac
      * mi). Validacija sellerId, kreiranje lokalnog entiteta, vracanje
      * ForeignBankId{nasRouting, generisaniId} kupcu.
+     *
+     * <p>R3 1539 — NAMERNO BEZ @Transactional. Akvizicija per-(seller,role,ticker)
+     * monitora se radi OKO transakcionog tela ({@code self.acceptCreatedNegotiationLocked}),
+     * tako da prvi inbound pregovor COMMIT-uje (i postaje vidljiv
+     * {@code sumActiveAmountForSellerAndTicker}-u) PRE nego sto drugi konkurentni
+     * inbound za istog prodavca/ticker procita kvotu. Da je lock unutar
+     * @Transactional metode, oslobodio bi se pre commit-a → drugi thread bi
+     * citao stale kvotu i over-allocation bi opstao.
+     */
+    public ForeignBankId acceptCreatedNegotiation(OtcOffer offer) {
+        if (offer == null) throw new IllegalArgumentException("offer ne sme biti null");
+        int myRouting = requireMyRoutingNumber();
+        if (offer.sellerId() == null) {
+            throw new IllegalArgumentException(
+                    "Mi nismo autoritativna banka za sellerId — sellerId.routingNumber mora biti nas (" + myRouting + ")");
+        }
+        // Lock kljuc po (seller-id-string, ticker) — pre validacije sadrzaja jer
+        // self.acceptCreatedNegotiationLocked ponavlja sve provere unutar Tx-a.
+        String lockKey = quotaLockKey(offer);
+        Object monitor = sellerQuotaLocks.computeIfAbsent(lockKey, k -> new Object());
+        synchronized (monitor) {
+            return self.acceptCreatedNegotiationLocked(offer);
+        }
+    }
+
+    /**
+     * §3.2 transakciono telo — kvota check + persist pod per-seller monitorom
+     * (vidi {@link #acceptCreatedNegotiation}). Self-pozvano kroz proxy da Spring
+     * AOP otvori @Transactional.
      */
     @Transactional
-    public ForeignBankId acceptCreatedNegotiation(OtcOffer offer) {
+    public ForeignBankId acceptCreatedNegotiationLocked(OtcOffer offer) {
         if (offer == null) throw new IllegalArgumentException("offer ne sme biti null");
         int myRouting = requireMyRoutingNumber();
 
@@ -633,6 +685,11 @@ public class OtcNegotiationService {
         contract.setCreatedAt(LocalDateTime.now());
         contractRepository.save(contract);
 
+        // R7 observability: sklopljen inter-bank OTC ugovor (banka2_otc_contracts_created_total).
+        if (businessMetrics != null) {
+            businessMetrics.recordOtcContractCreated();
+        }
+
         entity.setStatus(InterbankOtcNegotiationStatus.ACCEPTED);
         entity.setOngoing(false);
         entity.setLastModifiedByRoutingNumber(myParty.routingNumber());
@@ -696,6 +753,96 @@ public class OtcNegotiationService {
      */
     private static String stockReservationReleaseKey(Long negotiationEntityId) {
         return "otc-accept-compensate-" + negotiationEntityId + ":stock-release";
+    }
+
+    /**
+     * P0-B6 (Nalaz 1) — auto-expiry isteklih inter-bank OTC opcionih ugovora.
+     *
+     * <p>Bug koji resava: inter-bank ugovor se kreira ACTIVE pri §3.6 accept-u, sa
+     * {@code settlementDate}-om i rezervisanim sellerovim hartijama (§3.6 zadnji
+     * paragraf). Jedini prelaz iz ACTIVE je →EXERCISED (kupac iskoristi opciju).
+     * {@code EXPIRED} se NIGDE nije upisivao, pa kad settlementDate prodje bez
+     * exercise-a ugovor je ostajao TRAJNO ACTIVE, a sellerova rezervacija hartija
+     * je bila stranded zauvek (§2.7.2: "if that option was not used, the resources
+     * stuck in an option shall be un-reserved" — sad postovano).
+     *
+     * <p>Cist lokalni bookkeeping — BEZ wire-promene. Za svaki ACTIVE ugovor sa
+     * {@code settlementDate < now}:
+     * <ul>
+     *   <li>ako smo MI SELLER ({@code localPartyType == SELLER}) — oslobadjamo lokalnu
+     *       rezervaciju hartija preko {@link InterbankReservationApplier#releaseStock}
+     *       (idempotentno; trading-service razresava listing po ticker-u). Ako smo
+     *       BUYER, sellerova rezervacija zivi u partner banci — nemamo sta lokalno da
+     *       oslobodimo, samo markiramo status.</li>
+     *   <li>postavljamo status EXPIRED.</li>
+     * </ul>
+     *
+     * <p>Po-ugovor {@code REQUIRES_NEW} izolacija ({@link #expireOneContract}) tako da
+     * jedan release-fail (mrezni, trading-service down) ne rollback-uje vec uspesno
+     * isteknute ugovore iz iste runde.
+     *
+     * @return broj ugovora markiranih EXPIRED u ovoj rundi
+     */
+    public int expireSettledContracts() {
+        List<InterbankOtcContract> expired = contractRepository.findByStatusAndSettlementDateBefore(
+                InterbankOtcContractStatus.ACTIVE, OffsetDateTime.now(ZoneOffset.UTC));
+        int count = 0;
+        for (InterbankOtcContract c : expired) {
+            try {
+                self.expireOneContract(c.getId());
+                count++;
+            } catch (RuntimeException e) {
+                log.warn("OTC inter-bank expiry: ugovor #{} (ticker={}) nije uspeo da istekne: {}",
+                        c.getId(), c.getTicker(), e.getMessage());
+            }
+        }
+        if (count > 0) {
+            log.info("OTC inter-bank: {} ugovora isteklo i markirano EXPIRED", count);
+        }
+        return count;
+    }
+
+    /**
+     * Istice jedan inter-bank OTC ugovor u sopstvenoj transakciji ({@code REQUIRES_NEW}).
+     * Status-guard: samo ACTIVE → EXPIRED (race sa exercise-om koji je u medjuvremenu
+     * markirao EXERCISED ne sme biti pregazen). Sellerova rezervacija hartija se
+     * oslobadja PRE flip-a statusa; idempotentan release ne pravi stetu pri retry-u.
+     */
+    @Transactional(propagation = org.springframework.transaction.annotation.Propagation.REQUIRES_NEW)
+    public void expireOneContract(Long contractId) {
+        InterbankOtcContract contract = contractRepository.findById(contractId).orElse(null);
+        if (contract == null || contract.getStatus() != InterbankOtcContractStatus.ACTIVE) {
+            // Vec EXERCISED/EXPIRED u medjuvremenu (race) — ne diramo.
+            return;
+        }
+
+        // Oslobodi sellerovu rezervaciju hartija SAMO ako smo MI seller. Ako smo
+        // buyer, sellerova rezervacija je u partner banci (njihov lokalni bookkeeping).
+        if (contract.getLocalPartyType() == InterbankPartyType.SELLER) {
+            int qty = contract.getQuantity() != null ? contract.getQuantity().intValueExact() : 0;
+            if (qty > 0) {
+                reservationApplier.releaseStock(
+                        otcExpiryReleaseKey(contract.getId()),
+                        contract.getLocalPartyId(), contract.getLocalPartyRole(),
+                        contract.getTicker(), qty);
+            }
+        }
+
+        contract.setStatus(InterbankOtcContractStatus.EXPIRED);
+        contractRepository.save(contract);
+        log.info("OTC inter-bank ugovor #{} istekao (settlementDate={}) — status EXPIRED{}",
+                contract.getId(), contract.getSettlementDate(),
+                contract.getLocalPartyType() == InterbankPartyType.SELLER
+                        ? ", sellerova rezervacija hartija oslobodjena" : "");
+    }
+
+    /**
+     * Idempotency kljuc za oslobadjanje hartija pri auto-expiry-ju. Razlicit od
+     * reserve/compensate kljuceva (po contract id + faza "expire-release") da
+     * trading-service idempotency kes ne pomesa pozive.
+     */
+    private static String otcExpiryReleaseKey(Long contractEntityId) {
+        return "otc-expire-" + contractEntityId + ":stock-release";
     }
 
     /**
@@ -921,6 +1068,20 @@ public class OtcNegotiationService {
 
     private static BigDecimal nullToZero(BigDecimal value) {
         return value == null ? BigDecimal.ZERO : value;
+    }
+
+    /**
+     * R3 1539 — monitor kljuc za seller-kvota serijalizaciju. Bazira se na
+     * sirovom {@code sellerId.id()} (prefiksiran C-/E- string) + ticker, da bi
+     * dva inbound pregovora za istog prodavca i ticker delila isti monitor.
+     * Defanzivan na null (fallback na "?" — i dalje serijalizuje, samo grublje).
+     */
+    private static String quotaLockKey(OtcOffer offer) {
+        String sellerId = (offer.sellerId() != null && offer.sellerId().id() != null)
+                ? offer.sellerId().id() : "?";
+        String ticker = (offer.stock() != null && offer.stock().ticker() != null)
+                ? offer.stock().ticker() : "?";
+        return sellerId + "|" + ticker;
     }
 
     /** Test hook — programmatic cache invalidation (paket-private). */

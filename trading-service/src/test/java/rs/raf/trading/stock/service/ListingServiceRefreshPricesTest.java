@@ -378,30 +378,4 @@ class ListingServiceRefreshPricesTest {
         }
     }
 
-    // ─── loadInitialData ────────────────────────────────────────────────────────
-
-    @Nested
-    @DisplayName("loadInitialData")
-    class LoadInitialData {
-
-        @Test
-        @DisplayName("logs info when listings exist in database")
-        void listingsExist_logsInfo() {
-            when(listingRepository.count()).thenReturn(10L);
-
-            listingService.loadInitialData();
-
-            verify(listingRepository).count();
-        }
-
-        @Test
-        @DisplayName("logs warning when no listings in database")
-        void noListings_logsWarning() {
-            when(listingRepository.count()).thenReturn(0L);
-
-            listingService.loadInitialData();
-
-            verify(listingRepository).count();
-        }
-    }
 }

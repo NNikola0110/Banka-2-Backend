@@ -269,8 +269,12 @@ public class WizardRegistry {
                 simpleChoice("cardId", "Koju karticu odblokirate?",
                         (u, f) -> resolvers.userCards(u, false))
         );
+        // P0-B8 N3: odblokiranje je EMPLOYEE-only akcija (klijent moze samo da
+        // BLOKIRA svoju karticu, ne i da je odblokira). Ranije je wizard
+        // dozvoljavao i CLIENT pa je klijent kroz agenta mogao da odblokira
+        // karticu. Sada samo EMPLOYEE/ADMIN.
         templates.put("unblock_card", WizardTemplate.simple(
-                "unblock_card", "Odblokiranje kartice", slots, List.of("CLIENT", "EMPLOYEE")));
+                "unblock_card", "Odblokiranje kartice", slots, List.of("EMPLOYEE")));
     }
 
     private void registerChangeAccountName() {

@@ -292,6 +292,144 @@ class StopOrderActivationServiceTest {
         verify(orderRepository, never()).save(any(Order.class));
     }
 
+    // ── P1-dividends-order-1 (1321 / §329-331,358-360): trigger po ask/bid, ne po last price ──
+
+    @Test
+    void stopBuy_triggersOnAskNotLastPrice() {
+        // Spec §329: "Order se izvrsava kada ASK postane veci od stop vrednosti".
+        // Last price je ispod stopValue (ne bi okinuo), ali ASK je iznad -> mora okinuti.
+        Listing stock = new Listing();
+        stock.setId(20L);
+        stock.setPrice(new BigDecimal("145.00")); // last price ispod stopa
+        stock.setAsk(new BigDecimal("152.00"));   // ask iznad stopa -> trigger
+        stock.setBid(new BigDecimal("144.00"));
+
+        Order order = new Order();
+        order.setId(200L);
+        order.setOrderType(OrderType.STOP);
+        order.setDirection(OrderDirection.BUY);
+        order.setStopValue(new BigDecimal("150.00"));
+        order.setListing(stock);
+        order.setStatus(OrderStatus.APPROVED);
+
+        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED)).thenReturn(List.of(order));
+        when(listingRepository.findById(20L)).thenReturn(Optional.of(stock));
+
+        stopOrderActivationService.checkAndActivateStopOrders();
+
+        assertEquals(OrderType.MARKET, order.getOrderType());
+        verify(orderRepository, times(1)).save(order);
+    }
+
+    @Test
+    void stopBuy_askBelowStop_doesNotTrigger_evenIfLastPriceAbove() {
+        // Last price iznad stopa, ali ASK (po kome zapravo kupujemo) ispod -> NE okida.
+        Listing stock = new Listing();
+        stock.setId(21L);
+        stock.setPrice(new BigDecimal("155.00")); // last price iznad stopa
+        stock.setAsk(new BigDecimal("148.00"));   // ask ispod stopa -> NEMA trigger
+        stock.setBid(new BigDecimal("147.00"));
+
+        Order order = new Order();
+        order.setId(201L);
+        order.setOrderType(OrderType.STOP);
+        order.setDirection(OrderDirection.BUY);
+        order.setStopValue(new BigDecimal("150.00"));
+        order.setListing(stock);
+        order.setStatus(OrderStatus.APPROVED);
+
+        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED)).thenReturn(List.of(order));
+        when(listingRepository.findById(21L)).thenReturn(Optional.of(stock));
+
+        stopOrderActivationService.checkAndActivateStopOrders();
+
+        assertEquals(OrderType.STOP, order.getOrderType());
+        verify(orderRepository, never()).save(any(Order.class));
+    }
+
+    @Test
+    void stopSell_triggersOnBidNotLastPrice() {
+        // Spec §331: "Order se izvrsava kada BID postane manje od stop vrednosti".
+        // Last price iznad stopa, ali BID ispod -> mora okinuti.
+        Listing stock = new Listing();
+        stock.setId(22L);
+        stock.setPrice(new BigDecimal("95.00")); // last price iznad stopa
+        stock.setAsk(new BigDecimal("96.00"));
+        stock.setBid(new BigDecimal("88.00"));   // bid ispod stopa -> trigger
+
+        Order order = new Order();
+        order.setId(202L);
+        order.setOrderType(OrderType.STOP);
+        order.setDirection(OrderDirection.SELL);
+        order.setStopValue(new BigDecimal("90.00"));
+        order.setListing(stock);
+        order.setStatus(OrderStatus.APPROVED);
+
+        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED)).thenReturn(List.of(order));
+        when(listingRepository.findById(22L)).thenReturn(Optional.of(stock));
+
+        stopOrderActivationService.checkAndActivateStopOrders();
+
+        assertEquals(OrderType.MARKET, order.getOrderType());
+        verify(orderRepository, times(1)).save(order);
+    }
+
+    @Test
+    void stopLimitBuy_triggersOnAskNotLastPrice() {
+        // Spec §358: "Kada trzisna ASK cena dostigne ili predje Stop vrednost -> Buy Limit".
+        Listing stock = new Listing();
+        stock.setId(23L);
+        stock.setPrice(new BigDecimal("195.00")); // last price ispod stopa
+        stock.setAsk(new BigDecimal("205.00"));   // ask iznad stopa -> trigger
+        stock.setBid(new BigDecimal("194.00"));
+
+        Order order = new Order();
+        order.setId(203L);
+        order.setOrderType(OrderType.STOP_LIMIT);
+        order.setDirection(OrderDirection.BUY);
+        order.setStopValue(new BigDecimal("200.00"));
+        order.setLimitValue(new BigDecimal("206.00"));
+        order.setListing(stock);
+        order.setStatus(OrderStatus.APPROVED);
+
+        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED)).thenReturn(List.of(order));
+        when(listingRepository.findById(23L)).thenReturn(Optional.of(stock));
+
+        stopOrderActivationService.checkAndActivateStopOrders();
+
+        assertEquals(OrderType.LIMIT, order.getOrderType());
+        assertEquals(new BigDecimal("206.00"), order.getPricePerUnit());
+        verify(orderRepository, times(1)).save(order);
+    }
+
+    @Test
+    void stopLimitSell_triggersOnBidNotLastPrice() {
+        // Spec §360: "Kada trzisna BID cena padne ispod Stop vrednosti -> Sell Limit".
+        Listing stock = new Listing();
+        stock.setId(24L);
+        stock.setPrice(new BigDecimal("95.00")); // last price iznad stopa
+        stock.setAsk(new BigDecimal("96.00"));
+        stock.setBid(new BigDecimal("85.00"));   // bid ispod stopa -> trigger
+
+        Order order = new Order();
+        order.setId(204L);
+        order.setOrderType(OrderType.STOP_LIMIT);
+        order.setDirection(OrderDirection.SELL);
+        order.setStopValue(new BigDecimal("90.00"));
+        order.setLimitValue(new BigDecimal("84.00"));
+        order.setListing(stock);
+        order.setStatus(OrderStatus.APPROVED);
+
+        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED)).thenReturn(List.of(order));
+        when(listingRepository.findById(24L)).thenReturn(Optional.of(stock));
+
+        stopOrderActivationService.checkAndActivateStopOrders();
+
+        assertEquals(OrderType.LIMIT, order.getOrderType());
+        assertEquals(new BigDecimal("84.00"), order.getPricePerUnit());
+        verify(orderRepository, times(1)).save(order);
+    }
+
     @Test
     void testCheckAndActivate_NoStopOrders_NoAction() {
         when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED))

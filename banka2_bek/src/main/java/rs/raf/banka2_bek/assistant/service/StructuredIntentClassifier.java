@@ -9,6 +9,7 @@ import rs.raf.banka2_bek.assistant.config.AssistantProperties;
 import rs.raf.banka2_bek.assistant.dto.openai.OllamaGenerateRequest;
 import rs.raf.banka2_bek.assistant.dto.openai.OllamaGenerateResponse;
 import rs.raf.banka2_bek.assistant.tool.client.LlmHttpClient;
+import rs.raf.banka2_bek.assistant.util.LogSanitizer;
 import rs.raf.banka2_bek.auth.util.UserContext;
 
 import java.util.LinkedHashMap;
@@ -126,7 +127,9 @@ public class StructuredIntentClassifier {
 
             OllamaGenerateResponse resp = llmHttpClient.generate(req);
             if (resp == null || resp.response() == null || resp.response().isBlank()) {
-                log.info("ARBITRO StructuredIntentClassifier empty response for: {}", userMessage);
+                // [P2-input-validation-1 / R4 1782] sanitize CRLF iz user-input pre logovanja.
+                log.info("ARBITRO StructuredIntentClassifier empty response for: {}",
+                        LogSanitizer.sanitize(userMessage));
                 return Optional.empty();
             }
 
@@ -134,7 +137,9 @@ public class StructuredIntentClassifier {
             JsonNode toolNode = parsed.get("tool");
             JsonNode confNode = parsed.get("confidence");
             if (toolNode == null || confNode == null) {
-                log.info("ARBITRO StructuredIntentClassifier malformed JSON: {}", resp.response());
+                // resp.response() je LLM output (sadrzi reflektovan user-input) → sanitize.
+                log.info("ARBITRO StructuredIntentClassifier malformed JSON: {}",
+                        LogSanitizer.sanitize(resp.response()));
                 return Optional.empty();
             }
             String tool = toolNode.asText();

@@ -4,6 +4,8 @@ import com.influxdb.client.InfluxDBClient;
 import com.influxdb.client.InfluxDBClientFactory;
 import com.influxdb.client.WriteApiBlocking;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIf;
+import org.testcontainers.DockerClientFactory;
 import org.testcontainers.containers.InfluxDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -28,7 +30,21 @@ import static org.awaitility.Awaitility.await;
  * (ne samo unit mock-a).
  */
 @Testcontainers
+@EnabledIf("dockerAvailable")
 class OhlcvRecorderIntegrationTest {
+
+    /**
+     * JUnit5 ExecutionCondition (evaluira se PRE Testcontainers @BeforeAll-a koji
+     * pokrece kontejner) — ceo test se cisto preskace ako Docker daemon nije
+     * dostupan, umesto da puca sa container-startup greskom (CI / lokalno bez Docker-a).
+     */
+    static boolean dockerAvailable() {
+        try {
+            return DockerClientFactory.instance().isDockerAvailable();
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
 
     private static final String ORG = "banka2";
     private static final String BUCKET = "tick-listings";

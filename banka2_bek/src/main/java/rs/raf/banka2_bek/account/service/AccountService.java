@@ -41,14 +41,20 @@ public interface AccountService {
     AccountResponseDto updateAccountName(Long accountId, String newName);
 
     /**
-     * updating limit for acc
-     * @param accountId
-     * @param dailyLimit
-     * @param monthlyLimit
-     * @return
+     * Updates the daily/monthly spending limits for an account.
+     *
+     * <p>ACCEPTED-DEVIATION (user-directed 03.06): the OTP/verification gate that
+     * Celina 2 ("Promena limita (zahteva verifikaciju)") prescribed has been removed
+     * by explicit product decision — OTP now applies ONLY to payments and transfers
+     * (money-out). Limit change applies directly with no verification code.
+     *
+     * @param accountId   account ID
+     * @param dailyLimit  new daily limit (nullable — only applied when present)
+     * @param monthlyLimit new monthly limit (nullable — only applied when present)
+     * @return updated account
      */
-
-    AccountResponseDto updateAccountLimits(Long accountId, BigDecimal dailyLimit, BigDecimal monthlyLimit);
+    AccountResponseDto updateAccountLimits(Long accountId, BigDecimal dailyLimit,
+                                           BigDecimal monthlyLimit);
 
     Page<AccountResponseDto> getAllAccounts(int page, int limit, String ownerName);
 

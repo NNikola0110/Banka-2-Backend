@@ -24,6 +24,10 @@ import org.springframework.web.client.RestTemplate;
 import rs.raf.banka2.contracts.internal.InternalUserDto;
 import rs.raf.trading.client.BankaCoreClient;
 import rs.raf.trading.client.BankaCoreClientException;
+import rs.raf.trading.investmentfund.model.ClientFundPosition;
+import rs.raf.trading.investmentfund.model.InvestmentFund;
+import rs.raf.trading.investmentfund.repository.ClientFundPositionRepository;
+import rs.raf.trading.investmentfund.repository.InvestmentFundRepository;
 import rs.raf.trading.order.model.Order;
 import rs.raf.trading.order.model.OrderDirection;
 import rs.raf.trading.order.model.OrderStatus;
@@ -43,6 +47,7 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.when;
 
 /**
@@ -84,6 +89,12 @@ class ProfitBankControllerIntegrationTest {
     private ListingRepository listingRepository;
 
     @Autowired
+    private InvestmentFundRepository investmentFundRepository;
+
+    @Autowired
+    private ClientFundPositionRepository clientFundPositionRepository;
+
+    @Autowired
     private CacheManager cacheManager;
 
     @MockitoBean
@@ -108,6 +119,8 @@ class ProfitBankControllerIntegrationTest {
     void setUp() {
         orderRepository.deleteAll();
         listingRepository.deleteAll();
+        clientFundPositionRepository.deleteAll();
+        investmentFundRepository.deleteAll();
         // actuary-profit je @Cacheable; @SpringBootTest deli kontekst (i cache)
         // izmedju test metoda — ocisti da svaki test krene od svezeg izracuna.
         var cache = cacheManager.getCache("actuary-profit");
@@ -239,6 +252,58 @@ class ProfitBankControllerIntegrationTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).isEqualTo("[]");
+    }
+
+    @Test
+    @DisplayName("GET /profit-bank/fund-positions — 200 NON-empty kad banka ima poziciju u fondu (OT-1161)")
+    void fundPositions_nonEmptyForAdmin_whenBankHasPosition() {
+        // OT-1161 (TEST-tr-funds-dividends-profitbank-1): integracioni test je do sad
+        // pokrivao SAMO praznu listu (banka-klijent ne seed-ovan). Ovde seed-ujemo
+        // banka-klijenta (getUserByEmail za bank owner email) + InvestmentFund +
+        // ClientFundPosition (userRole=CLIENT, userId=bankClientId) i verifikujemo
+        // da /fund-positions vrati tu poziciju (non-empty grana listBankPositions).
+        Long bankClientId = 7777L;
+        // setUp() je stub-ovao getUserByEmail(anyString()) da BACI 404 (graceful prazna
+        // lista za default-ne testove). Ovde resetujemo mock da bismo cisto re-stub-ovali
+        // bankin owner email da VRATI klijenta (non-empty grana). Reset je bezbedan:
+        // actuary-performance stubovi nisu potrebni za /fund-positions.
+        reset(bankaCoreClient);
+        // bankin owner email default = banka2.doo@banka.rs (bez property override-a)
+        when(bankaCoreClient.getUserByEmail("banka2.doo@banka.rs")).thenReturn(
+                new InternalUserDto(bankClientId, "CLIENT", "banka2.doo@banka.rs",
+                        "Banka 2", "d.o.o.", true, null));
+
+        InvestmentFund fund = new InvestmentFund();
+        fund.setName("Banka 2 Stable Income");
+        fund.setDescription("Test fond");
+        fund.setMinimumContribution(new BigDecimal("1000.0000"));
+        fund.setManagerEmployeeId(SUPERVISOR_ID);
+        fund.setAccountId(99001L);
+        fund.setCreatedAt(LocalDateTime.now());
+        fund.setActive(true);
+        fund.setReinvestDividends(false);
+        InvestmentFund savedFund = investmentFundRepository.save(fund);
+
+        ClientFundPosition position = new ClientFundPosition();
+        position.setFundId(savedFund.getId());
+        position.setUserId(bankClientId);
+        position.setUserRole("CLIENT");
+        position.setTotalInvested(new BigDecimal("250000.0000"));
+        position.setLastModifiedAt(LocalDateTime.now());
+        clientFundPositionRepository.save(position);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                url("/profit-bank/fund-positions"),
+                HttpMethod.GET,
+                new HttpEntity<>(jsonHeaders(buildToken("admin@test.com", "ADMIN"))),
+                String.class
+        );
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isNotEqualTo("[]");
+        assertThat(response.getBody()).contains("\"fundName\":\"Banka 2 Stable Income\"");
+        assertThat(response.getBody()).contains("\"userId\":" + bankClientId);
+        assertThat(response.getBody()).contains("250000");
     }
 
     @Test

@@ -160,4 +160,26 @@ class InternalAuthFilterTest {
         assertThat(res.getStatus()).isEqualTo(401);
         assertThat(chain.getRequest()).isNull();
     }
+
+    // ─── TEST-branches-9: servlet-container auto-registracija filtera je ISKLJUCENA
+    //     (FilterRegistrationBean.setEnabled(false)) da se filter NE izvrsava dvaput
+    //     (jednom u servlet chain-u, jednom u Security chain-u). Merodavna je samo
+    //     Security-chain registracija (gde filter postavi ROLE_INTERNAL pre
+    //     AuthorizationFilter-a). R1-710. ──────────────────────────────────────────
+
+    @Test
+    void servletRegistrationOfInternalAuthFilterIsDisabled_TEST_branches_9() {
+        // Bean metod koristi SAMO svoj parametar (ne dira ostala 3 filtera), pa je
+        // bezbedno konstruisati GlobalSecurityConfig sa null-ovima za druge filtere.
+        rs.raf.banka2_bek.auth.config.GlobalSecurityConfig config =
+                new rs.raf.banka2_bek.auth.config.GlobalSecurityConfig(null, null, null, filter);
+
+        org.springframework.boot.web.servlet.FilterRegistrationBean<InternalAuthFilter> reg =
+                config.internalAuthFilterServletDisable(filter);
+
+        // KLJUCNA invarijanta: servlet auto-registracija mora biti iskljucena
+        // (inace dvostruko izvrsavanje filtera za /internal/** zahteve).
+        assertThat(reg.isEnabled()).isFalse();
+        assertThat(reg.getFilter()).isSameAs(filter);
+    }
 }

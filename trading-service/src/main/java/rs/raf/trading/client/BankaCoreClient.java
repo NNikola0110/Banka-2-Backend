@@ -11,6 +11,8 @@ import rs.raf.banka2.contracts.internal.CreditFundsRequest;
 import rs.raf.banka2.contracts.internal.CreditFundsResponse;
 import rs.raf.banka2.contracts.internal.DebitFundsRequest;
 import rs.raf.banka2.contracts.internal.DebitFundsResponse;
+import rs.raf.banka2.contracts.internal.IdempotencyStatusResponse;
+import rs.raf.banka2.contracts.internal.InterbankOtcExercisedDto;
 import rs.raf.banka2.contracts.internal.InternalAccountDto;
 import rs.raf.banka2.contracts.internal.InternalNotificationRequest;
 import rs.raf.banka2.contracts.internal.InternalOtpVerifyRequest;
@@ -88,6 +90,26 @@ public class BankaCoreClient {
     }
 
     /**
+     * P2-tax-interbank-otc-1 — vraca sve EXERCISED inter-bank OTC ugovore sa
+     * lokalnom stranom (GET /internal/interbank-otc/exercised). Koristi ga tax
+     * engine ({@code TaxService}) da ukljuci realizovanu kapitalnu dobit lokalnih
+     * CLIENT-ova iz inter-bank opcija u 15% obracun — banka-core nema tax modul,
+     * pa ovi ugovori inace ne bi bili oporezovani nigde. READ-ONLY; ne dira 2PC
+     * wire-protokol. Na HTTP gresku baca {@link BankaCoreClientException}.
+     */
+    public List<InterbankOtcExercisedDto> getExercisedInterbankOtc() {
+        InterbankOtcExercisedDto[] contracts = client.get()
+                .uri("/internal/interbank-otc/exercised")
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, (request, response) -> {
+                    throw new BankaCoreClientException(response.getStatusCode().value(),
+                            "banka-core GET /internal/interbank-otc/exercised → " + response.getStatusCode());
+                })
+                .body(InterbankOtcExercisedDto[].class);
+        return contracts == null ? List.of() : List.of(contracts);
+    }
+
+    /**
      * Vraca srednje devizne kurseve sa banka-core (GET /internal/fx/rates).
      * Koristi ga stock.ListingServiceImpl za FOREX cross-rate racun.
      */
@@ -104,6 +126,24 @@ public class BankaCoreClient {
     }
 
     // ── Identitet (faza 2c) ──────────────────────────────────────────────────
+
+    /**
+     * OT-1061: vraca id-eve svih aktivnih supervizora (banka-core
+     * {@code GET /internal/users/supervisors}). trading-service ga koristi da
+     * razresi primaoce tax-FX-failure in-app notifikacije — nema lokalnu listu
+     * supervizora. Na HTTP gresku baca {@link BankaCoreClientException}.
+     */
+    public List<Long> getSupervisorIds() {
+        Long[] ids = client.get()
+                .uri("/internal/users/supervisors")
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, (request, response) -> {
+                    throw new BankaCoreClientException(response.getStatusCode().value(),
+                            "banka-core GET /internal/users/supervisors → " + response.getStatusCode());
+                })
+                .body(Long[].class);
+        return ids == null ? List.of() : List.of(ids);
+    }
 
     /**
      * Razresava identitet (numericki id + rola) korisnika po email-u.
@@ -254,6 +294,27 @@ public class BankaCoreClient {
      */
     public TaxCollectResponse collectTax(String idempotencyKey, TaxCollectRequest req) {
         return post("/internal/funds/tax-collect", idempotencyKey, req, TaxCollectResponse.class);
+    }
+
+    /**
+     * <b>N4 (P0-T2):</b> autoritativan READ-ONLY upit banka-core-u da li je dati
+     * idempotency kljuc VEC KONZUMIRAN (operacija sa tim kljucem zaista izvrsena).
+     * Koristi ga OTC SAGA recovery (C3) da utvrdi da li je F3 {@code creditFunds}
+     * proslo pre pada — pa da bira pun reverzni transfer (consumed) vs commit-only
+     * refund kupcu (ne-consumed), umesto pogadjanja po write-ahead flag-ovima.
+     * Ne menja stanje (GET). Na HTTP gresku baca {@link BankaCoreClientException}.
+     */
+    public boolean isIdempotencyKeyConsumed(String idempotencyKey) {
+        IdempotencyStatusResponse resp = client.get()
+                .uri("/internal/funds/idempotency/{key}", idempotencyKey)
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, (request, response) -> {
+                    throw new BankaCoreClientException(response.getStatusCode().value(),
+                            "banka-core GET /internal/funds/idempotency/" + idempotencyKey
+                                    + " → " + response.getStatusCode());
+                })
+                .body(IdempotencyStatusResponse.class);
+        return resp != null && resp.consumed();
     }
 
     /**

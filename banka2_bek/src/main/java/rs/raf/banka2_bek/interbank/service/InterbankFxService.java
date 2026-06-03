@@ -25,27 +25,39 @@ import java.math.RoundingMode;
 public class InterbankFxService {
 
     /**
-     * Inter-bank settlement provizija (banka A naplacuje klijenta za
-     * cross-currency outbound). Razlikujemo od menjacnicke 1% jer ova ide
-     * direktno u inter-bank revenue racun banke (a ne u FX revenue).
+     * Inter-bank settlement provizija = <b>0.5%</b> (banka naplacuje za cross-currency
+     * inter-bank settlement). R1-675: ovo je RAZLICITA stavka od menjacnicke FX marze
+     * (1%, {@code CurrencyConversionService.FX_MARGIN}) — settlement fee ide u inter-bank
+     * revenue racun, a menjacnicka marza u FX revenue. Vrednosti (0.5% vs 1%) su namerno
+     * razlicite; ovaj komentar ih eksplicitno razdvaja da se ne mesaju.
      */
     private static final BigDecimal INTERBANK_SETTLEMENT_FEE = new BigDecimal("0.005");
 
     private final CurrencyConversionService currencyConversionService;
 
     /**
-     * Quote za outbound inter-bank payment.
+     * §Celina 5 §40-66: <b>inbound settlement na strani Banke B (primaoca)</b>.
      *
-     * @param amountSourceCurrency  iznos koji klijent posalje, u source valuti
-     * @param sourceCurrency        valuta posiljaoca
-     * @param targetCurrency        valuta primaoca
-     * @param chargeClientFee       true ako klijent placa proviziju (false za
-     *                              banka-banka settlement)
+     * <p>Banka B prima "Pocetnu vrednost" (originalni iznos u valuti posiljaoca)
+     * preko 2PC NEW_TX poruke, izracunava kurs i proviziju, i kreditira primaocu
+     * "Krajnju vrednost" = mid-rate konverzija MINUS inter-bank provizija, u
+     * valuti primaocevog racuna.
+     *
+     * <p>Provizija ide Banci B u <b>target</b> valuti i smanjuje iznos koji
+     * primalac dobija — tacno kako spec definise "Krajnju vrednost".
+     *
+     * <p>Same-currency je no-op: rate=1, fee=0, recipient dobija tacno {@code amount}
+     * (regression-safe — odgovara postojecem same-currency commit ponasanju).
+     *
+     * @param amountSourceCurrency  "Pocetna vrednost" — iznos u valuti posiljaoca
+     * @param sourceCurrency        valuta posiljaoca (wire valuta)
+     * @param targetCurrency        valuta primaocevog racuna kod Banke B
+     * @return quote gde {@code targetAmount} = "Krajnja vrednost" (recipient credit),
+     *         {@code commission} = Banka-B provizija u target valuti
      */
-    public InterbankFxQuote quoteOutboundPayment(BigDecimal amountSourceCurrency,
-                                                 String sourceCurrency,
-                                                 String targetCurrency,
-                                                 boolean chargeClientFee) {
+    public InterbankFxQuote quoteInboundSettlement(BigDecimal amountSourceCurrency,
+                                                   String sourceCurrency,
+                                                   String targetCurrency) {
         if (amountSourceCurrency == null || amountSourceCurrency.signum() <= 0) {
             throw new IllegalArgumentException("Amount must be positive");
         }
@@ -53,52 +65,80 @@ public class InterbankFxService {
             throw new IllegalArgumentException("Source/target currency must not be null");
         }
 
-        // Same-currency: nema FX, ali jos uvek moze imati inter-bank fee.
+        // Same-currency: nema FX, nema provizije — byte-identicno starom ponasanju.
         if (sourceCurrency.equalsIgnoreCase(targetCurrency)) {
-            BigDecimal fee = chargeClientFee
-                    ? amountSourceCurrency.multiply(INTERBANK_SETTLEMENT_FEE)
-                            .setScale(4, RoundingMode.HALF_UP)
-                    : BigDecimal.ZERO;
             return new InterbankFxQuote(
                     amountSourceCurrency,
-                    amountSourceCurrency.subtract(fee).setScale(4, RoundingMode.HALF_UP),
-                    fee,
+                    amountSourceCurrency,
+                    BigDecimal.ZERO,
                     BigDecimal.ONE,
                     BigDecimal.ONE,
                     sourceCurrency.toUpperCase(),
                     targetCurrency.toUpperCase());
         }
 
+        // Cross-currency: mid-rate konverzija (bez FX marze — provizija je
+        // zaseban inter-bank settlement fee, ne menjacnicki spread).
         ConversionResult result = currencyConversionService.convertForPurchase(
-                amountSourceCurrency, sourceCurrency, targetCurrency, chargeClientFee);
-
-        // Ako je naplaceno klijentu, nominalni iznos primalca je mid-rate
-        // konverzija; ConversionResult.amount() vec ukljucuje sve fee komponente.
-        BigDecimal targetNominal = chargeClientFee
-                ? result.amount().subtract(result.commission())
-                        .setScale(4, RoundingMode.HALF_UP)
-                : result.amount();
-
-        return new InterbankFxQuote(
-                amountSourceCurrency,
-                targetNominal,
-                result.commission(),
-                result.midRate(),
-                result.effectiveRate(),
-                sourceCurrency.toUpperCase(),
-                targetCurrency.toUpperCase());
+                amountSourceCurrency, sourceCurrency, targetCurrency, false);
+        return buildInboundQuote(amountSourceCurrency, sourceCurrency, targetCurrency,
+                result.amount(), result.midRate());
     }
 
     /**
-     * Quote za bank-to-bank settlement (banka A → banka B), bez provizije
-     * klijentu. Koristi se u Profit Banke flow-ima i internim transferima
-     * izmedju bankinih racuna.
+     * N5 — FX-pinned varijanta {@link #quoteInboundSettlement}. Umesto da povuce
+     * live mid-rate, koristi <b>zakljucan (pinned)</b> kurs iz VOTE faze. Tako commit
+     * uvek koristi isti kurs kao i provera stanja pri glasanju — FX drift izmedju
+     * vote-a i commit-a ne moze da pomeri isplatu izvan provere (overdraft / leak).
+     *
+     * @param amountSourceCurrency  "Pocetna vrednost" — iznos u valuti posiljaoca
+     * @param sourceCurrency        valuta posiljaoca (wire valuta)
+     * @param targetCurrency        valuta primaocevog racuna kod Banke B
+     * @param pinnedMidRate         zakljucan mid-rate source→target iz VOTE faze
      */
-    public InterbankFxQuote quoteBankSettlement(BigDecimal amountSourceCurrency,
-                                                String sourceCurrency,
-                                                String targetCurrency) {
-        return quoteOutboundPayment(amountSourceCurrency, sourceCurrency,
-                targetCurrency, false);
+    public InterbankFxQuote quoteInboundSettlementWithRate(BigDecimal amountSourceCurrency,
+                                                           String sourceCurrency,
+                                                           String targetCurrency,
+                                                           BigDecimal pinnedMidRate) {
+        if (amountSourceCurrency == null || amountSourceCurrency.signum() <= 0) {
+            throw new IllegalArgumentException("Amount must be positive");
+        }
+        if (sourceCurrency == null || targetCurrency == null) {
+            throw new IllegalArgumentException("Source/target currency must not be null");
+        }
+        if (pinnedMidRate == null || pinnedMidRate.signum() <= 0) {
+            throw new IllegalArgumentException("Pinned FX rate must be positive");
+        }
+
+        if (sourceCurrency.equalsIgnoreCase(targetCurrency)) {
+            return new InterbankFxQuote(
+                    amountSourceCurrency, amountSourceCurrency, BigDecimal.ZERO,
+                    BigDecimal.ONE, BigDecimal.ONE,
+                    sourceCurrency.toUpperCase(), targetCurrency.toUpperCase());
+        }
+
+        BigDecimal converted = amountSourceCurrency.multiply(pinnedMidRate)
+                .setScale(4, RoundingMode.HALF_UP);
+        return buildInboundQuote(amountSourceCurrency, sourceCurrency, targetCurrency,
+                converted, pinnedMidRate);
+    }
+
+    /** Zajednicki obracun inbound quote-a iz konvertovanog iznosa + mid-rate-a. */
+    private InterbankFxQuote buildInboundQuote(BigDecimal amountSourceCurrency,
+                                               String sourceCurrency, String targetCurrency,
+                                               BigDecimal converted, BigDecimal midRate) {
+        BigDecimal fee = converted.multiply(INTERBANK_SETTLEMENT_FEE)
+                .setScale(4, RoundingMode.HALF_UP);
+        BigDecimal recipientCredit = converted.subtract(fee).setScale(4, RoundingMode.HALF_UP);
+
+        return new InterbankFxQuote(
+                amountSourceCurrency,
+                recipientCredit,
+                fee,
+                midRate,
+                midRate,
+                sourceCurrency.toUpperCase(),
+                targetCurrency.toUpperCase());
     }
 
     /**
@@ -121,9 +161,5 @@ public class InterbankFxService {
             BigDecimal effectiveRate,
             String sourceCurrency,
             String targetCurrency) {
-
-        public boolean isCrossCurrency() {
-            return !sourceCurrency.equalsIgnoreCase(targetCurrency);
-        }
     }
 }

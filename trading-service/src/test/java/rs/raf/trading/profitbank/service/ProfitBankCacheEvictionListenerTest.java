@@ -54,13 +54,21 @@ class ProfitBankCacheEvictionListenerTest {
         assertThat(actuaryProfitCache.get("key")).isNull();
     }
 
+    /**
+     * R1 803: {@code OrderCompletedEvent.userRole()} dolazi iz
+     * {@code order.getUserRole()} koji nosi domenski string (EMPLOYEE/CLIENT/FUND),
+     * NIKAD Spring-prefiks {@code ROLE_EMPLOYEE}. Ranija {@code || == 'ROLE_EMPLOYEE'}
+     * grana je bila mrtva i uklonjena; ovaj test sad pinuje da prefiks-string NE
+     * evict-uje (dokumentuje stvarni event-contract).
+     */
     @Test
-    void roleEmployeeOrderCompleted_evictsCache() {
-        actuaryProfitCache.put("key", "stale-value");
+    void roleEmployeeOrderCompleted_doesNotEvictCache_deadBranchRemoved_R1_803() {
+        actuaryProfitCache.put("key", "fresh-value");
 
         eventPublisher.publishEvent(new OrderCompletedEvent(2L, 8L, "ROLE_EMPLOYEE", null));
 
-        assertThat(actuaryProfitCache.get("key")).isNull();
+        assertThat(actuaryProfitCache.get("key")).isNotNull();
+        assertThat(actuaryProfitCache.get("key").get()).isEqualTo("fresh-value");
     }
 
     @Test

@@ -161,6 +161,9 @@ public class EmployeeServiceImpl implements EmployeeService {
                 Long newManagerId = resolveCurrentAdminId(id);
                 tradingServiceInternalClient.reassignFundManager(id, newManagerId);
             }
+            // R1 391: oldValue je ranije bio null (stare permisije bacene). Sad belezimo
+            // stare permisije u oldValue radi smislenog before/after audit traga.
+            String oldPermissionsAudit = String.valueOf(oldPermissions);
             employee.setPermissions(request.getPermissions());
             // B7 audit hook (port iz main PR #86, Stasa Dragovic)
             Long actorId = resolveCurrentAdminId(id);
@@ -169,7 +172,7 @@ public class EmployeeServiceImpl implements EmployeeService {
                     AuditActionType.PERMISSIONS_CHANGED,
                     "Permissions updated for employee " + id,
                     "EMPLOYEE", id,
-                    null,
+                    oldPermissionsAudit,
                     String.valueOf(employee.getPermissions())
             );
         }
@@ -225,6 +228,41 @@ public class EmployeeServiceImpl implements EmployeeService {
 
         employee.setActive(false);
         employeeRepository.save(employee);
+
+        // P2-audit-coverage-1 (R5 1890): deaktivacija naloga zaposlenog je trajna,
+        // osetljiva akcija koja je bila bez audit traga (dok PERMISSIONS_CHANGED jeste).
+        // Aktor = izvrsilac (admin iz SecurityContext); best-effort (ne sme da fail-uje akciju).
+        Long actorId = resolveCurrentActorEmployeeId();
+        try {
+            auditLogService.record(
+                    actorId, "EMPLOYEE",
+                    AuditActionType.EMPLOYEE_DEACTIVATED,
+                    "Employee " + id + " deactivated",
+                    "EMPLOYEE", id,
+                    "active=true", "active=false");
+        } catch (Exception e) {
+            // best-effort — audit ne sme da obori deaktivaciju
+        }
+    }
+
+    /**
+     * P2-audit-coverage-1 (R5 1890): id trenutno autentifikovanog izvrsioca (zaposleni)
+     * iz SecurityContext-a. Vraca 0 (SYSTEM) kad nema auth konteksta (interni poziv).
+     */
+    private Long resolveCurrentActorEmployeeId() {
+        try {
+            org.springframework.security.core.Authentication auth =
+                    org.springframework.security.core.context.SecurityContextHolder
+                            .getContext().getAuthentication();
+            if (auth != null && auth.getName() != null) {
+                return employeeRepository.findByEmail(auth.getName())
+                        .map(Employee::getId)
+                        .orElse(0L);
+            }
+        } catch (RuntimeException ignored) {
+            // pad na 0 ispod
+        }
+        return 0L;
     }
 
     private String generateSalt() {

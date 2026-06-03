@@ -170,6 +170,32 @@ class IntentClassifierTest {
     }
 
     @Test
+    void classify_blocksEmployeeOnlyIntentForClient() {
+        // P0-B8 N3: i ako model emit-uje unblock_card za klijenta, klasifikator
+        // ga mora odbiti (employee-only intent).
+        when(wizardRegistry.has("unblock_card")).thenReturn(true);
+        when(llmHttpClient.chatNonStream(any(OpenAiChatRequest.class)))
+                .thenReturn(buildToolCallResponse("unblock_card"));
+
+        Optional<String> result = classifier.classify("odblokiraj karticu", clientUser);
+
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    void classify_allowsEmployeeOnlyIntentForEmployee() {
+        // P0-B8 N3: zaposleni SME unblock_card.
+        when(wizardRegistry.has("unblock_card")).thenReturn(true);
+        when(llmHttpClient.chatNonStream(any(OpenAiChatRequest.class)))
+                .thenReturn(buildToolCallResponse("unblock_card"));
+        UserContext employeeUser = new UserContext(7L, UserRole.EMPLOYEE);
+
+        Optional<String> result = classifier.classify("odblokiraj karticu klijentu", employeeUser);
+
+        assertThat(result).isPresent().contains("unblock_card");
+    }
+
+    @Test
     void classify_isCaseInsensitiveForCacheKey() {
         when(wizardRegistry.has("create_payment")).thenReturn(true);
         when(llmHttpClient.chatNonStream(any(OpenAiChatRequest.class)))

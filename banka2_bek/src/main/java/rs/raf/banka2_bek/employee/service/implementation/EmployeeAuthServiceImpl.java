@@ -1,6 +1,8 @@
 package rs.raf.banka2_bek.employee.service.implementation;
 
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -14,6 +16,7 @@ import rs.raf.banka2_bek.employee.service.EmployeeAuthService;
 
 import java.time.LocalDateTime;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Implementation of {@link EmployeeAuthService}.
@@ -22,6 +25,11 @@ import java.util.Optional;
 @Service
 @RequiredArgsConstructor
 public class EmployeeAuthServiceImpl implements EmployeeAuthService {
+
+    private static final Logger log = LoggerFactory.getLogger(EmployeeAuthServiceImpl.class);
+
+    /** Spec Sc 9: aktivacioni token traje 24h (isti TTL kao u createEmployee). */
+    private static final int ACTIVATION_TOKEN_TTL_HOURS = 24;
 
     private final ActivationTokenRepository activationTokenRepository;
     private final EmployeeRepository employeeRepository;
@@ -127,5 +135,61 @@ public class EmployeeAuthServiceImpl implements EmployeeAuthService {
                 .expiresAt(token.getExpiresAt())
                 .email(employee != null ? employee.getEmail() : null)
                 .build();
+    }
+
+    /**
+     * Spec Celina 1 Sc 9: slanje novog aktivacionog linka za zaposlenog ciji je
+     * (najcesce istekli) aktivacioni token prosledjen.
+     *
+     * <p>Anti-enumeration (mirror {@code AuthService.requestPasswordReset}):
+     * uvek se vraca tiho, bez izuzetka, bez razlikovanja "token ne postoji" /
+     * "nalog vec aktivan" — caller vraca istu generic poruku da se ne otkrije
+     * stanje naloga napadacu.
+     *
+     * <p>Tok kad zaposleni POSTOJI i NIJE aktivan:
+     *   1) invalidiraj sve njegove aktivne tokene (stari link prestaje da vredi),
+     *   2) generisi svez token sa istim 24h TTL kao u {@code createEmployee},
+     *   3) posalji nov aktivacioni email istim mehanizmom (sendActivationMail).
+     */
+    @Override
+    @Transactional
+    public void resendActivation(String tokenValue) {
+        if (tokenValue == null || tokenValue.isBlank()) {
+            // Bez interakcije sa bazom — generic no-op (anti-enumeration).
+            log.info("Sc9 resend-activation: prazan token, ignorisem (generic no-op).");
+            return;
+        }
+
+        Optional<ActivationToken> opt = activationTokenRepository.findByToken(tokenValue);
+        if (opt.isEmpty()) {
+            // Nepostojeci token — tiho izlazimo, bez 404 leak-a.
+            log.info("Sc9 resend-activation: token ne postoji, generic no-op (anti-enumeration).");
+            return;
+        }
+
+        Employee employee = opt.get().getEmployee();
+        if (employee == null || Boolean.TRUE.equals(employee.getActive())) {
+            // Nalog je vec aktivan (ili token bez vlasnika) — ne radimo nista, ista generic poruka.
+            log.info("Sc9 resend-activation: nalog vec aktivan ili token bez vlasnika, generic no-op.");
+            return;
+        }
+
+        // 1) Invalidiraj sve aktivne (neiskoriscene, ne-invalidovane) tokene zaposlenog.
+        activationTokenRepository.invalidateAllActiveTokensForEmployee(employee);
+
+        // 2) Generisi svez token sa istim 24h TTL kao u EmployeeServiceImpl.createEmployee.
+        String newTokenValue = UUID.randomUUID().toString();
+        ActivationToken freshToken = ActivationToken.builder()
+                .token(newTokenValue)
+                .employee(employee)
+                .expiresAt(LocalDateTime.now().plusHours(ACTIVATION_TOKEN_TTL_HOURS))
+                .used(false)
+                .invalidated(false)
+                .build();
+        activationTokenRepository.save(freshToken);
+
+        // 3) Posalji nov aktivacioni email (isti mehanizam kao createEmployee).
+        notificationPublisher.sendActivationMail(
+                employee.getEmail(), employee.getFirstName(), newTokenValue);
     }
 }

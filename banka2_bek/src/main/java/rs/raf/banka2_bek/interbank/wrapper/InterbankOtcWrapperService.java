@@ -2,7 +2,10 @@ package rs.raf.banka2_bek.interbank.wrapper;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import rs.raf.banka2_bek.account.model.Account;
 import rs.raf.banka2_bek.account.model.AccountStatus;
@@ -34,14 +37,22 @@ import rs.raf.banka2_bek.interbank.protocol.UserInformation;
 import rs.raf.banka2_bek.interbank.service.TransactionExecutorService;
 import rs.raf.banka2.contracts.internal.InternalListingDto;
 import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
+import rs.raf.banka2_bek.interbank.model.InterbankTransaction;
+import rs.raf.banka2_bek.interbank.model.InterbankTransactionStatus;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcContractRepository;
 import rs.raf.banka2_bek.interbank.repository.InterbankOtcNegotiationRepository;
+import rs.raf.banka2_bek.interbank.repository.InterbankTransactionRepository;
+import rs.raf.banka2_bek.interbank.service.InterbankReservationApplier;
 import rs.raf.banka2_bek.interbank.service.OtcNegotiationService;
 import rs.raf.banka2_bek.interbank.wrapper.InterbankOtcWrapperDtos.CounterOtcInterbankOfferRequest;
 import rs.raf.banka2_bek.interbank.wrapper.InterbankOtcWrapperDtos.CreateOtcInterbankOfferRequest;
+import rs.raf.banka2_bek.interbank.wrapper.InterbankOtcWrapperDtos.InterbankTransactionDto;
 import rs.raf.banka2_bek.interbank.wrapper.InterbankOtcWrapperDtos.OtcInterbankContract;
 import rs.raf.banka2_bek.interbank.wrapper.InterbankOtcWrapperDtos.OtcInterbankListing;
 import rs.raf.banka2_bek.interbank.wrapper.InterbankOtcWrapperDtos.OtcInterbankOffer;
+import rs.raf.banka2_bek.payment.model.Payment;
+import rs.raf.banka2_bek.payment.repository.PaymentRepository;
+import org.springframework.security.access.AccessDeniedException;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
@@ -83,6 +94,21 @@ public class InterbankOtcWrapperService {
     private final TradingServiceInternalClient tradingServiceClient;
     private final AccountRepository accountRepository;
     private final TransactionExecutorService transactionExecutor;
+    private final InterbankTransactionRepository interbankTransactionRepository;
+    private final PaymentRepository paymentRepository;
+    private final InterbankReservationApplier reservationApplier;
+
+    /**
+     * P1-interbank-otc-2 (1336/1337) — self-proxy za exercise claim/revert.
+     * Claim (lock contract + ACTIVE→EXERCISING + reserveMonas) i revert se izvrsavaju
+     * u zasebnim {@code REQUIRES_NEW} transakcijama PRE/POSLE out-of-tx 2PC
+     * {@code execute()}. Self-pozivi MORAJU ici kroz proxy da Spring AOP uhvati
+     * @Transactional na svakoj fazi (self-invocation kroz {@code this} preskace
+     * interceptor). Isti obrazac kao {@code OtcNegotiationService.self}.
+     */
+    @Lazy
+    @Autowired
+    InterbankOtcWrapperService self;
 
     /** Cache imena partner banaka po routing number-u (resolveUserName izlaz). */
     private final Map<String, UserInformation> userInfoCache = new ConcurrentHashMap<>();
@@ -144,6 +170,9 @@ public class InterbankOtcWrapperService {
 
     @Transactional
     public OtcInterbankOffer createOffer(CreateOtcInterbankOfferRequest request, Long buyerUserId, String buyerUserRole) {
+        // R1 209 — inter-bank OTC je za supervizore i klijente sa TRADE_STOCKS;
+        // agenti iskljuceni (mirror trading-service ensureOtcAccess).
+        ensureInterbankOtcAccess(buyerUserId, buyerUserRole);
         int myRouting = requireMyRoutingNumber();
         int sellerRouting = parseRoutingFromBankCode(request.sellerBankCode());
         if (sellerRouting == myRouting) {
@@ -300,6 +329,7 @@ public class InterbankOtcWrapperService {
     @Transactional
     public OtcInterbankOffer counterOffer(String offerId, CounterOtcInterbankOfferRequest request,
                                           Long userId, String userRole) {
+        ensureInterbankOtcAccess(userId, userRole); // R1 209
         ForeignBankId foreignId = parseForeignBankId(offerId);
         InterbankOtcNegotiation entity = lookupOrThrow(foreignId);
         ensureMyParty(entity, userId, userRole);
@@ -361,9 +391,17 @@ public class InterbankOtcWrapperService {
 
     @Transactional
     public OtcInterbankOffer declineOffer(String offerId, Long userId, String userRole) {
+        ensureInterbankOtcAccess(userId, userRole); // R1 209
         ForeignBankId foreignId = parseForeignBankId(offerId);
         InterbankOtcNegotiation entity = lookupOrThrow(foreignId);
         ensureMyParty(entity, userId, userRole);
+
+        // R6 1976 — state-machine guard: decline je legalan SAMO iz ACTIVE.
+        // Pre fix-a declineOffer/acceptOffer su bezuslovno flip-ovali status
+        // (proveravali samo ensureMyParty), pa je ilegalan prelaz ACCEPTED→DECLINED
+        // (ili DECLINED→DECLINED) prolazio. Intra (loadActiveOfferForParticipant) i
+        // inbound (OtcNegotiationService) RADE ovaj guard.
+        ensureNegotiationActive(entity);
 
         // Local close + (uslovni) DELETE outbound.
         entity.setOngoing(false);
@@ -393,9 +431,16 @@ public class InterbankOtcWrapperService {
 
     @Transactional
     public OtcInterbankOffer acceptOffer(String offerId, Long buyerAccountId, Long userId, String userRole) {
+        ensureInterbankOtcAccess(userId, userRole); // R1 209
         ForeignBankId foreignId = parseForeignBankId(offerId);
         InterbankOtcNegotiation entity = lookupOrThrow(foreignId);
         ensureMyParty(entity, userId, userRole);
+
+        // R6 1976 — state-machine guard PRE outbound 2PC accept (premium debit kod
+        // partnera). Bez ovog, dva accept-a istog pregovora (ili accept posle
+        // decline) bi pokrenula DVA 2PC accept-a → dupli premium debit. Guard mora
+        // biti PRE negotiationService.acceptOffer(...) jer to pomera novac.
+        ensureNegotiationActive(entity);
 
         if (entity.getLocalPartyType() != InterbankPartyType.BUYER) {
             // T2-G (Stage C UX polish, 2026-05-20): user-friendly poruka. Per
@@ -437,6 +482,159 @@ public class InterbankOtcWrapperService {
         return result;
     }
 
+    // ─── P1-9: GET /interbank/payments/{id} status view ────────────────────────
+
+    /**
+     * P1-9 — vraca FE-facing view inter-bank 2PC / OTC SAGA transakcije za polling
+     * progresa ({@code OtcInterBankContractsTab} poll-uje {@code GET /interbank/payments/{id}}).
+     *
+     * <p>Lookup id moze biti:
+     * <ol>
+     *   <li><b>OTC contract id</b> (numeric) — FE-ov {@code getTransactionLookupId}
+     *       padne na {@code String(transaction.id)} = contract id (OtcInterbankContract
+     *       DTO nema poseban transactionId field). Vlasnistvo: {@code localPartyId == userId}
+     *       i {@code localPartyRole} se poklapa. Status se mapira iz
+     *       {@code InterbankOtcContractStatus}.</li>
+     *   <li><b>2PC transaction id string</b> (protocol id) — inter-bank placanje.
+     *       Vlasnistvo se razresava preko vezanog {@code Payment} (placanje pripada
+     *       {@code fromAccount.client}). Status se mapira iz
+     *       {@code InterbankTransactionStatus} sa {@code ROLLED_BACK → ABORTED}.</li>
+     * </ol>
+     *
+     * <p>404 ako nista ne matchuje; {@link AccessDeniedException} (→ 403) ako resurs
+     * ne pripada pozivacu (anti-IDOR).
+     */
+    @Transactional(readOnly = true)
+    public InterbankTransactionDto getInterbankTransactionView(String lookupId, Long userId, String userRole) {
+        if (lookupId == null || lookupId.isBlank()) {
+            throw new java.util.NoSuchElementException("Transakcija nije pronadjena.");
+        }
+
+        // (1) Probaj kao OTC contract id (numeric) — FE-ov primarni slucaj.
+        Long contractId = null;
+        try {
+            contractId = Long.parseLong(lookupId.trim());
+        } catch (NumberFormatException ignored) {
+            // nije numeric → padni na transaction-id-string pretragu (placanja)
+        }
+        if (contractId != null) {
+            Optional<InterbankOtcContract> contractOpt = contractRepository.findById(contractId);
+            if (contractOpt.isPresent()) {
+                InterbankOtcContract contract = contractOpt.get();
+                // Anti-IDOR: samo vlasnik (lokalna strana ugovora) sme da vidi.
+                if (!contract.getLocalPartyId().equals(userId)
+                        || !contract.getLocalPartyRole().equalsIgnoreCase(userRole)) {
+                    throw new AccessDeniedException("Ugovor ne pripada trenutnom korisniku.");
+                }
+                return mapContractToTransactionView(contract);
+            }
+            // numeric id koji nije contract — moze i dalje biti InterbankTransaction
+            // id string koji slucajno izgleda numericki; nastavi na (2).
+        }
+
+        // (2) Probaj kao 2PC transaction id string (medjubankarsko placanje).
+        Optional<Payment> paymentOpt = paymentRepository
+                .findByInterbankTxRoutingNumberAndInterbankTxIdString(requireMyRoutingNumber(), lookupId);
+        if (paymentOpt.isPresent()) {
+            Payment payment = paymentOpt.get();
+            // Anti-IDOR: placanje mora pripadati pozivacu (vlasniku fromAccount-a).
+            boolean owns = payment.getFromAccount() != null
+                    && payment.getFromAccount().getClient() != null
+                    && payment.getFromAccount().getClient().getId().equals(userId)
+                    && "CLIENT".equalsIgnoreCase(userRole);
+            if (!owns) {
+                throw new AccessDeniedException("Placanje ne pripada trenutnom korisniku.");
+            }
+            InterbankTransaction ibTx = interbankTransactionRepository
+                    .findByTransactionRoutingNumberAndTransactionIdString(
+                            payment.getInterbankTxRoutingNumber(), payment.getInterbankTxIdString())
+                    .orElseThrow(() -> new java.util.NoSuchElementException(
+                            "Inter-bank transakcija nije pronadjena za placanje."));
+            return mapTransactionToView(ibTx, payment);
+        }
+
+        throw new java.util.NoSuchElementException("Transakcija nije pronadjena: " + lookupId);
+    }
+
+    /**
+     * Mapira {@code InterbankOtcContract} u FE view. Status mapiranje:
+     * ACTIVE → PREPARING (SAGA jos nije finalizovana / retryable),
+     * EXERCISED → COMMITTED, EXPIRED → ABORTED.
+     */
+    private InterbankTransactionDto mapContractToTransactionView(InterbankOtcContract c) {
+        String status;
+        String currentPhase;
+        switch (c.getStatus()) {
+            case EXERCISED -> { status = "COMMITTED"; currentPhase = "Finalizacija"; }
+            case EXPIRED   -> { status = "ABORTED";   currentPhase = null; }
+            default        -> { status = "PREPARING"; currentPhase = "Rezervacija sredstava"; }
+        }
+        BigDecimal money = c.getStrikePrice() != null && c.getQuantity() != null
+                ? c.getStrikePrice().multiply(c.getQuantity())
+                : null;
+        return new InterbankTransactionDto(
+                c.getId(),
+                String.valueOf(c.getId()),
+                "OTC",
+                status,
+                currentPhase,
+                "RN-" + c.getForeignPartyRoutingNumber(),   // sellerBankCode (foreign)
+                "RN-" + requireMyRoutingNumber(),           // our bank
+                money,
+                c.getStrikeCurrency(),
+                c.getTicker(),
+                c.getQuantity(),
+                c.getStrikePrice(),
+                c.getCreatedAt(),
+                c.getStatus() == InterbankOtcContractStatus.EXERCISED ? c.getExercisedAt() : null,
+                c.getStatus() == InterbankOtcContractStatus.EXPIRED ? c.getCreatedAt() : null,
+                0,
+                c.getStatus() == InterbankOtcContractStatus.EXPIRED
+                        ? "Opcioni ugovor je istekao bez iskoriscenja." : null
+        );
+    }
+
+    /**
+     * Mapira {@code InterbankTransaction} (2PC placanje) u FE view. Kljucno
+     * mapiranje po spec-u: {@code ROLLED_BACK → ABORTED} (FE nema ROLLED_BACK
+     * status). PREPARING/PREPARED/COMMITTED/STUCK ostaju 1:1.
+     */
+    private InterbankTransactionDto mapTransactionToView(InterbankTransaction ibTx, Payment payment) {
+        String status = mapTransactionStatus(ibTx.getStatus());
+        return new InterbankTransactionDto(
+                ibTx.getId(),
+                ibTx.getTransactionIdString(),
+                "PAYMENT",
+                status,
+                null,
+                "RN-" + ibTx.getTransactionRoutingNumber(),
+                // R1-683: receiverBankCode mora biti BANK KOD (kao u OTC view-u: "RN-"+routing),
+                // ne sirov broj racuna. Routing primaoceve banke je prvih 3 cifre dest. racuna.
+                receiverBankCodeFor(payment.getToAccountNumber()),
+                payment.getAmount(),
+                payment.getCurrency() != null ? payment.getCurrency().getCode() : null,
+                null,
+                null,
+                null,
+                ibTx.getCreatedAt(),
+                ibTx.getCommittedAt(),
+                ibTx.getRolledBackAt(),
+                ibTx.getRetryCount() != null ? ibTx.getRetryCount() : 0,
+                ibTx.getFailureReason()
+        );
+    }
+
+    /** §P1-9: ROLLED_BACK → ABORTED (FE shape); ostali statusi 1:1. */
+    private static String mapTransactionStatus(InterbankTransactionStatus status) {
+        return switch (status) {
+            case ROLLED_BACK -> "ABORTED";
+            case PREPARING -> "PREPARING";
+            case PREPARED -> "PREPARED";
+            case COMMITTED -> "COMMITTED";
+            case STUCK -> "STUCK";
+        };
+    }
+
     /**
      * Exercise inter-bank OTC ugovor sa nase (kupceve) strane (§2.7.2).
      * <p>
@@ -470,6 +668,9 @@ public class InterbankOtcWrapperService {
      */
     public OtcInterbankContract exerciseContract(String contractIdStr, Long buyerAccountId,
                                                  Long userId, String userRole) {
+        // R1 209 — exercise je OTC trgovinska akcija; isti gate kao create/accept.
+        ensureInterbankOtcAccess(userId, userRole);
+
         Long contractId;
         try {
             contractId = Long.parseLong(contractIdStr);
@@ -528,11 +729,24 @@ public class InterbankOtcWrapperService {
         }
 
         BigDecimal totalCost = contract.getStrikePrice().multiply(contract.getQuantity());
+        // Cheap fail-fast (ne-locking): konacna provera + hold se rade u claimForExercise.
         if (buyerAccount.getAvailableBalance().compareTo(totalCost) < 0) {
             throw new InterbankExceptions.InterbankExerciseConflictException(
                     "Nedovoljno sredstava na racunu " + buyerAccount.getAccountNumber()
                             + " za exercise (potrebno: " + totalCost + " " + contract.getStrikeCurrency() + ")");
         }
+
+        // R2 1336/1337 — exercise CLAIM (REQUIRES_NEW, lock contract + reserveMonas):
+        //  (1336) Lock-uje contract red i flip-uje ACTIVE→EXERCISING POD lock-om →
+        //         drugi konkurentni exercise cekajuci na lock-u vidi !ACTIVE i 409
+        //         (vise nema dvostrukog 2PC/debit-a).
+        //  (1337) reserveMonas pomera availableBalance→reservedAmount pod pessimistic
+        //         account lock-om (atomicna balance provera) → konkurentno placanje vise
+        //         ne moze isprazniti racun izmedju provere i commit-a; commitLocal-ov
+        //         commitMonas(isDebit=false) konzumira upravo ovu rezervaciju.
+        // Claim je commit-ovan PRE out-of-tx 2PC. Ako 2PC padne — revert (EXERCISING→
+        // ACTIVE + releaseMonas) u zasebnoj REQUIRES_NEW transakciji.
+        self.claimForExercise(contractId, buyerAccount.getAccountNumber(), totalCost);
 
         // Formiraj exercise transakciju per §2.7.2.
         int myRouting = requireMyRoutingNumber();
@@ -564,16 +778,66 @@ public class InterbankOtcWrapperService {
                 null, "OTC-EX", "Iskoriscavanje OTC opcionog ugovora"
         );
 
-        // Pozovi 2PC OUT-OF-TX (execute koordinira svoju per-fazu Tx). Ako padne,
-        // exception se propagira — contract ostaje ACTIVE i kupac moze da retry-uje.
-        // Na uspesan COMMIT_TX, commitLocal heuristika (vidi TransactionExecutorService)
-        // detektuje Stock+Option posting i postavlja contract.status=EXERCISED.
-        transactionExecutor.execute(tx);
+        // Pozovi 2PC OUT-OF-TX (execute koordinira svoju per-fazu Tx). Na uspesan
+        // COMMIT_TX, commitLocal heuristika (vidi TransactionExecutorService) detektuje
+        // Stock+Option posting i postavlja contract.status EXERCISING→EXERCISED +
+        // commitMonas konzumira rezervaciju. Ako 2PC padne — revert claim (oslobodi
+        // rezervaciju + EXERCISING→ACTIVE) pa propagiraj da kupac moze retry.
+        try {
+            transactionExecutor.execute(tx);
+        } catch (RuntimeException ex) {
+            self.revertExerciseClaim(contractId, buyerAccount.getAccountNumber(), totalCost);
+            throw ex;
+        }
 
         // Posle uspesnog 2PC ucitaj contract sveze (commitLocal je vec save-ovao).
         InterbankOtcContract refreshed = contractRepository.findById(contractId).orElse(contract);
         log.info("OTC inter-bank contract {} exercised (buyerAccount={})", contractId, buyerAccountId);
         return mapContractToDto(refreshed);
+    }
+
+    /**
+     * R2 1336/1337 — exercise claim (REQUIRES_NEW). Lock-uje contract red, re-citanje
+     * statusa POD lock-om, flip ACTIVE→EXERCISING, i rezervise buyer-ova sredstva
+     * ({@code reserveMonas} — atomicna availableBalance provera + hold pod account
+     * lock-om). Drugi konkurentni exercise koji cekanje na contract lock-u vidi
+     * status != ACTIVE → 409. Commit-uje se PRE out-of-tx 2PC (write-ahead claim).
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void claimForExercise(Long contractId, String buyerAccountNumber, BigDecimal totalCost) {
+        InterbankOtcContract locked = contractRepository.findByIdForUpdate(contractId)
+                .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
+                        "Ugovor " + contractId + " ne postoji"));
+        if (locked.getStatus() != InterbankOtcContractStatus.ACTIVE) {
+            throw new InterbankExceptions.InterbankExerciseConflictException(
+                    "Ugovor nije ACTIVE (trenutno: " + locked.getStatus()
+                            + ") — exercise je vec u toku ili zavrsen");
+        }
+        // Hold sredstava (atomicno pod account lock-om; baca ProtocolException ako se
+        // availableBalance u medjuvremenu smanjio ispod totalCost — 1337 race-window).
+        reservationApplier.reserveMonas(buyerAccountNumber, totalCost);
+        locked.setStatus(InterbankOtcContractStatus.EXERCISING);
+        contractRepository.save(locked);
+    }
+
+    /**
+     * R2 1336/1337 — revert exercise claim (REQUIRES_NEW) na 2PC pad. Oslobodi
+     * rezervaciju i vrati EXERCISING→ACTIVE da kupac moze da retry-uje. Idempotentno:
+     * ako je status vec EXERCISED (2PC ipak commit-ovao) ili nije EXERCISING, ne
+     * dira novac (release se izvrsava samo dok je contract jos EXERCISING).
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void revertExerciseClaim(Long contractId, String buyerAccountNumber, BigDecimal totalCost) {
+        InterbankOtcContract locked = contractRepository.findByIdForUpdate(contractId)
+                .orElse(null);
+        if (locked == null || locked.getStatus() != InterbankOtcContractStatus.EXERCISING) {
+            // Vec finalizovan (EXERCISED) ili ne postoji — rezervaciju je vec
+            // konzumirao commitMonas; ne dupliraj release.
+            return;
+        }
+        reservationApplier.releaseMonas(buyerAccountNumber, totalCost);
+        locked.setStatus(InterbankOtcContractStatus.ACTIVE);
+        contractRepository.save(locked);
     }
 
     /**
@@ -598,6 +862,25 @@ public class InterbankOtcWrapperService {
                     "interbank.my-routing-number nije konfigurisan");
         }
         return my;
+    }
+
+    /**
+     * R1-683: izvedi {@code receiverBankCode} ("RN-"+routing) iz broja racuna primaoca,
+     * da PAYMENT view bude konzistentan sa OTC view-om (koji koristi isti "RN-" format).
+     * Routing je prvih 3 cifre racuna (vidi {@code BankRoutingService.parseRoutingNumber}).
+     * Ako racun nije parsabilan/null, vrati sirov racun kao fallback (ne pucaj na display putu).
+     */
+    private static String receiverBankCodeFor(String toAccountNumber) {
+        if (toAccountNumber != null && toAccountNumber.length() >= 3) {
+            String first3 = toAccountNumber.substring(0, 3);
+            try {
+                Integer.parseInt(first3);
+                return "RN-" + first3;
+            } catch (NumberFormatException ignored) {
+                // nije numericki prefiks — fallback na sirov racun
+            }
+        }
+        return toAccountNumber;
     }
 
     private static int parseRoutingFromBankCode(String bankCode) {
@@ -657,6 +940,62 @@ public class InterbankOtcWrapperService {
             throw new InterbankExceptions.InterbankProtocolException(
                     "Pregovor ne pripada trenutno autentifikovanom korisniku");
         }
+    }
+
+    /**
+     * R6 1976 — state-machine guard. Mutirajuce OTC akcije (accept/decline) su
+     * legalne SAMO iz ACTIVE stanja. Pre fix-a su flip-ovale status bezuslovno →
+     * ilegalan prelaz (ACCEPTED→DECLINED, DECLINED→ACCEPTED) + dvostruki 2PC accept
+     * (dupli premium debit kod partnera).
+     */
+    private static void ensureNegotiationActive(InterbankOtcNegotiation entity) {
+        if (entity.getStatus() != InterbankOtcNegotiationStatus.ACTIVE) {
+            throw new InterbankExceptions.InterbankNegotiationConflictException(
+                    "Pregovor nije ACTIVE (trenutno: " + entity.getStatus()
+                            + ") — akcija nije dozvoljena nad zatvorenim/prihvacenim pregovorom");
+        }
+    }
+
+    /**
+     * R1 209 — inter-bank OTC pristup. Po Celini 4 (Nova) §145-148: OTC trgovina je
+     * dozvoljena SUPERVIZORIMA (od zaposlenih) i KLIJENTIMA sa permisijom za trgovinu;
+     * AGENTI su eksplicitno iskljuceni. Mirror {@code trading-service OtcService.ensureOtcAccess},
+     * ali razresava preko repozitorijuma (u banka-core klijentski JWT NE nosi
+     * {@code TRADE_STOCKS} autoritet — vidi {@code User.getAuthorities()} koji daje
+     * samo {@code ROLE_<role>}; zaposleni preko {@code EmployeeUserDetails} nose
+     * permisije kao autoritete, ali repository-resolved provera je deterministicna za
+     * obe role i ne zavisi od populacije SecurityContext-a).
+     *
+     * @throws AccessDeniedException (→403) ako klijent nema {@code canTradeStocks},
+     *         agent (zaposleni bez SUPERVISOR/ADMIN), ili nepoznata rola/korisnik.
+     */
+    private void ensureInterbankOtcAccess(Long userId, String userRole) {
+        if (userId == null || userRole == null) {
+            throw new AccessDeniedException("Korisnicki identitet nije razresen za OTC pristup.");
+        }
+        if ("CLIENT".equalsIgnoreCase(userRole)) {
+            Client client = clientRepository.findById(userId)
+                    .orElseThrow(() -> new AccessDeniedException("Klijent ne postoji."));
+            if (!Boolean.TRUE.equals(client.getCanTradeStocks())) {
+                throw new AccessDeniedException(
+                        "Nemate dozvolu za OTC trgovinu (permisija za trgovanje nije dodeljena).");
+            }
+            return;
+        }
+        if ("EMPLOYEE".equalsIgnoreCase(userRole)) {
+            Employee employee = employeeRepository.findById(userId)
+                    .orElseThrow(() -> new AccessDeniedException("Zaposleni ne postoji."));
+            java.util.Set<String> perms = employee.getPermissions();
+            boolean isSupervisor = perms != null
+                    && (perms.contains("SUPERVISOR") || perms.contains("ADMIN"));
+            if (!isSupervisor) {
+                throw new AccessDeniedException(
+                        "OTC je dozvoljen samo supervizorima i klijentima (po Celini 4 Nova) — "
+                                + "agenti su iskljuceni.");
+            }
+            return;
+        }
+        throw new AccessDeniedException("Nepoznata uloga ne moze pristupiti inter-bank OTC-u.");
     }
 
     private OtcInterbankOffer mapNegotiationToDto(InterbankOtcNegotiation n) {

@@ -27,7 +27,14 @@ import java.time.LocalDateTime;
 // referenceType="RECURRING_ORDER", referenceId=recurringOrderId.
 
 @Entity
-@Table(name = "notifications")
+// R5-1897: SVE query metode (paged list, countBy...AndRead unread-count koji FE
+// poll-uje na interval, markAllReadForRecipient) filtriraju po
+// (recipient_id, recipient_type). Bez indexa unread-count poll je seq-scan nad
+// rastucom tabelom na svaki FE tick. Drugi entiteti (Card/Branch/interbank) vec
+// imaju @Index pa je ovo propust konvencije, ne dizajn.
+@Table(name = "notifications", indexes = {
+        @Index(name = "idx_notification_recipient", columnList = "recipient_id, recipient_type")
+})
 @Getter
 @Setter
 @NoArgsConstructor

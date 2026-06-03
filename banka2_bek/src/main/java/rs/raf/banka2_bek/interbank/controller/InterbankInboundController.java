@@ -7,10 +7,12 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import rs.raf.banka2_bek.interbank.config.InterbankProperties;
 import rs.raf.banka2_bek.interbank.exception.InterbankExceptions;
+import rs.raf.banka2_bek.interbank.model.InterbankMessage;
 import rs.raf.banka2_bek.interbank.protocol.*;
 import rs.raf.banka2_bek.interbank.service.InterbankMessageService;
 import rs.raf.banka2_bek.interbank.service.TransactionExecutorService;
 import rs.raf.banka2_bek.interbank.util.SecurityUtils;
+import rs.raf.banka2_bek.monitoring.BusinessMetrics;
 import java.util.Optional;
 
 
@@ -24,6 +26,7 @@ public class InterbankInboundController {
     private final ObjectMapper objectMapper;
     private final InterbankMessageService interbankMessageService;
     private final TransactionExecutorService transactionExecutorService;
+    private final BusinessMetrics businessMetrics;
 
     /**
      * Glavni endpoint po §2.11. Body je Message<Type> envelope sa
@@ -65,6 +68,11 @@ public class InterbankInboundController {
 
         InterbankProperties.PartnerBank partnerBank = partnerBankOpt.get();
 
+        // R7 observability: zabelezi autentifikovan inbound inter-bank zahtev
+        // (banka2_interbank_inbound_total). Broji se posle X-Api-Key validacije
+        // (neautentifikovani 401-i nisu legitiman protokolarni saobracaj).
+        businessMetrics.recordInterbankInbound();
+
         // Parse envelope — throws JsonProcessingException (→ 400 via advice) on malformed JSON.
         JsonNode envelope = objectMapper.readTree(rawBody);
 
@@ -97,10 +105,28 @@ public class InterbankInboundController {
                     "idempotenceKey.routingNumber mismatches X-Api-Key sender");
         }
 
-        Optional<String> cachedResponseOpt = interbankMessageService.findCachedResponse(idempotenceKey);
+        // 1377 — type-aware idempotency cache lookup. §2.2 kljuc je
+        // (senderRoutingNumber, locallyGeneratedKey) i posiljalac generise svez kljuc
+        // po poruci, pa svaki messageType ima distinktan kljuc. Branimo se ipak od
+        // key-collision-a: ako stigne poruka cija se vrsta NE poklapa sa vec kesiranom
+        // vrstom pod istim kljucem (npr. COMMIT_TX pod kljucem koji vec ima kesiran
+        // NEW_TX vote), NE smemo slepo vratiti kesiran odgovor — COMMIT_TX bi dobio
+        // TransactionVote i commit se nikad ne bi izvrsio (novac zaglavljen). Odbijamo
+        // neuskladjenost kao protocol violation (400).
+        Optional<InterbankMessage> cachedMessageOpt =
+                interbankMessageService.findCachedMessage(idempotenceKey);
 
-        if (cachedResponseOpt.isPresent()) {
-            String cachedResponse = cachedResponseOpt.get();
+        if (cachedMessageOpt.isPresent()) {
+            InterbankMessage cached = cachedMessageOpt.get();
+
+            if (cached.getMessageType() != null && cached.getMessageType() != messageType) {
+                throw new InterbankExceptions.InterbankProtocolException(
+                        "idempotenceKey already used for a " + cached.getMessageType()
+                                + " message; cannot reuse it for " + messageType
+                                + " (idempotency key must be unique per message).");
+            }
+
+            String cachedResponse = cached.getResponseBody();
 
             if (cachedResponse == null || cachedResponse.isBlank()) {
                 return ResponseEntity.noContent().build();

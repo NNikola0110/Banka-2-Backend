@@ -28,6 +28,7 @@ import rs.raf.trading.security.TradingUserResolver;
 import rs.raf.trading.stock.model.Listing;
 import rs.raf.trading.stock.repository.ListingRepository;
 import rs.raf.trading.stock.util.ListingCurrencyResolver;
+import rs.raf.trading.tax.util.TaxConstants;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -56,8 +57,10 @@ import java.util.stream.Collectors;
 @Slf4j
 public class DividendService {
 
-    private static final BigDecimal TAX_RATE = new BigDecimal("0.15");
-    private static final BigDecimal FOUR = new BigDecimal("4");
+    // R1 798: stopa poreza je centralizovana u TaxConstants (deljena sa TaxService);
+    // tax = TaxConstants.computeTax(grossAmount).
+    // Kvartalni delilac (godisnji yield / 4) — dividendna domena, nije poreska konstanta.
+    private static final BigDecimal QUARTERS_PER_YEAR = new BigDecimal("4");
 
     private final DividendPayoutRepository dividendPayoutRepository;
     private final PortfolioRepository portfolioRepository;
@@ -108,10 +111,21 @@ public class DividendService {
         int skipped = 0;
 
         for (Map.Entry<String, List<Portfolio>> entry : grouped.entrySet()) {
-            Portfolio position = entry.getValue().get(0);
+            List<Portfolio> group = entry.getValue();
+            Portfolio position = group.get(0);
             Long listingId = position.getListingId();
             Long ownerId = position.getUserId();
             String ownerType = position.getUserRole();
+
+            // P1-dividends-order-1 (R1 227): vlasnik moze imati VISE Portfolio redova za
+            // istu hartiju (parcijalni fillovi) — dividenda se placa na UKUPNU kolicinu.
+            // Pre fix-a: placalo se samo group.get(0).getQuantity() -> underpay. Sumiramo
+            // sve redove grupe u jednu reprezentativnu poziciju (na kopiji, da ne mutiramo
+            // perzistovan entitet).
+            if (group.size() > 1) {
+                int totalQty = group.stream().mapToInt(Portfolio::getQuantity).sum();
+                position = aggregatePosition(position, totalQty);
+            }
 
             // Idempotentnost per-vlasnik: proveravamo da li je ovaj (owner, listing, date)
             // vec isplacen, a ne samo da li postoji bilo koji payout za taj listing+datum.
@@ -169,17 +183,33 @@ public class DividendService {
         List<InvestmentFund> activeFunds = investmentFundRepository.findByActiveTrueOrderByNameAsc();
         for (InvestmentFund fund : activeFunds) {
             try {
-                if (Boolean.TRUE.equals(fund.getReinvestDividends())) {
-                    fundDividendService.reinvestDividends(fund.getId());
-                } else {
-                    fundDividendService.distributeDividendsToClients(fund.getId());
-                }
+                // R1 796 — deljeni per-fund reinvest-vs-distribute switch zivi u FundDividendService.
+                fundDividendService.dispatchByPolicy(fund);
             } catch (Exception ex) {
                 log.error("TODO_final C4 #14: dispatch dividendi za fond #{} ({}) propao: {}",
                         fund.getId(), fund.getName(), ex.getMessage(), ex);
                 // Nastavljamo — jedna greska ne sme da blokira ostale fondove.
             }
         }
+    }
+
+    /**
+     * P1-dividends-order-1 (R1 227): pravi plitku kopiju Portfolio pozicije sa
+     * agregiranom (sumiranom) kolicinom svih redova vlasnika za istu hartiju.
+     * Kopija se NE perzistuje (nije managed) — sluzi samo kao nosilac ukupne
+     * kolicine za obracun dividende. Ostala polja (owner, listing, ticker) se
+     * preuzimaju iz reprezentativnog reda.
+     */
+    private Portfolio aggregatePosition(Portfolio representative, int totalQuantity) {
+        Portfolio agg = new Portfolio();
+        agg.setUserId(representative.getUserId());
+        agg.setUserRole(representative.getUserRole());
+        agg.setListingId(representative.getListingId());
+        agg.setListingTicker(representative.getListingTicker());
+        agg.setListingName(representative.getListingName());
+        agg.setListingType(representative.getListingType());
+        agg.setQuantity(totalQuantity);
+        return agg;
     }
 
     // ── Jedna transakciona isplata ────────────────────────────────────────────
@@ -220,11 +250,19 @@ public class DividendService {
         }
 
         // 2. Izracunaj iznose.
+        // P1-dividends-order-1 (R5 1843): gross se racuna u JEDNOM lancu
+        // (qty × price × annualYield / 4) sa visokom preciznoscu, pa se tek
+        // grossAmount zaokruzi na money scale. Pre fix-a se quarterlyYield
+        // zaokruzivao na scale-6 PRE mnozenja sa (qty×price) — za veliki quantity
+        // (npr. 1.000.000 akcija) ta truncation se mnozi i akumulira gresku do
+        // celih jedinica valute. quarterlyYield se i dalje cuva na DividendPayout
+        // kao prikazna vrednost (scale-6), ali se NE koristi u obracunu.
         BigDecimal quarterlyYield = annualYield
-                .divide(FOUR, 6, RoundingMode.HALF_UP);
+                .divide(QUARTERS_PER_YEAR, 6, RoundingMode.HALF_UP);
         BigDecimal grossAmount = BigDecimal.valueOf(quantity)
                 .multiply(price)
-                .multiply(quarterlyYield)
+                .multiply(annualYield)
+                .divide(QUARTERS_PER_YEAR, java.math.MathContext.DECIMAL128)
                 .setScale(4, RoundingMode.HALF_UP);
 
         // 2.5. B11 — FUND-vlasnistvo dispatch: ne knjizimo direktno, vec
@@ -238,7 +276,7 @@ public class DividendService {
         boolean taxExempt = "EMPLOYEE".equals(ownerType);
         BigDecimal tax = taxExempt
                 ? BigDecimal.ZERO
-                : grossAmount.multiply(TAX_RATE).setScale(4, RoundingMode.HALF_UP);
+                : TaxConstants.computeTax(grossAmount);
         BigDecimal netAmount = grossAmount.subtract(tax).setScale(4, RoundingMode.HALF_UP);
 
         // 3. Odredi valutu listinga.

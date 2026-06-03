@@ -30,19 +30,18 @@ public interface OrderService {
     /**
      * Kreiranje ordera sa eksplicitnim {@code internalActor} flag-om.
      *
-     * <p>{@code internalActor=false} (default, public REST flow): OTP guard u
-     * {@code OrderController} verifikuje {@code dto.otpCode} kroz banka-core
-     * pre nego sto se ova metoda pozove. OTP validaciju radi controller, ne servis.
+     * <p><b>ACCEPTED-DEVIATION (user-directed 03.06):</b> OTP/verifikacioni kod je
+     * UKLONJEN sa kreiranja ordera (OTP ostaje samo na placanja+transfere).
+     * Nijedan flow vise ne verifikuje {@code dto.otpCode}. Flag {@code internalActor}
+     * je zadrzan samo radi log-semantike (system vs public-initiated) — NE menja
+     * biznis logiku (limit / approval / fund reservation / notify identicni za oba).
+     *
+     * <p>{@code internalActor=false} (default, public REST flow): poziva ga
+     * {@code OrderController} (direktno, bez OTP gate-a).
      *
      * <p>{@code internalActor=true} (scheduler / system-initiated flow): pozivac
-     * je trading-service interni servis (npr. {@link rs.raf.trading.recurringorder.service.RecurringOrderService}),
-     * OTP guard se NE primenjuje (sistemska akcija, nema realnog korisnika
-     * koji moze da unese TOTP kod). Bilo koja eventualna pre-check validacija
-     * vezana za OTP/identitet (sad ili u buducnosti) treba da preskoci proveru.
-     *
-     * <p>Vazno: biznis logika (limit / approval / fund reservation / notify)
-     * je identicna za oba flag-a — flag samo dokumentuje da OTP guard ne stoji
-     * uzvodno od ovog poziva.
+     * je trading-service interni servis (npr.
+     * {@link rs.raf.trading.recurringorder.service.RecurringOrderService}).
      */
     OrderDto createOrder(CreateOrderDto dto, boolean internalActor);
 

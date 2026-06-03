@@ -18,7 +18,6 @@ import rs.raf.banka2_bek.client.model.Client;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.currency.model.Currency;
 import rs.raf.banka2_bek.exchange.ExchangeService;
-import rs.raf.banka2_bek.exchange.dto.CalculateExchangeResponseDto;
 import rs.raf.banka2_bek.payment.model.PaymentStatus;
 import rs.raf.banka2_bek.transfers.model.Transfer;
 import rs.raf.banka2_bek.transfers.dto.TransferFxRequestDto;
@@ -152,8 +151,8 @@ class TransferServiceExtendedTest {
             when(accountRepository.findForUpdateByAccountNumber("222222222222222222")).thenReturn(Optional.of(toAccount));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankRsd));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.of(bankEur));
-            when(exchangeService.calculateCross(5000.0, "RSD", "EUR"))
-                    .thenReturn(new CalculateExchangeResponseDto(42.5, 0.0085, "RSD", "EUR"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("5000"), "RSD", "EUR"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("42.50"), new BigDecimal("0.0085")));
             when(transferRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
             TransferInternalRequestDto request = new TransferInternalRequestDto();
@@ -165,7 +164,7 @@ class TransferServiceExtendedTest {
 
             assertThat(response.getStatus()).isEqualTo(PaymentStatus.COMPLETED);
             // Should have used exchange service (FX path)
-            verify(exchangeService).calculateCross(5000.0, "RSD", "EUR");
+            verify(exchangeService).calculateCrossExact(new BigDecimal("5000"), "RSD", "EUR");
         }
     }
 
@@ -198,8 +197,8 @@ class TransferServiceExtendedTest {
             when(accountRepository.findForUpdateByAccountNumber("222222222222222222")).thenReturn(Optional.of(toAccount));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankRsd));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.of(bankEur));
-            when(exchangeService.calculateCross(10000.0, "RSD", "EUR"))
-                    .thenReturn(new CalculateExchangeResponseDto(85.0, 0.0085, "RSD", "EUR"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("10000"), "RSD", "EUR"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("85.00"), new BigDecimal("0.0085")));
             when(transferRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
             TransferFxRequestDto request = new TransferFxRequestDto();
@@ -240,8 +239,8 @@ class TransferServiceExtendedTest {
             when(accountRepository.findForUpdateByAccountNumber("222222222222222222")).thenReturn(Optional.of(toAccount));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankRsd));
             when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.of(bankEur));
-            when(exchangeService.calculateCross(10000.0, "RSD", "EUR"))
-                    .thenReturn(new CalculateExchangeResponseDto(85.0, 0.0085, "RSD", "EUR"));
+            when(exchangeService.calculateCrossExact(new BigDecimal("10000"), "RSD", "EUR"))
+                    .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("85.00"), new BigDecimal("0.0085")));
 
             TransferFxRequestDto request = new TransferFxRequestDto();
             request.setFromAccountNumber("111111111111111111");
@@ -430,8 +429,12 @@ class TransferServiceExtendedTest {
     @DisplayName("getAllTransfers with filters")
     class GetAllTransfersFiltered {
 
+        // R1-653 (P3-bc-transfer-exchange-loan-savings-1): filtriranje je prebaceno u
+        // JPA fetch-join upit (findForClientWithFilters). Repo mock vraca vec-filtrirani
+        // podskup (kao sto bi DB uradio); test pina da servis prosledjuje normalizovane
+        // parametre i mapira rezultat.
         @Test
-        @DisplayName("filters by account number")
+        @DisplayName("delegates account-number filter to query and maps result")
         void filtersByAccountNumber() {
             Transfer t1 = new Transfer();
             t1.setFromAccount(fromAccount);
@@ -444,23 +447,8 @@ class TransferServiceExtendedTest {
             t1.setCreatedBy(client);
             t1.setCreatedAt(LocalDateTime.now());
 
-            Account otherAccount = new Account();
-            otherAccount.setAccountNumber("333333333333333333");
-            otherAccount.setCurrency(rsd);
-
-            Transfer t2 = new Transfer();
-            t2.setFromAccount(otherAccount);
-            t2.setToAccount(toAccount);
-            t2.setFromAmount(new BigDecimal("2000"));
-            t2.setFromCurrency(rsd);
-            t2.setToCurrency(rsd);
-            t2.setCommission(BigDecimal.ZERO);
-            t2.setStatus(PaymentStatus.COMPLETED);
-            t2.setCreatedBy(client);
-            t2.setCreatedAt(LocalDateTime.now());
-
-            when(transferRepository.findByCreatedByOrderByCreatedAtDesc(client))
-                    .thenReturn(List.of(t1, t2));
+            when(transferRepository.findForClientWithFilters(client, "111111111111111111", null, null))
+                    .thenReturn(List.of(t1));
 
             List<TransferResponseDto> result = transferService.getAllTransfers(client, "111111111111111111", null, null);
 
@@ -469,19 +457,8 @@ class TransferServiceExtendedTest {
         }
 
         @Test
-        @DisplayName("filters by date range")
+        @DisplayName("delegates date-range filter to query and maps result")
         void filtersByDateRange() {
-            Transfer t1 = new Transfer();
-            t1.setFromAccount(fromAccount);
-            t1.setToAccount(toAccount);
-            t1.setFromAmount(new BigDecimal("1000"));
-            t1.setFromCurrency(rsd);
-            t1.setToCurrency(rsd);
-            t1.setCommission(BigDecimal.ZERO);
-            t1.setStatus(PaymentStatus.COMPLETED);
-            t1.setCreatedBy(client);
-            t1.setCreatedAt(LocalDateTime.of(2026, 3, 15, 10, 0));
-
             Transfer t2 = new Transfer();
             t2.setFromAccount(fromAccount);
             t2.setToAccount(toAccount);
@@ -493,8 +470,11 @@ class TransferServiceExtendedTest {
             t2.setCreatedBy(client);
             t2.setCreatedAt(LocalDateTime.of(2026, 4, 1, 10, 0));
 
-            when(transferRepository.findByCreatedByOrderByCreatedAtDesc(client))
-                    .thenReturn(List.of(t1, t2));
+            when(transferRepository.findForClientWithFilters(
+                    client, null,
+                    LocalDate.of(2026, 3, 20).atStartOfDay(),
+                    LocalDate.of(2026, 4, 5).atTime(23, 59, 59)))
+                    .thenReturn(List.of(t2));
 
             List<TransferResponseDto> result = transferService.getAllTransfers(
                     client, null, LocalDate.of(2026, 3, 20), LocalDate.of(2026, 4, 5));
@@ -517,7 +497,7 @@ class TransferServiceExtendedTest {
             t1.setCreatedBy(client);
             t1.setCreatedAt(LocalDateTime.now());
 
-            when(transferRepository.findByCreatedByOrderByCreatedAtDesc(client))
+            when(transferRepository.findForClientWithFilters(client, null, null, null))
                     .thenReturn(List.of(t1));
 
             List<TransferResponseDto> result = transferService.getAllTransfers(client, null, null, null);

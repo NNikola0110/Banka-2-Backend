@@ -122,35 +122,6 @@ class InterbankOtcContractRepositoryTest {
     }
 
     @Test
-    @DisplayName("findByLocalPartyTypeAndStatus — filtrira po BUYER/SELLER + status")
-    void filterByPartyAndStatus() {
-        // 2 BUYER ACTIVE
-        repository.save(buildBuyerSideContract(
-                1L, "AAPL", new BigDecimal("10"),
-                LocalDate.now().plusDays(10), InterbankOtcContractStatus.ACTIVE));
-        repository.save(buildBuyerSideContract(
-                2L, "MSFT", new BigDecimal("5"),
-                LocalDate.now().plusDays(15), InterbankOtcContractStatus.ACTIVE));
-        // 1 BUYER EXERCISED — ne sme biti vracen
-        repository.save(buildBuyerSideContract(
-                3L, "GOOG", new BigDecimal("8"),
-                LocalDate.now().minusDays(2), InterbankOtcContractStatus.EXERCISED));
-        // 1 SELLER ACTIVE — ne sme biti vracen
-        InterbankOtcContract sellerSide = buildBuyerSideContract(
-                4L, "TSLA", new BigDecimal("3"),
-                LocalDate.now().plusDays(20), InterbankOtcContractStatus.ACTIVE);
-        sellerSide.setLocalPartyType(InterbankPartyType.SELLER);
-        repository.save(sellerSide);
-
-        List<InterbankOtcContract> active = repository
-                .findByLocalPartyTypeAndStatus(InterbankPartyType.BUYER, InterbankOtcContractStatus.ACTIVE);
-
-        assertThat(active).hasSize(2);
-        assertThat(active).allMatch(c -> c.getStatus() == InterbankOtcContractStatus.ACTIVE);
-        assertThat(active).allMatch(c -> c.getLocalPartyType() == InterbankPartyType.BUYER);
-    }
-
-    @Test
     @DisplayName("findByStatusAndSettlementDateBefore — auto-expiry helper za scheduler")
     void autoExpiryHelper() {
         LocalDate today = LocalDate.now();

@@ -77,13 +77,32 @@ public class TradingSecurityConfig {
                 .requestMatchers(HttpMethod.GET, "/tax/my", "/tax/my/breakdown").authenticated()
                 .requestMatchers("/tax/**").hasAnyAuthority("ROLE_ADMIN", "ADMIN", "SUPERVISOR")
                 // ── Berze (exchanges) ────────────────────────────────────────
+                // R4-444: mutacije globalne berza-config (test-mode toggle +
+                //   praznici) su admin/oversight alat (§79 "dugme ... kako bi mogli
+                //   da testiramo"). Ranije je test-mode bio hasAnyRole(ADMIN,EMPLOYEE)
+                //   (svaki agent menjao globalnu berzu), a holiday mutacije su padale
+                //   na .anyRequest().authenticated() (svaki KLIJENT je preko URL-a
+                //   mogao da menja praznike). Sad: samo ADMIN + SUPERVISOR (paritet sa
+                //   /tax/**, /profit-bank/**, /actuaries/**). GET ostaje permitAll.
                 .requestMatchers(HttpMethod.GET, "/exchanges", "/exchanges/**").permitAll()
-                .requestMatchers(HttpMethod.PATCH, "/exchanges/*/test-mode").hasAnyRole("ADMIN", "EMPLOYEE")
+                .requestMatchers(HttpMethod.PATCH, "/exchanges/*/test-mode")
+                        .hasAnyAuthority("ROLE_ADMIN", "ADMIN", "SUPERVISOR")
+                .requestMatchers(HttpMethod.PUT, "/exchanges/*/holidays")
+                        .hasAnyAuthority("ROLE_ADMIN", "ADMIN", "SUPERVISOR")
+                .requestMatchers(HttpMethod.POST, "/exchanges/*/holidays")
+                        .hasAnyAuthority("ROLE_ADMIN", "ADMIN", "SUPERVISOR")
+                .requestMatchers(HttpMethod.DELETE, "/exchanges/*/holidays/**")
+                        .hasAnyAuthority("ROLE_ADMIN", "ADMIN", "SUPERVISOR")
                 // ── Opcije ───────────────────────────────────────────────────
                 .requestMatchers(HttpMethod.GET, "/options", "/options/**").authenticated()
                 .requestMatchers(HttpMethod.POST, "/options/*/exercise").authenticated()
                 .requestMatchers(HttpMethod.POST, "/options/generate").hasRole("ADMIN")
                 // ── Margin racuni ────────────────────────────────────────────
+                // BE-STK-06: marzni racuni kompanija — samo zaposleni (supervizor/
+                //   admin), NE klijent. Specificne rute PRE generickih. Servis
+                //   dodatno enforce-uje EMPLOYEE (defense-in-depth).
+                .requestMatchers(HttpMethod.POST, "/margin-accounts/company").hasAnyRole("ADMIN", "EMPLOYEE")
+                .requestMatchers(HttpMethod.GET, "/margin-accounts/company/**").hasAnyRole("ADMIN", "EMPLOYEE")
                 .requestMatchers(HttpMethod.POST, "/margin-accounts/*/withdraw").hasRole("CLIENT")
                 .requestMatchers(HttpMethod.POST, "/margin-accounts/*/deposit").hasRole("CLIENT")
                 .requestMatchers("/margin-accounts/**").authenticated()
@@ -113,6 +132,20 @@ public class TradingSecurityConfig {
                 // ── W3-T2: ML predictions (read-only) — svaki authenticated ──
                 //   (paritet sa /listings/** koje je authenticated() default).
                 .requestMatchers("/listings/*/prediction").authenticated()
+                // ── R1 537 (P2-authz-method-1): OHLCV time-series (chart) — read-only
+                //   trzisni podatak, eksplicitno authenticated() umesto tihog
+                //   fall-through na anyRequest().authenticated(). Eksplicitni matcher
+                //   dokumentuje nameru i sprecava da buduca preuredjivanja pravila
+                //   slucajno otvore endpoint (npr. da padne na permitAll). OHLCV je
+                //   isti razred kao /listings/*/prediction (svaki ulogovan korisnik
+                //   sme da vidi berzanski grafikon).
+                .requestMatchers(HttpMethod.GET, "/listings/*/ohlcv").authenticated()
+                // ── P1-7: Audit log — samo ADMIN i SUPERVISOR (paritet sa
+                //    banka-core GlobalSecurityConfig). Bez ovog matchera ruta je
+                //    padala na .anyRequest().authenticated() — svaki klijent ju je
+                //    citao. Authority stringovi isti kao /profit-bank/** matcher. ─
+                .requestMatchers("/audit/**").hasAnyAuthority(
+                        "ROLE_ADMIN", "ADMIN", "SUPERVISOR")
                 .anyRequest().authenticated())
             // CI-05: defense-in-depth security response headers (paritet sa
             // banka2_bek GlobalSecurityConfig). Gateway (nginx) takodje setuje
@@ -127,8 +160,15 @@ public class TradingSecurityConfig {
                             .maxAgeInSeconds(31_536_000)) // 1 godina HSTS
                     .referrerPolicy(r -> r.policy(
                             ReferrerPolicyHeaderWriter.ReferrerPolicy.NO_REFERRER))
+                    // P2-config-2 (R4 1786): uskladjeno sa FE nginx + banka-core
+                    // (geolocation=(self) Leaflet mapa, microphone=(self) Arbitro voice;
+                    // camera/payment/usb disabled).
+                    // Bug 6 (03.06): uklonjen dead `interest-cohort=()` — moderni browseri
+                    // ga vise ne prepoznaju u Permissions-Policy (FLoC ukinut) pa ga
+                    // odbacuju uz console warning; paritet sa banka-core GlobalSecurityConfig.
                     .permissionsPolicyHeader(p -> p.policy(
-                            "geolocation=(), microphone=(), camera=()")))
+                            "geolocation=(self), microphone=(self), camera=(), "
+                                    + "payment=(), usb=()")))
             .addFilterBefore(internalAuthFilter, UsernamePasswordAuthenticationFilter.class)
             .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
         return http.build();

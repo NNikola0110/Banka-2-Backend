@@ -162,23 +162,24 @@ class TransferControllerCoverageTest {
 
     // ---------- GET /transfers ----------
 
+    // R1-652 (P3-bc-transfer-exchange-loan-savings-1): nepostojeci/anoniman klijent
+    // -> 401, NE prazan 200 (vidi TransferController.getAllTransfers).
     @Test
-    @DisplayName("GET /transfers - 200 OK empty kad SecurityContext ima Authentication ali nije authenticated")
-    void getAllTransfers_authNotAuthenticated_returnsEmpty() throws Exception {
+    @DisplayName("GET /transfers - 401 kad SecurityContext ima Authentication ali nije authenticated")
+    void getAllTransfers_authNotAuthenticated_returns401() throws Exception {
         Authentication unauth = mock(Authentication.class);
         when(unauth.isAuthenticated()).thenReturn(false);
         SecurityContextHolder.getContext().setAuthentication(unauth);
 
         mockMvc.perform(get("/transfers"))
-                .andExpect(status().isOk())
-                .andExpect(content().string("[]"));
+                .andExpect(status().isUnauthorized());
 
         verify(transferService, never()).getAllTransfers(any(), any(), any(), any());
     }
 
     @Test
-    @DisplayName("GET /transfers - 200 OK empty kad clientRepository vrati prazan Optional")
-    void getAllTransfers_clientMissing_returnsEmpty() throws Exception {
+    @DisplayName("GET /transfers - 401 kad clientRepository vrati prazan Optional")
+    void getAllTransfers_clientMissing_returns401() throws Exception {
         SecurityContextHolder.getContext().setAuthentication(
                 new UsernamePasswordAuthenticationToken(
                         "ghost@banka.rs", null,
@@ -186,8 +187,7 @@ class TransferControllerCoverageTest {
         when(clientRepository.findByEmail("ghost@banka.rs")).thenReturn(Optional.empty());
 
         mockMvc.perform(get("/transfers"))
-                .andExpect(status().isOk())
-                .andExpect(content().string("[]"));
+                .andExpect(status().isUnauthorized());
 
         verify(transferService, never()).getAllTransfers(any(), any(), any(), any());
     }

@@ -125,6 +125,17 @@
             <version>1.20.0</version>
             <scope>test</scope>
         </dependency>
+        <!-- Testcontainers PostgreSQL - PG-DDL smoke za INTEGER-mapirane boolean-e
+             (@ColumnDefault). H2 (MODE=PostgreSQL) guta `default false` na INTEGER
+             koloni pa DDL bugovi (npr. dividend_payouts.tax_exempt) postanu nevidljivi;
+             ovaj modul pokrece PRAVI postgres kontejner da reprodukuje DDL ponasanje.
+             Test scope — ne ide u prod artefakt. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>1.20.0</version>
+            <scope>test</scope>
+        </dependency>
         <!-- Caffeine - kes za TradingUserResolver (email -> numericki UserContext) -->
         <dependency>
             <groupId>com.github.ben-manes.caffeine</groupId>
@@ -142,6 +153,22 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
+        <!-- N3 FIX (concurrency): ShedLock — distribuirani lock nad @Scheduled poslovima
+             (order execution + DCA + stop-order) da na VISE k8s replika SAMO jedna izvrsi
+             ciklus. Bez ovoga 2 replike paralelno izvrsavaju iste APPROVED ordere /
+             dospele DCA naloge → double-fill / dupli buy / double-charge. JDBC provider
+             cuva lock-ove u `shedlock` tabeli (trading_db); @Version je in-process zastita,
+             ShedLock je cross-replica zastita. -->
+        <dependency>
+            <groupId>net.javacrumbs.shedlock</groupId>
+            <artifactId>shedlock-spring</artifactId>
+            <version>5.16.0</version>
+        </dependency>
+        <dependency>
+            <groupId>net.javacrumbs.shedlock</groupId>
+            <artifactId>shedlock-provider-jdbc-template</artifactId>
+            <version>5.16.0</version>
         </dependency>
     </dependencies>
 

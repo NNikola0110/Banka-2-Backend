@@ -1,5 +1,6 @@
 package rs.raf.trading.stock.service.implementation;
 
+import jakarta.annotation.PostConstruct;
 import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -8,6 +9,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
@@ -74,6 +76,52 @@ public class ListingServiceImpl implements ListingService {
     private final AtomicInteger keyIndex = new AtomicInteger(0);
 
     /**
+     * R1-729: imenovane konstante za blok cenovne simulacije koji se ranije
+     * ponavljao 4× (test-mode + 3 fallback grane kad eksterni API nije dostupan).
+     * Simulirana cena = trenutna × [0.98, 1.02) (±2% random walk); ask/bid su
+     * trenutna ± 0.2% spread; volumen = prethodni × [0.9, 1.1) (±10% sum).
+     * {@link #ASK_BID_SPREAD} se koristi i na granama sa REALNIM podacima.
+     */
+    private static final double SIM_PRICE_MIN_FACTOR = 0.98;
+    private static final double SIM_PRICE_RANGE = 0.04;
+    private static final BigDecimal ASK_BID_SPREAD = BigDecimal.valueOf(0.002);
+    private static final double SIM_VOLUME_MIN_FACTOR = 0.9;
+    private static final double SIM_VOLUME_RANGE = 0.2;
+    private static final long DEFAULT_SIM_VOLUME = 100000L;
+
+    /**
+     * Mali nosac rezultata cenovnog tika (svi izvedeni iz nove cene).
+     */
+    private record PriceTick(BigDecimal price, BigDecimal ask, BigDecimal bid,
+                             BigDecimal priceChange, long volume) {}
+
+    /** Ask = cena × (1 + spread), zaokruzeno na 4 decimale. */
+    private static BigDecimal askFor(BigDecimal price) {
+        return price.multiply(BigDecimal.ONE.add(ASK_BID_SPREAD)).setScale(4, RoundingMode.HALF_UP);
+    }
+
+    /** Bid = cena × (1 - spread), zaokruzeno na 4 decimale. */
+    private static BigDecimal bidFor(BigDecimal price) {
+        return price.multiply(BigDecimal.ONE.subtract(ASK_BID_SPREAD)).setScale(4, RoundingMode.HALF_UP);
+    }
+
+    /**
+     * R1-729: jedinstvena cenovna simulacija (±2% random walk + ask/bid spread +
+     * ±10% volumen) — zamenjuje 4 identicne kopije. Ponasanje (raspodele, scale,
+     * zaokruzivanje) je byte-identicno prethodnim inline blokovima.
+     */
+    private PriceTick simulateTick(Listing listing, BigDecimal currentPrice) {
+        double changePercent = SIM_PRICE_MIN_FACTOR + (SIM_PRICE_RANGE * random.nextDouble());
+        BigDecimal newPrice = currentPrice.multiply(BigDecimal.valueOf(changePercent))
+                .setScale(4, RoundingMode.HALF_UP);
+        long newVolume = listing.getVolume() != null
+                ? (long) (listing.getVolume() * (SIM_VOLUME_MIN_FACTOR + (SIM_VOLUME_RANGE * random.nextDouble())))
+                : DEFAULT_SIM_VOLUME;
+        return new PriceTick(newPrice, askFor(newPrice), bidFor(newPrice),
+                newPrice.subtract(currentPrice), newVolume);
+    }
+
+    /**
      * Round-robin API key selection across configured keys.
      */
     private String getNextApiKey() {
@@ -84,6 +132,26 @@ public class ListingServiceImpl implements ListingService {
 
     @Value("${stock.api.url:https://www.alphavantage.co/query}")
     private String stockApiUrl;
+
+    /**
+     * P2-config-2 (R2 1415): Alpha Vantage {@code demo} kljuc je dvostruki default
+     * (application.properties {@code STOCK_API_KEYS:demo} + ovaj {@code @Value}
+     * default), a u prod-u vraca SAMO IBM (i to rate-limit-ovano) — refresh tihо
+     * servira stale IBM-only podatke bez ijednog signala. Ne fail-FAST-ujemo
+     * (lomilo bi lokalni dev/test koji legitimno koriste {@code demo}), ali
+     * dizemo glasan startup WARN da prod operater vidi da kljuc nije podesen.
+     */
+    @PostConstruct
+    void warnIfDemoStockApiKey() {
+        boolean allDemo = java.util.Arrays.stream(stockApiKeys.split(","))
+                .map(String::trim)
+                .allMatch(k -> k.isEmpty() || "demo".equalsIgnoreCase(k));
+        if (allDemo) {
+            log.warn("stock.api.keys je na 'demo' Alpha Vantage kljucu — GLOBAL_QUOTE vraca "
+                    + "SAMO IBM i rate-limit-ovan je. Refresh cena ce tiho servirati stale "
+                    + "IBM-only podatke. Podesi STOCK_API_KEYS (Secret) za realne kljuceve u prod-u.");
+        }
+    }
 
     @Override
     public Page<ListingDto> getListings(String type, String search, int page, int size) {
@@ -114,9 +182,14 @@ public class ListingServiceImpl implements ListingService {
 
         var pageable = PageRequest.of(page, size, Sort.by("ticker").ascending());
         Map<String, Boolean> testModeByAcronym = loadExchangeTestModeMap();
+        // Sc25: orphan-exchange listinge (acronym koji ne postoji u `exchanges`)
+        // iskljucujemo na DB nivou, kombinovano sa korisnickim filterima. Tako su
+        // paginacija/total tacni i orphan hartije nikad ne dospeju u odgovor.
+        Specification<Listing> spec = ListingSpec.withFilters(listingType, search, exchangePrefix,
+                        priceMin, priceMax, settlementDateFrom, settlementDateTo)
+                .and(ListingSpec.tradeableExchange());
         return listingRepository
-                .findAll(ListingSpec.withFilters(listingType, search, exchangePrefix,
-                        priceMin, priceMax, settlementDateFrom, settlementDateTo), pageable)
+                .findAll(spec, pageable)
                 .map(l -> ListingMapper.toDto(l, testModeByAcronym.get(l.getExchangeAcronym())));
     }
 
@@ -164,6 +237,42 @@ public class ListingServiceImpl implements ListingService {
                 .map(Exchange::isTestMode)
                 .orElse(null);
         return ListingMapper.toDto(listing, testMode);
+    }
+
+    /**
+     * P2-perf-nplus1-1 (R1 515): batch-resolve. Jedan {@code findAllById} za sve
+     * listinge + jedan batch testMode lookup (distinct exchange acronym), umesto
+     * N pojedinacnih {@code getListingById} (DB N+1). FOREX-gate NIJE primenjen
+     * ovde — pozivalac (watchlist) ionako ne moze imati FOREX stavke za klijenta
+     * (addItem ih odbija preko getListingById), a zaposleni vide FOREX.
+     */
+    @Override
+    @Transactional(readOnly = true)
+    public Map<Long, ListingDto> getListingsByIds(java.util.Collection<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return Map.of();
+        }
+        List<Long> distinct = ids.stream().filter(java.util.Objects::nonNull).distinct().toList();
+        List<Listing> listings = listingRepository.findAllById(distinct);
+        if (listings.isEmpty()) {
+            return Map.of();
+        }
+        // Batch testMode lookup: distinct exchange acronym → isTestMode, jedan upit.
+        java.util.Set<String> acronyms = listings.stream()
+                .map(Listing::getExchangeAcronym)
+                .filter(java.util.Objects::nonNull)
+                .collect(Collectors.toSet());
+        Map<String, Boolean> testModeByAcronym = new java.util.HashMap<>();
+        for (String acronym : acronyms) {
+            testModeByAcronym.put(acronym,
+                    exchangeRepository.findByAcronym(acronym).map(Exchange::isTestMode).orElse(null));
+        }
+        Map<Long, ListingDto> result = new java.util.HashMap<>();
+        for (Listing listing : listings) {
+            Boolean testMode = testModeByAcronym.get(listing.getExchangeAcronym());
+            result.put(listing.getId(), ListingMapper.toDto(listing, testMode));
+        }
+        return result;
     }
 
     @Override
@@ -295,23 +404,20 @@ public class ListingServiceImpl implements ListingService {
 
             if (exchangeInTestMode) {
                 // Test mode: simuliramo cene bez trosenja Alpha Vantage / fixer.io kljuceva
-                double changePercent = 0.98 + (0.04 * random.nextDouble());
-                newPrice = currentPrice.multiply(BigDecimal.valueOf(changePercent))
-                        .setScale(4, RoundingMode.HALF_UP);
-                newAsk = newPrice.multiply(BigDecimal.valueOf(1.002)).setScale(4, RoundingMode.HALF_UP);
-                newBid = newPrice.multiply(BigDecimal.valueOf(0.998)).setScale(4, RoundingMode.HALF_UP);
-                priceChange = newPrice.subtract(currentPrice);
-                newVolume = listing.getVolume() != null
-                        ? (long) (listing.getVolume() * (0.9 + (0.2 * random.nextDouble())))
-                        : 100000L;
+                PriceTick tick = simulateTick(listing, currentPrice);
+                newPrice = tick.price();
+                newAsk = tick.ask();
+                newBid = tick.bid();
+                priceChange = tick.priceChange();
+                newVolume = tick.volume();
                 log.debug("Refreshed {} in test-mode (simulation): price={}", listing.getTicker(), newPrice);
             } else if (listing.getListingType() == ListingType.STOCK) {
                 // Try Alpha Vantage for stocks
                 BigDecimal[] alphaResult = fetchAlphaVantagePrice(listing.getTicker());
                 if (alphaResult != null) {
                     newPrice = alphaResult[0];
-                    newAsk = newPrice.multiply(BigDecimal.valueOf(1.002)).setScale(4, RoundingMode.HALF_UP);
-                    newBid = newPrice.multiply(BigDecimal.valueOf(0.998)).setScale(4, RoundingMode.HALF_UP);
+                    newAsk = askFor(newPrice);
+                    newBid = bidFor(newPrice);
                     priceChange = alphaResult[1]; // change from previous close
                     newVolume = alphaResult[2].longValue();
                     // Use real high/low if available
@@ -320,51 +426,42 @@ public class ListingServiceImpl implements ListingService {
                     log.info("Refreshed {} from Alpha Vantage: price={}", listing.getTicker(), newPrice);
                 } else {
                     log.warn("Alpha Vantage unavailable for {}, using random simulation", listing.getTicker());
-                    double changePercent = 0.98 + (0.04 * random.nextDouble());
-                    newPrice = currentPrice.multiply(BigDecimal.valueOf(changePercent))
-                            .setScale(4, RoundingMode.HALF_UP);
-                    newAsk = newPrice.multiply(BigDecimal.valueOf(1.002)).setScale(4, RoundingMode.HALF_UP);
-                    newBid = newPrice.multiply(BigDecimal.valueOf(0.998)).setScale(4, RoundingMode.HALF_UP);
-                    priceChange = newPrice.subtract(currentPrice);
-                    newVolume = listing.getVolume() != null
-                            ? (long) (listing.getVolume() * (0.9 + (0.2 * random.nextDouble())))
-                            : 100000L;
+                    PriceTick tick = simulateTick(listing, currentPrice);
+                    newPrice = tick.price();
+                    newAsk = tick.ask();
+                    newBid = tick.bid();
+                    priceChange = tick.priceChange();
+                    newVolume = tick.volume();
                 }
             } else if (listing.getListingType() == ListingType.FOREX) {
                 // Use BankaCoreClient (fixer.io via banka-core /internal/fx/rates) for forex pairs
                 BigDecimal forexPrice = fetchForexPrice(listing.getBaseCurrency(), listing.getQuoteCurrency());
                 if (forexPrice != null) {
                     newPrice = forexPrice;
-                    newAsk = newPrice.multiply(BigDecimal.valueOf(1.002)).setScale(4, RoundingMode.HALF_UP);
-                    newBid = newPrice.multiply(BigDecimal.valueOf(0.998)).setScale(4, RoundingMode.HALF_UP);
+                    newAsk = askFor(newPrice);
+                    newBid = bidFor(newPrice);
                     priceChange = newPrice.subtract(currentPrice);
                     newVolume = listing.getVolume() != null
-                            ? (long) (listing.getVolume() * (0.9 + (0.2 * random.nextDouble())))
-                            : 100000L;
+                            ? (long) (listing.getVolume() * (SIM_VOLUME_MIN_FACTOR + (SIM_VOLUME_RANGE * random.nextDouble())))
+                            : DEFAULT_SIM_VOLUME;
                     log.info("Refreshed {} from fixer.io: price={}", listing.getTicker(), newPrice);
                 } else {
                     log.warn("Fixer.io unavailable for {}, using random simulation", listing.getTicker());
-                    double changePercent = 0.98 + (0.04 * random.nextDouble());
-                    newPrice = currentPrice.multiply(BigDecimal.valueOf(changePercent))
-                            .setScale(4, RoundingMode.HALF_UP);
-                    newAsk = newPrice.multiply(BigDecimal.valueOf(1.002)).setScale(4, RoundingMode.HALF_UP);
-                    newBid = newPrice.multiply(BigDecimal.valueOf(0.998)).setScale(4, RoundingMode.HALF_UP);
-                    priceChange = newPrice.subtract(currentPrice);
-                    newVolume = listing.getVolume() != null
-                            ? (long) (listing.getVolume() * (0.9 + (0.2 * random.nextDouble())))
-                            : 100000L;
+                    PriceTick tick = simulateTick(listing, currentPrice);
+                    newPrice = tick.price();
+                    newAsk = tick.ask();
+                    newBid = tick.bid();
+                    priceChange = tick.priceChange();
+                    newVolume = tick.volume();
                 }
             } else {
                 // FUTURES — keep random simulation (no free API)
-                double changePercent = 0.98 + (0.04 * random.nextDouble());
-                newPrice = currentPrice.multiply(BigDecimal.valueOf(changePercent))
-                        .setScale(4, RoundingMode.HALF_UP);
-                newAsk = newPrice.multiply(BigDecimal.valueOf(1.002)).setScale(4, RoundingMode.HALF_UP);
-                newBid = newPrice.multiply(BigDecimal.valueOf(0.998)).setScale(4, RoundingMode.HALF_UP);
-                priceChange = newPrice.subtract(currentPrice);
-                newVolume = listing.getVolume() != null
-                        ? (long) (listing.getVolume() * (0.9 + (0.2 * random.nextDouble())))
-                        : 100000L;
+                PriceTick tick = simulateTick(listing, currentPrice);
+                newPrice = tick.price();
+                newAsk = tick.ask();
+                newBid = tick.bid();
+                priceChange = tick.priceChange();
+                newVolume = tick.volume();
             }
 
             listing.setPrice(newPrice);
@@ -541,26 +638,20 @@ public class ListingServiceImpl implements ListingService {
     }
 
     /**
-     * Scheduled 15-minute price refresh.
+     * Scheduled 15-minute price refresh. Live od cutover-a (2f) — trading-service
+     * je vlasnik trgovinskih schedulera ({@code SchedulingConfig @EnableScheduling}).
      *
-     * NOTE: @Scheduled is dormant in trading-service because TradingServiceApplication
-     * does not carry @EnableScheduling (copy-first phase — prevents double API calls
-     * while the monolith still runs the same job). Enable @EnableScheduling on
-     * TradingServiceApplication once the monolith's stock scheduler is removed.
+     * <p>P2-perf-nplus1-1 (R5 1904): {@code fixedDelay} (ne {@code fixedRate}) —
+     * 15min se broji od KRAJA prethodnog ciklusa, ne od pocetka. {@code fixedRate}
+     * dozvoljava preklapanje: ako jedan refresh traje duze od 15min (spor
+     * AlphaVantage / mnogo listinga), sledeci tick starta dok prethodni jos traje,
+     * pa se na thread-pool-u gomilaju paralelni refresh-evi i medjusobno se utrkuju
+     * nad istim {@code listing_daily_prices} redovima. {@code fixedDelay} serijalizuje
+     * ciklus po definiciji.
      */
-    @Scheduled(fixedRate = 900000)
+    @Scheduled(fixedDelay = 900000)
     public void scheduledRefresh() {
         // Scheduler samo okida business metodu, ne sadrži logiku direktno
         this.refreshPrices();
-    }
-
-    @Override
-    public void loadInitialData() {
-        long count = listingRepository.count();
-        if (count == 0) {
-            log.warn("No listings in database. Please ensure seed data is loaded.");
-        } else {
-            log.info("Found {} listings in database.", count);
-        }
     }
 }

@@ -26,6 +26,7 @@ import rs.raf.trading.portfolio.model.Portfolio;
 import rs.raf.trading.portfolio.repository.PortfolioRepository;
 import rs.raf.trading.stock.model.Listing;
 import rs.raf.trading.stock.repository.ListingRepository;
+import rs.raf.trading.stock.util.ListingCurrencyResolver;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -65,8 +66,16 @@ public class OptionService {
 
     private static final Logger log = LoggerFactory.getLogger(OptionService.class);
 
-    /** Valuta bankinog racuna preko kog se izvrsavaju opcije (monolit: getBankAccount → USD). */
-    private static final String BANK_ACCOUNT_CURRENCY = "USD";
+    /**
+     * Fallback valuta bankinog racuna ako se valuta listinga ne moze razresiti
+     * ({@link ListingCurrencyResolver} vec sam pada na USD, pa je ovo dodatni
+     * defanzivni fallback). P1-options-tax-1 (1546/1332): pre fix-a je valuta bila
+     * tvrdo {@code "USD"} a {@code totalCost = strikePrice × contractSize} je u
+     * valuti listinga → za ne-USD listing (BELEX/RSD strike 5000 → 5000 USD,
+     * LSE/GBP, XETRA/EUR) je novcana noga bila ~120× pogresne magnitude i krsila
+     * konzervaciju. Sad se valuta razresava po listingu.
+     */
+    private static final String FALLBACK_BANK_ACCOUNT_CURRENCY = "USD";
 
     private final OptionRepository optionRepository;
     private final ListingRepository listingRepository;
@@ -137,6 +146,10 @@ public class OptionService {
 
     @Transactional
     public void exerciseOption(Long optionId, String userEmail) {
+        // R2 1426 (ACCEPTED-BY-DESIGN): opcije su instrument banke — exercise sme SAMO
+        // aktuar/admin-zaposleni ({@link #ensureUserCanExerciseOptions} to enforce-uje i
+        // vraca EMPLOYEE userId). Zato je {@code UserRole.EMPLOYEE} u updatePortfolioBuy/Sell
+        // ispod KOREKTAN (vlasnik pozicije JE zaposleni), ne hardkod-bug.
         Long employeeUserId = ensureUserCanExerciseOptions(userEmail);
 
         // Pesimisticki lock — sprecava lost-update trku na openInterest izmedju
@@ -153,6 +166,22 @@ public class OptionService {
 
         BigDecimal currentPrice = option.getStockListing().getPrice();
         BigDecimal strikePrice = option.getStrikePrice();
+
+        // [P2-input-validation-1 / R1 461] guard PRE money-leg-a — bez ovoga null
+        // currentPrice obara compareTo ispod NPE-om (→ 500), a contractSize<=0 /
+        // null strike daju totalCost==0 (tihi zero-value money-leg). Pretvori sve u
+        // cist 400 (IllegalArgumentException → BAD_REQUEST) umesto NPE/500.
+        if (currentPrice == null) {
+            throw new IllegalArgumentException(
+                    "Trenutna cena hartije nije dostupna — opcija se trenutno ne moze izvrsiti.");
+        }
+        if (strikePrice == null) {
+            throw new IllegalArgumentException("Strike cena opcije nije definisana.");
+        }
+        if (option.getContractSize() <= 0) {
+            throw new IllegalArgumentException(
+                    "Velicina ugovora (contractSize) mora biti veca od 0.");
+        }
 
         // [BE-STK-02] Per Opcije.txt + Celina 3, kupac opcije ima PRAVO (ne obavezu)
         // da je iskoristi cak i kad nije in-the-money. To je njegova ekonomska odluka
@@ -177,17 +206,56 @@ public class OptionService {
         BigDecimal totalCost = strikePrice.multiply(BigDecimal.valueOf(contractSize))
                 .setScale(4, RoundingMode.HALF_UP);
 
+        // P1-options-tax-1 (1546/1332): valuta novcane noge MORA biti valuta
+        // listinga, jer je strikePrice (i samim tim totalCost) denominovan u valuti
+        // listinga. Bankin trading racun se razresava u TOJ valuti (banka-core ima
+        // BANK_TRADING racun po valuti), pa nema FX konverzije ni magnitudnog
+        // mismatch-a — konzervacija je egzaktna (debit/credit iznos i valuta racuna
+        // se poklapaju sa denominacijom strike-a). Pre fix-a se ne-USD totalCost
+        // slao na USD racun → ~120× off (RSD strike na USD racun).
+        String bankCurrency = ListingCurrencyResolver.resolveSafe(
+                stockListing, FALLBACK_BANK_ACCOUNT_CURRENCY);
+
         // openInterest PRE dekrementa — koristi se kao deterministicki idempotency
         // diskriminator (svaki exercise event ima razlicitu vrednost; retry koji je
         // rollback-ovao re-cita istu vrednost, pa banka-core replay-uje umesto dupliranja).
         int openInterestBefore = option.getOpenInterest();
 
-        // Bankin USD racun — monolit ga je razresavao kroz findBankAccountByCurrency,
-        // sad ga banka-core daje preko /internal/accounts/bank-trading/USD.
-        InternalAccountDto bankAccount = bankaCoreClient.getBankTradingAccount(BANK_ACCOUNT_CURRENCY);
+        // Bankin trading racun u valuti listinga — monolit ga je razresavao kroz
+        // findBankAccountByCurrency, sad ga banka-core daje preko
+        // /internal/accounts/bank-trading/{currencyCode}.
+        InternalAccountDto bankAccount = bankaCoreClient.getBankTradingAccount(bankCurrency);
 
+        // [W1.11] money-leg-last: SVE lokalne JPA mutacije (portfolio + openInterest
+        // dekrement) idu PRVE, a NEPOVRATNA banka-core novcana noga (debit za CALL /
+        // credit za PUT) ide POSLEDNJA. Tako pad novcane noge cini da @Transactional
+        // cisto rollback-uje sve lokalne izmene (nema nekonzistencije — pre fixa je
+        // CALL debit mogao da prodje a portfolio update da padne → novac skinut bez
+        // akcija; PUT credit je prolazio pre openInterest save → novac stvoren ako
+        // taj save padne). Uspeh novcane noge je poslednji korak pre commit-a.
         if (option.getOptionType() == OptionType.CALL) {
             // CALL exercise: kupac placa strikePrice * contractSize, dobija akcije.
+            // Add shares to portfolio (lokalna mutacija — pre novcane noge).
+            // P1-options-tax-1 (1547/196): nabavna cena (cost-basis) iskoriscenih
+            // akcija je STRIKE cena koju je kupac stvarno platio, NE trenutna trzisna
+            // cena. Pre fix-a se upisivao currentPrice → cost-basis precenjen za ITM
+            // CALL → kasniji SELL je prikazivao lazno manji realizovani profit (porez
+            // potcenjen jer je profit od exercise-a "nestao" u napumpanom cost-basis-u).
+            updatePortfolioBuy(employeeUserId, UserRole.EMPLOYEE, stockListing, contractSize, strikePrice);
+        } else {
+            // PUT exercise: kupac prodaje akcije po strikePrice, dobija novac.
+            // Akcije se uklanjaju iz portfolija (mora ih posedovati — updatePortfolioSell
+            // validira vlasnistvo i baca PRE bilo kakvog pomeranja novca).
+            updatePortfolioSell(employeeUserId, UserRole.EMPLOYEE, stockListing, contractSize);
+        }
+
+        // Decrement open interest (lokalna mutacija — pre novcane noge).
+        option.setOpenInterest(openInterestBefore - 1);
+        optionRepository.save(option);
+
+        // Novcana noga POSLEDNJA — nepovratna banka-core operacija. Ako padne,
+        // @Transactional rollback-uje portfolio + openInterest izmene iznad.
+        if (option.getOptionType() == OptionType.CALL) {
             // Novac napusta bankin racun → /internal/funds/debit. banka-core 409
             // (nedovoljno sredstava na bankinom racunu) preslikavamo u istu poruku
             // koju je monolit bacao pre rewiring-a.
@@ -195,7 +263,7 @@ public class OptionService {
                 bankaCoreClient.debitFunds(
                         "option-exercise-" + optionId + "-" + openInterestBefore,
                         new DebitFundsRequest(bankAccount.id(), totalCost, BigDecimal.ZERO,
-                                BANK_ACCOUNT_CURRENCY,
+                                bankCurrency,
                                 "Izvrsavanje CALL opcije " + option.getTicker()));
             } catch (BankaCoreClientException ex) {
                 if (ex.getHttpStatus() == 409) {
@@ -205,26 +273,14 @@ public class OptionService {
                 }
                 throw ex;
             }
-
-            // Add shares to portfolio
-            updatePortfolioBuy(employeeUserId, UserRole.EMPLOYEE, stockListing, contractSize, currentPrice);
-
         } else {
-            // PUT exercise: kupac prodaje akcije po strikePrice, dobija novac.
-            // Akcije se uklanjaju iz portfolija (mora ih posedovati).
-            updatePortfolioSell(employeeUserId, UserRole.EMPLOYEE, stockListing, contractSize);
-
             // Novac stize na bankin racun → /internal/funds/credit.
             bankaCoreClient.creditFunds(
                     "option-exercise-" + optionId + "-" + openInterestBefore,
                     new CreditFundsRequest(bankAccount.id(), totalCost, BigDecimal.ZERO,
-                            BANK_ACCOUNT_CURRENCY,
+                            bankCurrency,
                             "Izvrsavanje PUT opcije " + option.getTicker()));
         }
-
-        // Decrement open interest
-        option.setOpenInterest(openInterestBefore - 1);
-        optionRepository.save(option);
 
         // W2-T1: brojaj uspesno izvrsenu opciju (i CALL i PUT).
         try {

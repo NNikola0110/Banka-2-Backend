@@ -38,6 +38,16 @@ public class SavingsTransaction {
     @Column(name = "processed_date", nullable = false)
     private LocalDate processedDate;
 
+    /**
+     * R1-663: REZERVISANO polje — nikad se trenutno ne setuje (uvek {@code null}).
+     * Namera: kad otvaranje/raskid depozita kreira knjiznu transakciju na racunu
+     * (npr. {@code Transfer}/{@code Payment} entitet), ovde bi se upisao njen id radi
+     * povezivanja stedne transakcije sa knjiznim zapisom. Do tada ostaje null;
+     * eksplicitno zadrzano (ne brise se) jer FE ({@code savings.ts}) i Mobile
+     * ({@code SavingsDto.kt}) DTO oblik vec sadrze polje — uklanjanje bi bio
+     * cross-module contract break za benigno-null polje (low). Wire kad se uvede
+     * book-transaction linkovanje.
+     */
     @Column(name = "resulting_transaction_id")
     private Long resultingTransactionId;
 

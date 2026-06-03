@@ -23,89 +23,75 @@ class TransferExceptionHandlerTest {
         handler = new TransferExceptionHandler();
     }
 
-    // ── RuntimeException routing ──────────────────────────────────
+    // ── R1 340: TIPIZOVANO mapiranje (zamenjuje stari fragilni msg.contains string-match) ──
 
     @Test
-    void handleRuntime_notFoundMessage_returns404() {
-        RuntimeException ex = new RuntimeException("Account not found");
+    void handleNotFound_entityNotFound_returns404() {
+        var ex = new jakarta.persistence.EntityNotFoundException("From account not found");
 
-        ResponseEntity<Map<String, Object>> response = handler.handleRuntime(ex);
+        ResponseEntity<Map<String, Object>> response = handler.handleNotFound(ex);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(response.getBody()).containsEntry("message", "Account not found");
+        assertThat(response.getBody()).containsEntry("message", "From account not found");
     }
 
     @Test
-    void handleRuntime_insufficientFunds_returns400() {
-        RuntimeException ex = new RuntimeException("Insufficient funds");
+    void handleBadRequest_insufficientFunds_returns400() {
+        var ex = new IllegalArgumentException("Insufficient funds");
 
-        ResponseEntity<Map<String, Object>> response = handler.handleRuntime(ex);
+        ResponseEntity<Map<String, Object>> response = handler.handleBadRequest(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).containsEntry("message", "Insufficient funds");
+    }
+
+    @Test
+    void handleBadRequest_notActive_returns400() {
+        var ex = new IllegalArgumentException("Source account is not active");
+
+        ResponseEntity<Map<String, Object>> response = handler.handleBadRequest(ex);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
-    void handleRuntime_notActive_returns400() {
-        RuntimeException ex = new RuntimeException("Account is not active");
+    void handleBadRequest_mustBeDifferent_returns400() {
+        var ex = new IllegalArgumentException("Accounts must be different");
 
-        ResponseEntity<Map<String, Object>> response = handler.handleRuntime(ex);
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-    }
-
-    @Test
-    void handleRuntime_mustBeDifferent_returns400() {
-        RuntimeException ex = new RuntimeException("Accounts must be different");
-
-        ResponseEntity<Map<String, Object>> response = handler.handleRuntime(ex);
+        ResponseEntity<Map<String, Object>> response = handler.handleBadRequest(ex);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
-    void handleRuntime_sameCurrency_returns400() {
-        RuntimeException ex = new RuntimeException("Accounts must have same currency");
+    void handleBadRequest_differentCurrencies_returns400() {
+        var ex = new IllegalArgumentException("Accounts must have different currencies");
 
-        ResponseEntity<Map<String, Object>> response = handler.handleRuntime(ex);
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-    }
-
-    @Test
-    void handleRuntime_differentCurrencies_returns400() {
-        RuntimeException ex = new RuntimeException("Accounts have different currencies");
-
-        ResponseEntity<Map<String, Object>> response = handler.handleRuntime(ex);
+        ResponseEntity<Map<String, Object>> response = handler.handleBadRequest(ex);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
-    void handleRuntime_doNotHaveAccess_returns400() {
-        RuntimeException ex = new RuntimeException("You do not have access");
+    void handleAuth_notAuthenticated_returns401() {
+        var ex = new rs.raf.banka2_bek.transfers.service.TransferAuthException("User is not authenticated");
 
-        ResponseEntity<Map<String, Object>> response = handler.handleRuntime(ex);
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-    }
-
-    @Test
-    void handleRuntime_notAuthenticated_returns401() {
-        RuntimeException ex = new RuntimeException("User is not authenticated");
-
-        ResponseEntity<Map<String, Object>> response = handler.handleRuntime(ex);
+        ResponseEntity<Map<String, Object>> response = handler.handleAuth(ex);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(response.getBody()).containsEntry("message", "User is not authenticated");
     }
 
     @Test
-    void handleRuntime_clientNotFoundForAuthenticated_returns404_becauseNotFoundMatchesFirst() {
-        // "Client not found for authenticated" contains "not found" which matches first branch
-        RuntimeException ex = new RuntimeException("Client not found for authenticated user");
+    void handleAuth_clientNotFoundForAuthenticated_returns401_notMore404() {
+        // R1 340: ranije je "Client not found for authenticated" sadrzao "not found" pa je
+        // string-match davao 404; sad je tipizovan kao TransferAuthException → deterministicki 401.
+        var ex = new rs.raf.banka2_bek.transfers.service.TransferAuthException(
+                "Client not found for authenticated user");
 
-        ResponseEntity<Map<String, Object>> response = handler.handleRuntime(ex);
+        ResponseEntity<Map<String, Object>> response = handler.handleAuth(ex);
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
     }
 
     @Test

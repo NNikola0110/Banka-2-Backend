@@ -1,6 +1,8 @@
 package rs.raf.banka2_bek.interbank.repository;
 
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import rs.raf.banka2_bek.interbank.model.InterbankTransaction;
@@ -29,6 +31,25 @@ public interface InterbankTransactionRepository extends JpaRepository<InterbankT
      */
     Optional<InterbankTransaction> findByTransactionRoutingNumberAndTransactionIdString(
             int transactionRoutingNumber, String transactionIdString);
+
+    /**
+     * Pessimistic-write lookup po (routingNumber, idString) paru — koristi se u
+     * {@code commitLocal}/{@code rollbackLocal} da serijalizuje konkurentne
+     * duplicate-delivery COMMIT_TX/ROLLBACK_TX poruke (§2.9 dozvoljava duplikat
+     * dostavu). Bez locka, dve paralelne COMMIT_TX bi obe procitale PREPARED
+     * stanje (COMMITTED-guard se evaluira pre bilo kakve serijalizacije) i obe
+     * usle u petlju primene postinga → Monas leg (commitMonas/commitRecipientCredit)
+     * koji NEMA idempotency kljuc bi se primenio dvaput (dupli debit/credit, novac
+     * se kreira/unistava). Lock + re-citanje statusa pod lock-om cini drugu
+     * isporuku no-op.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select t from InterbankTransaction t "
+            + "where t.transactionRoutingNumber = :routingNumber "
+            + "and t.transactionIdString = :idString")
+    Optional<InterbankTransaction> findForUpdateByTransactionRoutingNumberAndTransactionIdString(
+            @Param("routingNumber") int transactionRoutingNumber,
+            @Param("idString") String transactionIdString);
 
     List<InterbankTransaction> findByStatusIn(List<InterbankTransactionStatus> statuses);
 

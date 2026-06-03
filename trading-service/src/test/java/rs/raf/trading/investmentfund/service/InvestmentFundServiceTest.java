@@ -57,6 +57,10 @@ class InvestmentFundServiceTest {
     private rs.raf.trading.order.service.CurrencyConversionService currencyConversionService;
     @Mock
     private rs.raf.trading.investmentfund.scheduler.FundValueSnapshotScheduler fundValueSnapshotScheduler;
+    @Mock
+    private rs.raf.trading.audit.service.AuditLogService auditLogService;
+    @Mock
+    private rs.raf.trading.notification.service.NotificationService notificationService;
 
     private InvestmentFundService investmentFundService;
 
@@ -76,7 +80,9 @@ class InvestmentFundServiceTest {
                 fundValueCalculator,
                 fundLiquidationService,
                 currencyConversionService,
-                fundValueSnapshotScheduler);
+                fundValueSnapshotScheduler,
+                auditLogService,
+                notificationService);
     }
 
     @Test
@@ -140,6 +146,24 @@ class InvestmentFundServiceTest {
         when(fundValueSnapshotRepository.findByFundIdAndSnapshotDateBetweenOrderBySnapshotDateAsc(1L, start, start.plusDays(729))).thenReturn(snapshots);
         var result = investmentFundService.getPerformance(1L, start, start.plusDays(729), InvestmentFundDtos.Granularity.YEAR);
         assertTrue(result.size() >= 2 && result.size() <= 3); // 2 or 3 years
+    }
+
+    @Test
+    void testGetPerformanceEmptySnapshots_returnsEmptyList() {
+        // OT-1140 (TEST-tr-funds-dividends-profitbank-1): kad nema nijednog
+        // snapshot-a u opsegu, getPerformance vraca PRAZNU listu bez NPE-a
+        // (rana grana `if (snapshots.isEmpty()) return List.of();`). Bilo koja
+        // granularnost mora pre-empt-ovati agregaciju.
+        LocalDate start = LocalDate.of(2023, 1, 1);
+        when(fundValueSnapshotRepository
+                .findByFundIdAndSnapshotDateBetweenOrderBySnapshotDateAsc(1L, start, start.plusDays(30)))
+                .thenReturn(new ArrayList<>());
+
+        for (InvestmentFundDtos.Granularity g : InvestmentFundDtos.Granularity.values()) {
+            var result = investmentFundService.getPerformance(1L, start, start.plusDays(30), g);
+            assertNotNull(result);
+            assertTrue(result.isEmpty(), "granularnost " + g + " mora vratiti praznu listu");
+        }
     }
 
     @Test

@@ -1,5 +1,6 @@
 package rs.raf.trading.berza.service;
 
+import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -32,10 +33,38 @@ public class ExchangeManagementService {
     /**
      * Proverava da li je berza trenutno otvorena.
      * Uzima u obzir vikende, praznike i radno vreme u lokalnoj vremenskoj zoni berze.
+     *
+     * <p>R2-1359 (§76): radno vreme berze ukljucuje i <b>pre-market</b> prozor.
+     * Ako berza ima {@code preMarketOpenTime}, otvaranje pocinje od pre-marketa
+     * (a ne tek od {@code openTime}) — trgovina u pre-marketu je deo radne sesije,
+     * ne "zatvoreno". Pre fix-a je {@code isExchangeOpen} gledao samo
+     * {@code [openTime, closeTime]}, pa je nalog u pre-marketu padao na
+     * {@code isClosedOrAfterHours()==true} (spori fill) iako je berza po spec-u
+     * radila. Post-market obrada (after-hours spori fill) ostaje na
+     * {@link #isAfterHours} / {@link #isClosedOrAfterHours} — pre-market NE racuna
+     * kao after-hours (to je produzena sesija, ne posle-zatvaranja prozor).
      */
     public boolean isExchangeOpen(String acronym) {
         Exchange exchange = exchangeRepository.findByAcronym(acronym)
-                .orElseThrow(() -> new RuntimeException("Exchange not found: " + acronym));
+                .orElseThrow(() -> new EntityNotFoundException("Exchange not found: " + acronym));
+        return isExchangeOpen(exchange);
+    }
+
+    /**
+     * R1-749 (N+1 fix): overload koji radi nad vec ucitanim {@link Exchange}
+     * entitetom — bez dodatnog {@code findByAcronym} poziva. {@link #toDto} i
+     * {@link #getAllExchanges} ga koriste da po berzi ne idu opet u bazu
+     * (pre fix-a je {@code toDto} zvao {@code isExchangeOpen(acronym)} → nov
+     * SELECT po svakoj berzi → N+1 nad {@code findByActiveTrue()} listom).
+     */
+    public boolean isExchangeOpen(Exchange exchange) {
+        // R1-751: delistovana (neaktivna) berza nikad NIJE otvorena — bez obzira na
+        // testMode ili radno vreme. Pre fix-a je inactive berza i dalje izvestavala
+        // {@code isCurrentlyOpen=true} (test-mode ili u radnom vremenu), pa bi order
+        // engine tretirao trgovinu kao da je berza ziva.
+        if (!exchange.isActive()) {
+            return false;
+        }
         if (exchange.isTestMode()) {
             return true;
         }
@@ -44,9 +73,26 @@ public class ExchangeManagementService {
             return false;
         }
         LocalTime now = nowZ.toLocalTime();
-        LocalTime open = exchange.getOpenTime();
+        // §76: pre-market je deo radne sesije — efektivno otvaranje je
+        // preMarketOpenTime ako je postavljen i raniji od openTime-a.
+        LocalTime open = effectiveOpenTime(exchange);
         LocalTime close = exchange.getCloseTime();
         return isWithinTradingHours(now, open, close);
+    }
+
+    /**
+     * Efektivno vreme otvaranja: ako berza ima {@code preMarketOpenTime} koji je
+     * pre {@code openTime}, sesija pocinje od pre-marketa (§76). Inace regularni
+     * {@code openTime}. Defanzivno: ako je pre-market posle open-a (nelogican
+     * seed) ignorise se.
+     */
+    private static LocalTime effectiveOpenTime(Exchange exchange) {
+        LocalTime open = exchange.getOpenTime();
+        LocalTime pre = exchange.getPreMarketOpenTime();
+        if (pre != null && open != null && pre.isBefore(open)) {
+            return pre;
+        }
+        return open;
     }
 
     /**
@@ -88,7 +134,7 @@ public class ExchangeManagementService {
      */
     public ExchangeDto getByAcronym(String acronym) {
         Exchange exchange = exchangeRepository.findByAcronym(acronym)
-                .orElseThrow(() -> new RuntimeException("Exchange not found: " + acronym));
+                .orElseThrow(() -> new EntityNotFoundException("Exchange not found: " + acronym));
         return toDto(exchange);
     }
 
@@ -98,7 +144,7 @@ public class ExchangeManagementService {
     @Transactional
     public void setTestMode(String acronym, boolean enabled) {
         Exchange exchange = exchangeRepository.findByAcronym(acronym)
-                .orElseThrow(() -> new RuntimeException("Exchange not found: " + acronym));
+                .orElseThrow(() -> new EntityNotFoundException("Exchange not found: " + acronym));
         exchange.setTestMode(enabled);
         exchangeRepository.save(exchange);
         log.info("Test mode for exchange {} set to {}", acronym, enabled);
@@ -114,12 +160,18 @@ public class ExchangeManagementService {
      * BELEX 15:00→19:00, ...). Za striktnu spec-only proveru bez oslonca na
      * postMarketCloseTime, koristi {@link #isWithinPostCloseWindow(String, int)}.
      */
+    /** Default spec-pure post-close prozor (§404: 4h) kad berza nema seedovan postMarketCloseTime. */
+    private static final int DEFAULT_POST_CLOSE_HOURS = 4;
+
     public boolean isAfterHours(String acronym) {
         Exchange exchange = exchangeRepository.findByAcronym(acronym)
-                .orElseThrow(() -> new RuntimeException("Exchange not found: " + acronym));
+                .orElseThrow(() -> new EntityNotFoundException("Exchange not found: " + acronym));
         LocalTime postEnd = exchange.getPostMarketCloseTime();
         if (postEnd == null) {
-            return false;
+            // R1 452: berza bez seedovanog postMarketCloseTime — wire-uj spec-pure 4h
+            // prozor (§404). Ranije se vracalo bezuslovno false (after-hours nikad
+            // dostupan za takvu berzu).
+            return isWithinPostCloseWindow(acronym, DEFAULT_POST_CLOSE_HOURS);
         }
         ZonedDateTime nowZ = nowInExchangeZone(exchange);
         if (isNonTradingDay(nowZ, exchange)) {
@@ -127,10 +179,38 @@ public class ExchangeManagementService {
         }
         LocalTime now = nowZ.toLocalTime();
         LocalTime close = exchange.getCloseTime();
-        if (close == null || !postEnd.isAfter(close)) {
+        if (close == null) {
             return false;
         }
+        // R1 449 (cross-midnight): ako post-market prozor prelazi ponoc
+        // (postEnd <= close, npr. close=22:00 postEnd=02:00), stara grana
+        // (`!postEnd.isAfter(close)` → false) ga je cinila NEDOSTIZNIM uvek.
+        // Sada tretiramo wrap eksplicitno: posle close ILI pre postEnd (ujutru).
+        if (!postEnd.isAfter(close)) {
+            // wrap preko ponoci
+            return now.isAfter(close) || now.isBefore(postEnd);
+        }
         return now.isAfter(close) && now.isBefore(postEnd);
+    }
+
+    /**
+     * R1-190 (§404): vraca {@code true} ako berza NIJE u regularnom radnom vremenu
+     * — tj. ako je ZATVORENA (vikend, praznik, van radnih sati) ILI u after-hours
+     * prozoru. Spec: "Obavestiti korisnika ako je berza zatvorena ... i ako je
+     * berza u after-hours stanju ... Ako korisnik postavi Order u ovom slucaju,
+     * njegovo ispunjavanje treba da se izvrsi sporije nego inace."
+     *
+     * <p>Order engine ({@code OrderServiceImpl.computeAfterHours}) koristi OVU
+     * metodu da setuje {@code order.afterHours} → spori fill (dodatnih 30 min po
+     * delu). Pre fix-a se oslanjalo samo na {@link #isAfterHours} (post-market
+     * prozor), pa je potpuno zatvorena berza dobijala {@code afterHours=false} i
+     * fill normalnom brzinom (bug).
+     *
+     * <p>Test mode čini berzu "otvorenom" ({@link #isExchangeOpen}) radi testiranja
+     * van radnog vremena → {@code false} (normalan fill), sto je zeljeno ponasanje.
+     */
+    public boolean isClosedOrAfterHours(String acronym) {
+        return !isExchangeOpen(acronym);
     }
 
     /**
@@ -146,7 +226,7 @@ public class ExchangeManagementService {
     public boolean isWithinPostCloseWindow(String acronym, int hours) {
         if (hours <= 0) return false;
         Exchange exchange = exchangeRepository.findByAcronym(acronym)
-                .orElseThrow(() -> new RuntimeException("Exchange not found: " + acronym));
+                .orElseThrow(() -> new EntityNotFoundException("Exchange not found: " + acronym));
         LocalTime close = exchange.getCloseTime();
         if (close == null) return false;
 
@@ -156,11 +236,13 @@ public class ExchangeManagementService {
         LocalTime now = nowZ.toLocalTime();
         LocalTime windowEnd = close.plusHours(hours);
 
-        // Cross-midnight handling: ako close+hours wrap-uje preko ponoci
-        // (sto za nase 6 berzi nije slucaj), tretiramo kao ne-after-hours
-        // posle ponoci radi pojednostavljenja.
-        if (windowEnd.isBefore(close)) {
-            return now.isAfter(close);
+        // R1 449 (cross-midnight): ako close+hours wrap-uje preko ponoci
+        // (npr. close=22:00, hours=4 → windowEnd=02:00), prozor je
+        // (close, 24:00) U [00:00, windowEnd). Stara grana je vracala samo
+        // now.isAfter(close) → propustala je rani-jutarnji deo (00:00-02:00).
+        // (LocalTime.plusHours wrap-uje pa je windowEnd < close u tom slucaju.)
+        if (!windowEnd.isAfter(close)) {
+            return now.isAfter(close) || now.isBefore(windowEnd);
         }
 
         return now.isAfter(close) && now.isBefore(windowEnd);
@@ -211,7 +293,7 @@ public class ExchangeManagementService {
      */
     public Set<LocalDate> getHolidays(String acronym) {
         Exchange exchange = exchangeRepository.findByAcronym(acronym)
-                .orElseThrow(() -> new RuntimeException("Exchange not found: " + acronym));
+                .orElseThrow(() -> new EntityNotFoundException("Exchange not found: " + acronym));
         return exchange.getHolidays();
     }
 
@@ -221,11 +303,16 @@ public class ExchangeManagementService {
     @Transactional
     public void setHolidays(String acronym, Set<LocalDate> holidays) {
         Exchange exchange = exchangeRepository.findByAcronym(acronym)
-                .orElseThrow(() -> new RuntimeException("Exchange not found: " + acronym));
-        exchange.getHolidays().clear();
-        exchange.getHolidays().addAll(holidays);
+                .orElseThrow(() -> new EntityNotFoundException("Exchange not found: " + acronym));
+        // R2 1419: berza ucitana sa null holidays kolekcijom (legacy red / direktan
+        // konstruktor) bi bacila NPE na getHolidays().clear(). Inicijalizuj defanzivno.
+        Set<LocalDate> target = ensureHolidaysInitialized(exchange);
+        target.clear();
+        if (holidays != null) {
+            target.addAll(holidays);
+        }
         exchangeRepository.save(exchange);
-        log.info("Set {} holidays for exchange {}", holidays.size(), acronym);
+        log.info("Set {} holidays for exchange {}", target.size(), acronym);
     }
 
     /**
@@ -234,10 +321,22 @@ public class ExchangeManagementService {
     @Transactional
     public void addHoliday(String acronym, LocalDate date) {
         Exchange exchange = exchangeRepository.findByAcronym(acronym)
-                .orElseThrow(() -> new RuntimeException("Exchange not found: " + acronym));
-        exchange.getHolidays().add(date);
+                .orElseThrow(() -> new EntityNotFoundException("Exchange not found: " + acronym));
+        // R2 1419: null-safe — vidi setHolidays.
+        ensureHolidaysInitialized(exchange).add(date);
         exchangeRepository.save(exchange);
         log.info("Added holiday {} for exchange {}", date, acronym);
+    }
+
+    /**
+     * R2 1419: garantuje da {@code exchange.holidays} nije null pre mutacije
+     * ({@code clear}/{@code add}). Vraca (eventualno novu) kolekciju.
+     */
+    private static Set<LocalDate> ensureHolidaysInitialized(Exchange exchange) {
+        if (exchange.getHolidays() == null) {
+            exchange.setHolidays(new java.util.HashSet<>());
+        }
+        return exchange.getHolidays();
     }
 
     /**
@@ -246,8 +345,11 @@ public class ExchangeManagementService {
     @Transactional
     public void removeHoliday(String acronym, LocalDate date) {
         Exchange exchange = exchangeRepository.findByAcronym(acronym)
-                .orElseThrow(() -> new RuntimeException("Exchange not found: " + acronym));
-        exchange.getHolidays().remove(date);
+                .orElseThrow(() -> new EntityNotFoundException("Exchange not found: " + acronym));
+        // R2 1419: null-safe — bez inicijalizovane kolekcije remove je no-op.
+        if (exchange.getHolidays() != null) {
+            exchange.getHolidays().remove(date);
+        }
         exchangeRepository.save(exchange);
         log.info("Removed holiday {} for exchange {}", date, acronym);
     }
@@ -255,7 +357,9 @@ public class ExchangeManagementService {
     // ── Helper metode ───────────────────────────────────────────────────────────
 
     private ExchangeDto toDto(Exchange exchange) {
-        boolean open = isExchangeOpen(exchange.getAcronym());
+        // R1-749 (N+1 fix): koristi vec ucitan entitet umesto isExchangeOpen(acronym)
+        // koji bi re-fetch-ovao istu berzu iz baze po svakom redu liste.
+        boolean open = isExchangeOpen(exchange);
         String currentLocalTime;
         try {
             currentLocalTime = ZonedDateTime.now(ZoneId.of(exchange.getTimeZone()))

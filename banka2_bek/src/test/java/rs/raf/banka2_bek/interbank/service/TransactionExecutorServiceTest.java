@@ -23,6 +23,7 @@ import rs.raf.banka2_bek.interbank.exception.InterbankExceptions;
 import rs.raf.banka2_bek.interbank.model.InterbankOtcContract;
 import rs.raf.banka2_bek.interbank.model.InterbankOtcContractStatus;
 import rs.raf.banka2_bek.interbank.model.InterbankOtcNegotiation;
+import rs.raf.banka2_bek.interbank.model.InterbankPartyType;
 import rs.raf.banka2_bek.interbank.model.InterbankTransaction;
 import rs.raf.banka2_bek.interbank.model.InterbankTransactionStatus;
 import rs.raf.banka2_bek.interbank.protocol.*;
@@ -61,6 +62,7 @@ class TransactionExecutorServiceTest {
     @Mock private TradingServiceInternalClient tradingServiceClient;
     @Mock private InterbankOtcNegotiationRepository otcNegotiationRepository;
     @Mock private InterbankOtcContractRepository otcContractRepository;
+    @Mock private InterbankFxService interbankFxService;
 
     /** Self-proxy replaced with a mock so @Transactional sub-methods can be stubbed. */
     @Mock private TransactionExecutorService self;
@@ -85,9 +87,11 @@ class TransactionExecutorServiceTest {
         service = new TransactionExecutorService(
                 messageService, client, routing, txRepo, objectMapper,
                 accountRepository, reservationApplier, tradingServiceClient,
-                otcNegotiationRepository, otcContractRepository);
+                otcNegotiationRepository, otcContractRepository, interbankFxService);
 
         ReflectionTestUtils.setField(service, "self", self);
+        // P0-3: @Value polje za cross-currency inbound settlement bank lookup.
+        ReflectionTestUtils.setField(service, "bankRegistrationNumber", "22200022");
 
         lenient().when(routing.myRoutingNumber()).thenReturn(MY_RN);
 
@@ -219,6 +223,57 @@ class TransactionExecutorServiceTest {
     }
 
     @Test
+    @DisplayName("1537: phase-2 COMMIT_TX throws InterbankAuthException (partner 401) → "
+            + "execute() does NOT propagate (fire-and-forget); message marked failed for retransmit")
+    void execute_coordinator_phase2AuthException_doesNotPropagate() {
+        // 1537 — phase-2 mora biti fire-and-forget. Pre fix-a sendPhase2Network je
+        // hvatao SAMO InterbankCommunicationException; InterbankAuthException (partner
+        // 401) je propagirao iz execute() POSLE lokalnog commit-a → pozivalac
+        // (acceptReceivedNegotiation / OTC saga) je usao u catch→compensate i
+        // rollback-ovao pregovor iako je novac vec lokalno pomeren (divergencija).
+        Transaction tx = mixedMonasTx();
+        IdempotenceKey p1Key = new IdempotenceKey(MY_RN, "p1-401");
+        IdempotenceKey commitKey = new IdempotenceKey(MY_RN, "commit-401");
+
+        when(self.prepareTxPhase(eq(tx), eq(Set.of(REMOTE_RN)))).thenReturn(phase1Yes(p1Key, tx));
+        when(client.sendMessage(eq(REMOTE_RN), eq(MessageType.NEW_TX), any(), eq(TransactionVote.class)))
+                .thenReturn(yesVote());
+        when(self.commitTxPhase(tx.transactionId(), Set.of(REMOTE_RN)))
+                .thenReturn(Map.of(REMOTE_RN, commitKey));
+        // Phase-2 COMMIT_TX → partner 401 (auth), NE communication exception.
+        when(client.sendMessage(eq(REMOTE_RN), eq(MessageType.COMMIT_TX), any(), eq(Void.class)))
+                .thenThrow(new InterbankExceptions.InterbankAuthException("Invalid API key for routing 111."));
+
+        // Kljucna invarijanta: NE sme da baci — lokalni commit je vec primenjen,
+        // execute() mora da se zavrsi cisto (recipient ce ishod primiti kroz retransmit).
+        service.execute(tx);
+
+        // Poruka je oznacena failed (ostaje PENDING za §2.9 retransmisiju), ne SENT.
+        verify(messageService).markOutboundFailed(eq(commitKey), contains("Invalid API key"));
+        verify(messageService, never()).markOutboundSent(eq(commitKey), anyInt(), any());
+    }
+
+    @Test
+    @DisplayName("1537: phase-2 ROLLBACK_TX throws InterbankProtocolException → execute() does NOT propagate")
+    void execute_coordinator_phase2ProtocolException_doesNotPropagate() {
+        Transaction tx = mixedMonasTx();
+        IdempotenceKey p1Key = new IdempotenceKey(MY_RN, "p1-proto");
+        IdempotenceKey rbKey = new IdempotenceKey(MY_RN, "rb-proto");
+
+        when(self.prepareTxPhase(eq(tx), eq(Set.of(REMOTE_RN)))).thenReturn(phase1Yes(p1Key, tx));
+        when(client.sendMessage(eq(REMOTE_RN), eq(MessageType.NEW_TX), any(), eq(TransactionVote.class)))
+                .thenReturn(noVote());
+        when(self.rollbackTxPhase(tx.transactionId(), Set.of(REMOTE_RN)))
+                .thenReturn(Map.of(REMOTE_RN, rbKey));
+        when(client.sendMessage(eq(REMOTE_RN), eq(MessageType.ROLLBACK_TX), any(), eq(Void.class)))
+                .thenThrow(new InterbankExceptions.InterbankProtocolException("malformed"));
+
+        service.execute(tx); // ne sme da baci
+
+        verify(messageService).markOutboundFailed(eq(rbKey), contains("malformed"));
+    }
+
+    @Test
     @DisplayName("execute coordinator: remote votes NO → rollbackTxPhase called + ROLLBACK_TX sent")
     void execute_coordinator_remoteNo_rollsBackAndSendsRollback() {
         Transaction tx = mixedMonasTx();
@@ -286,6 +341,77 @@ class TransactionExecutorServiceTest {
 
         verify(self).rollbackTxPhase(tx.transactionId(), Set.of(REMOTE_RN));
         verify(messageService).markOutboundFailed(eq(p1Key), contains("timeout"));
+    }
+
+    @Test
+    @DisplayName("execute coordinator: partner 401 (InterbankAuthException) → treated as NO → "
+            + "rollbackTxPhase called so sender reservation is released (P1-5)")
+    void execute_coordinator_authException_rollsBackAndReleasesReservation() {
+        // P1-5: InterbankClient.sendMessage baca InterbankAuthException (NE
+        // InterbankCommunicationException) na partner 401. Pre fix-a, ovaj izuzetak
+        // je propagirao neuhvacen iz execute() → rollbackTxPhase/rollbackLocal se
+        // nikad nije pozvao → senderova rezervacija (commit-ovana u prepareTxPhase)
+        // ostala zakljucana zauvek. Posle fix-a, 401 se tretira kao NO glas →
+        // rollbackTxPhase se poziva (koji interno radi rollbackLocal → releaseMonas).
+        Transaction tx = mixedMonasTx();
+        IdempotenceKey p1Key = new IdempotenceKey(MY_RN, "key-401");
+
+        when(self.prepareTxPhase(eq(tx), eq(Set.of(REMOTE_RN)))).thenReturn(phase1Yes(p1Key, tx));
+        when(client.sendMessage(eq(REMOTE_RN), eq(MessageType.NEW_TX), any(), eq(TransactionVote.class)))
+                .thenThrow(new InterbankExceptions.InterbankAuthException(
+                        "Invalid API key for routing " + REMOTE_RN + "."));
+        when(self.rollbackTxPhase(any(), any())).thenReturn(Map.of());
+
+        service.execute(tx);
+
+        // Kljucna invarijanta: rollbackTxPhase (→ rollbackLocal → releaseMonas) MORA
+        // biti pozvan, inace rezervacija ostaje zakljucana.
+        verify(self).rollbackTxPhase(tx.transactionId(), Set.of(REMOTE_RN));
+        verify(self, never()).commitTxPhase(any(), any());
+        verify(messageService).markOutboundFailed(eq(p1Key), contains("Invalid API key"));
+    }
+
+    @Test
+    @DisplayName("execute coordinator: partner 401 then rollbackLocal releases sender reservation "
+            + "end-to-end — availableBalance restored, status ROLLED_BACK (P1-5)")
+    void execute_coordinator_authException_endToEndReleasesReservation() throws Exception {
+        // P1-5 end-to-end: ovaj test ne mockuje rollbackLocal, vec pusta pravi kod
+        // da odradi rollbackLocal → releaseMonas (kroz self.rollbackTxPhase delegaciju
+        // na realnu instancu). Time dokazujemo da senderova rezervacija stvarno biva
+        // oslobodjena (releaseMonas pozvan) i da status zavrsi kao ROLLED_BACK kad
+        // partner vrati 401. Sender (kreditni, -amount) leg MORA biti lokalan da bi
+        // rollbackLocal oslobodio rezervaciju (rollbackLocal oslobadja samo lokalne
+        // credit postings). Local sender ACCT_A (-100), remote receiver (+100).
+        Transaction tx = new Transaction(List.of(
+                new Posting(new TxAccount.Account(ACCT_A), BigDecimal.valueOf(-100),
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD))),
+                new Posting(new TxAccount.Account(ACCT_REMOTE), BigDecimal.valueOf(100),
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD)))
+        ), new ForeignBankId(MY_RN, "tx-401-e2e"), null, null, null, null);
+        IdempotenceKey p1Key = new IdempotenceKey(MY_RN, "key-401-e2e");
+        IdempotenceKey rbKey = new IdempotenceKey(MY_RN, "rb-key-401");
+
+        when(self.prepareTxPhase(eq(tx), eq(Set.of(REMOTE_RN)))).thenReturn(phase1Yes(p1Key, tx));
+        when(client.sendMessage(eq(REMOTE_RN), eq(MessageType.NEW_TX), any(), eq(TransactionVote.class)))
+                .thenThrow(new InterbankExceptions.InterbankAuthException("Invalid API key for routing 111."));
+        // Pusti rollbackTxPhase da pozove pravi rollbackLocal preko self → delegira na
+        // realnu instancu (service).
+        when(self.rollbackTxPhase(eq(tx.transactionId()), eq(Set.of(REMOTE_RN))))
+                .thenAnswer(inv -> service.rollbackTxPhase(tx.transactionId(), Set.of(REMOTE_RN)));
+
+        // rollbackLocal cita ibTx iz repo-a (PREPARED, sa rezervacijom) i oslobadja je.
+        InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARED);
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+                .thenReturn(Optional.of(ibt));
+        when(messageService.generateKey()).thenReturn(rbKey);
+        stubTxSave();
+
+        service.execute(tx);
+
+        // Lokalni credit (sender) posting je ACCT_A (amount -100). rollbackLocal
+        // MORA osloboditi tu rezervaciju — to je kljucna P1-5 invarijanta.
+        verify(reservationApplier).releaseMonas(eq(ACCT_A), eq(BigDecimal.valueOf(100)));
+        assertThat(ibt.getStatus()).isEqualTo(InterbankTransactionStatus.ROLLED_BACK);
     }
 
     // =========================================================================
@@ -557,18 +683,23 @@ class TransactionExecutorServiceTest {
     // =========================================================================
 
     @Test
-    @DisplayName("commitLocal: MONAS debit → commitMonas(isDebit=true); MONAS credit → commitMonas(isDebit=false)")
+    @DisplayName("commitLocal: MONAS debit (recipient) → commitRecipientCredit (FX-aware); MONAS credit (sender) → commitMonas (sender debit)")
     void commitLocal_monasPostings_callsCommitMonasCorrectly() throws Exception {
+        // P0-3: cross-currency FX wiring promenila routing. Recipient (debit, +amount)
+        // leg sad ide kroz commitRecipientCredit (koji interno radi konverziju +
+        // Banka-B proviziju ako se valute razlikuju, ili je no-op za same-currency).
+        // R1-681: Sender (credit, −amount) leg ide kroz commitMonas (2-arg sender debit).
         Transaction tx = localMonasTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         stubTxSave();
 
         service.commitLocal(tx.transactionId());
 
-        verify(reservationApplier).commitMonas(eq(ACCT_A), eq(BigDecimal.valueOf(100)), eq(true));
-        verify(reservationApplier).commitMonas(eq(ACCT_B), eq(BigDecimal.valueOf(100)), eq(false));
+        // N5: commitRecipientCredit sad nosi i pinned FX rate (null za same-currency / nepinned).
+        verify(reservationApplier).commitRecipientCredit(eq(ACCT_A), eq(BigDecimal.valueOf(100)), eq("RSD"), any());
+        verify(reservationApplier).commitMonas(eq(ACCT_B), eq(BigDecimal.valueOf(100)));
     }
 
     @Test
@@ -576,7 +707,7 @@ class TransactionExecutorServiceTest {
     void commitLocal_statusSetToCommitted() throws Exception {
         Transaction tx = localMonasTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         stubTxSave();
 
@@ -593,7 +724,7 @@ class TransactionExecutorServiceTest {
     void commitLocal_idempotent_alreadyCommitted() throws Exception {
         Transaction tx = localMonasTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.COMMITTED);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
 
         service.commitLocal(tx.transactionId());
@@ -603,11 +734,61 @@ class TransactionExecutorServiceTest {
     }
 
     @Test
+    @DisplayName("1536: commitLocal acquires PESSIMISTIC_WRITE lock (findForUpdate) — "
+            + "duplicate-delivery COMMIT_TX serialized, NOT the unlocked lookup")
+    void commitLocal_usesPessimisticLockLookup() throws Exception {
+        // 1536 — duplicate-delivery COMMIT_TX → double Monas commit. §2.9 dozvoljava
+        // duplikat dostavu; pre fix-a commitLocal je citao ibTx BEZ locka i COMMITTED-
+        // guard se evaluirao pre serijalizacije → 2 paralelne COMMIT_TX obe vide
+        // PREPARED → obe primene Monas leg (koji NEMA idempotency kljuc) → dupli
+        // debit/credit. Fix: findForUpdate (PESSIMISTIC_WRITE) lock + status re-read
+        // pod lock-om. Ovaj test cementira da commitLocal NE koristi vise unlocked
+        // lookup — da je regresija (vracanje na findBy...) odmah vidljiva.
+        Transaction tx = localMonasTx();
+        InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+                .thenReturn(Optional.of(ibt));
+        stubTxSave();
+
+        service.commitLocal(tx.transactionId());
+
+        // Lock-ovani lookup je iskoriscen; unlocked nikad (cementira lock-acquire).
+        verify(txRepo).findForUpdateByTransactionRoutingNumberAndTransactionIdString(
+                eq(tx.transactionId().routingNumber()), eq(tx.transactionId().id()));
+        verify(txRepo, never()).findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any());
+        assertThat(ibt.getStatus()).isEqualTo(InterbankTransactionStatus.COMMITTED);
+    }
+
+    @Test
+    @DisplayName("1536: duplicate COMMIT_TX after first commit → Monas leg applied EXACTLY once "
+            + "(second delivery sees COMMITTED under lock → no-op)")
+    void commitLocal_duplicateDelivery_monasAppliedOnce() throws Exception {
+        // Simuliramo dve sekvencijalne (= lock-serijalizovane) COMMIT_TX dostave nad
+        // istim redom. Prva dostava commit-uje (Monas leg primenjen). Druga dostava,
+        // kad uzme lock, vidi status COMMITTED (mutiran in-place na deljenom ibt) i
+        // izlazi kao no-op — Monas leg se NE primenjuje ponovo (exactly-once).
+        Transaction tx = localMonasTx();
+        InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+                .thenReturn(Optional.of(ibt));
+        stubTxSave();
+
+        service.commitLocal(tx.transactionId()); // prva dostava
+        service.commitLocal(tx.transactionId()); // duplikat dostava (lock → COMMITTED → no-op)
+
+        // Recipient credit (debit leg) i sender debit (credit leg) — svaki TACNO jednom.
+        verify(reservationApplier, times(1))
+                .commitRecipientCredit(eq(ACCT_A), eq(BigDecimal.valueOf(100)), eq("RSD"), any());
+        verify(reservationApplier, times(1))
+                .commitMonas(eq(ACCT_B), eq(BigDecimal.valueOf(100)));
+    }
+
+    @Test
     @DisplayName("commitLocal: throws InterbankProtocolException when transaction is ROLLED_BACK")
     void commitLocal_throwsOnRolledBack() throws Exception {
         Transaction tx = localMonasTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.ROLLED_BACK);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
 
         assertThatThrownBy(() -> service.commitLocal(tx.transactionId()))
@@ -619,7 +800,7 @@ class TransactionExecutorServiceTest {
     void commitLocal_stockPostings_callsCommitStockCorrectly() throws Exception {
         Transaction tx = localStockTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         // H4: commitLocal vise ne radi findListingByTicker pre-check — commitStock
         // (trading-service seam) sam razresava listing po ticker-u.
@@ -638,7 +819,7 @@ class TransactionExecutorServiceTest {
     void commitLocal_stockIdempotencyKeyIncludesPostingIndex() throws Exception {
         Transaction tx = localStockTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         // H4: commitLocal vise ne radi findListingByTicker pre-check.
         stubTxSave();
@@ -670,7 +851,7 @@ class TransactionExecutorServiceTest {
         // simuliramo direktnim throw-om iz mock-ovanog reservationApplier-a.
         Transaction tx = localStockTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         doThrow(new InterbankExceptions.InterbankProtocolException("Listing not found: AAPL"))
                 .when(reservationApplier)
@@ -690,7 +871,7 @@ class TransactionExecutorServiceTest {
     void rollbackLocal_onlyCreditPostingsReleased() throws Exception {
         Transaction tx = localMonasTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         stubTxSave();
 
@@ -705,7 +886,7 @@ class TransactionExecutorServiceTest {
     void rollbackLocal_statusSetToRolledBack() throws Exception {
         Transaction tx = localMonasTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         stubTxSave();
 
@@ -721,7 +902,7 @@ class TransactionExecutorServiceTest {
     void rollbackLocal_idempotent_alreadyRolledBack() throws Exception {
         Transaction tx = localMonasTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.ROLLED_BACK);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
 
         service.rollbackLocal(tx.transactionId());
@@ -735,7 +916,7 @@ class TransactionExecutorServiceTest {
     void rollbackLocal_idempotent_alreadyCommitted() throws Exception {
         Transaction tx = localMonasTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.COMMITTED);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
 
         service.rollbackLocal(tx.transactionId());
@@ -749,7 +930,7 @@ class TransactionExecutorServiceTest {
     void rollbackLocal_stockCreditPosting_callsReleaseStock() throws Exception {
         Transaction tx = localStockTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         // H4: rollbackLocal vise ne radi findListingByTicker pre-check — releaseStock
         // (trading-service seam) sam razresava listing po ticker-u.
@@ -772,7 +953,7 @@ class TransactionExecutorServiceTest {
                         BigDecimal.valueOf(-5), new Asset.Stock(new StockDescription("AAPL")))
         ), new ForeignBankId(MY_RN, "stock-debit-only"), null, null, null, null);
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         // H4: rollbackLocal vise ne radi findListingByTicker pre-check.
         stubTxSave();
@@ -792,7 +973,7 @@ class TransactionExecutorServiceTest {
         // "Listing not found" gresku u InterbankProtocolException.
         Transaction tx = localStockTx();
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         doThrow(new InterbankExceptions.InterbankProtocolException("Listing not found: AAPL"))
                 .when(reservationApplier)
@@ -808,26 +989,351 @@ class TransactionExecutorServiceTest {
     // =========================================================================
 
     @Test
-    @DisplayName("handleNewTx: clean tx → saves RECIPIENT record, returns YES, records inbound response")
+    @DisplayName("handleNewTx: clean inbound tx (remote charge + local receive) → YES, saves RECIPIENT, records response")
     void handleNewTx_cleanTx_yesVoteAndSavesRecipient() throws Exception {
-        Transaction tx = localMonasTx();
+        // N3: realisticna inbound NEW_TX payload — REMOTE strana se tereti (charge),
+        // LOKALNA strana SAMO prima (debit-into). Lokalni racun se ne tereti.
+        Transaction tx = inboundReceiveTx();
         IdempotenceKey key = new IdempotenceKey(REMOTE_RN, "k1");
         // BE-INT-01: handler vise ne radi cache lookup interno — idempotency je
         // na dispatch nivou (InterbankInboundController).
-        stubMonasAccounts("RSD");
+        when(accountRepository.findByAccountNumber(ACCT_B))
+                .thenReturn(Optional.of(buildAccount(ACCT_B, "RSD", BigDecimal.valueOf(500), AccountStatus.ACTIVE)));
         stubTxSave();
 
         TransactionVote vote = service.handleNewTx(tx, key);
 
         assertThat(vote.vote()).isEqualTo(TransactionVote.Vote.YES);
+        // P2-concurrency-locks-1 (R3-1582): recipient red se sada perzistuje saveAndFlush
+        // (UNIQUE-constraint double-reserve barijera) umesto plain save.
         ArgumentCaptor<InterbankTransaction> cap = ArgumentCaptor.forClass(InterbankTransaction.class);
-        verify(txRepo).save(cap.capture());
+        verify(txRepo).saveAndFlush(cap.capture());
         assertThat(cap.getValue().getRole())
                 .isEqualTo(InterbankTransaction.InterbankTransactionRole.RECIPIENT);
         assertThat(cap.getValue().getStatus())
                 .isEqualTo(InterbankTransactionStatus.PREPARED);
         verify(messageService).recordInboundResponse(
                 eq(key), eq(MessageType.NEW_TX), any(), eq(200), any(), any());
+    }
+
+    @Test
+    @DisplayName("R3-1582: duplicate NEW_TX (recipient red PREPARED pod lockom) → replay YES, NE rezervise ponovo (double-reserve guard)")
+    void handleNewTx_duplicateNewTx_replaysYesWithoutReReserving() throws Exception {
+        // P2-concurrency-locks-1 (R3-1582): dispatch cache (InterbankMessage) ne moze
+        // da iznudi idempotenciju jer je tabela particionisana po created_at. Dva
+        // konkurentna NEW_TX sa istim transactionId su pre fix-a OBA prosla
+        // saveRecipientState (ne-zakljucan check-then-act) i OBA rezervisala.
+        // Posle fix-a: pesimisticki findForUpdate vidi da recipient red VEC postoji
+        // (racing prvi NEW_TX ga je commit-ovao) → preskace rezervaciju i replay-uje
+        // vote izvedenu iz statusa AUTORITATIVNOG recipient reda (PREPARED → YES).
+        Transaction tx = inboundReceiveTx();
+        IdempotenceKey key = new IdempotenceKey(REMOTE_RN, "dup-newtx-1");
+
+        // findForUpdate vraca postojeci recipient red (duplicate-delivery / racing drugi).
+        InterbankTransaction existing = new InterbankTransaction();
+        existing.setTransactionRoutingNumber(REMOTE_RN);
+        existing.setTransactionIdString(tx.transactionId().id());
+        existing.setRole(InterbankTransaction.InterbankTransactionRole.RECIPIENT);
+        existing.setStatus(InterbankTransactionStatus.PREPARED);
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(
+                eq(REMOTE_RN), eq(tx.transactionId().id())))
+                .thenReturn(Optional.of(existing));
+        // Replay se sad izvodi iz AUTORITATIVNOG reda (non-locking lookup), ne iz cache-a.
+        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(
+                eq(REMOTE_RN), eq(tx.transactionId().id())))
+                .thenReturn(Optional.of(existing));
+
+        TransactionVote vote = service.handleNewTx(tx, key);
+
+        // Replay YES (originalni glas je bio YES, red je PREPARED)...
+        assertThat(vote.vote()).isEqualTo(TransactionVote.Vote.YES);
+        // ...ali NIJE rezervisao ponovo (kljucni double-reserve guard)...
+        verify(reservationApplier, never()).reserveMonas(any(), any());
+        // ...niti je ponovo upisao recipient red ili cache (drugi NEW_TX je vlasnik).
+        verify(txRepo, never()).saveAndFlush(any());
+        verify(messageService, never()).recordInboundResponse(any(), any(), any(), anyInt(), any(), any());
+    }
+
+    @Test
+    @DisplayName("R3-1582 phantom-vote: duplicate NEW_TX sa DRUGIM kljucem (K2) za tx cija je "
+            + "original NEW_TX glasao NO (red ROLLED_BACK) → replay NO, NE phantom YES "
+            + "(cross-bank conservation leak zatvoren)")
+    void handleNewTx_duplicateNewTx_differentKey_rolledBackRow_replaysNoNotPhantomYes() throws Exception {
+        // REVIEWER-FOUND phantom-vote bug (R3-1582 sub-fix): §2.2 posiljalac generise
+        // SVEZ idempotency kljuc po poruci. Original NEW_TX#1 stigne pod kljucem K1,
+        // glasa NO (npr. nedovoljno sredstava) → recipient red postaje ROLLED_BACK i
+        // dispatch cache kesira NO POD K1. Same-transaction redelivery NEW_TX#2 stigne
+        // sa DRUGIM kljucem K2 → findCachedMessage(K2) je PRAZNO. Pre fix-a, replay je
+        // padao na bezuslovni "phantom YES" → koordinatoru bi se prijavila rezervacija
+        // koja NE postoji → cross-bank conservation leak / stranded state na COMMIT_TX.
+        // Posle fix-a: replay se izvodi iz STATUSA autoritativnog reda (ROLLED_BACK → NO).
+        Transaction tx = inboundReceiveTx();
+        IdempotenceKey k2 = new IdempotenceKey(REMOTE_RN, "redelivery-K2");
+
+        // Recipient red postoji i ima status ROLLED_BACK (original NEW_TX#1 glasao NO).
+        InterbankTransaction rolledBack = new InterbankTransaction();
+        rolledBack.setTransactionRoutingNumber(REMOTE_RN);
+        rolledBack.setTransactionIdString(tx.transactionId().id());
+        rolledBack.setRole(InterbankTransaction.InterbankTransactionRole.RECIPIENT);
+        rolledBack.setStatus(InterbankTransactionStatus.ROLLED_BACK);
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(
+                eq(REMOTE_RN), eq(tx.transactionId().id())))
+                .thenReturn(Optional.of(rolledBack));
+        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(
+                eq(REMOTE_RN), eq(tx.transactionId().id())))
+                .thenReturn(Optional.of(rolledBack));
+
+        // Dispatch cache MISS za K2 (glas je kesiran pod K1) — ovo je sustina buga.
+        lenient().when(messageService.findCachedMessage(k2)).thenReturn(Optional.empty());
+
+        TransactionVote vote = service.handleNewTx(tx, k2);
+
+        // KLJUCNA invarijanta: replay NO (ne phantom YES) — ne tvrdimo rezervaciju
+        // koja ne postoji.
+        assertThat(vote.vote()).isEqualTo(TransactionVote.Vote.NO);
+        // I dalje ne rezervise ponovo niti pise red (double-reserve guard ocuvan).
+        verify(reservationApplier, never()).reserveMonas(any(), any());
+        verify(txRepo, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("R3-1582 phantom-vote (positive): duplicate NEW_TX sa DRUGIM kljucem (K2) za tx "
+            + "cija je original NEW_TX glasao YES (red PREPARED) → replay YES, NE rezervise ponovo")
+    void handleNewTx_duplicateNewTx_differentKey_preparedRow_replaysYesNoSecondReserve() throws Exception {
+        // Pozitivan par: original NEW_TX#1 (kljuc K1) je glasao YES → red PREPARED,
+        // rezervacija postoji. Redelivery NEW_TX#2 sa DRUGIM kljucem K2 (cache miss)
+        // mora replay-ovati YES iz statusa reda — ALI bez druge rezervacije
+        // (double-reserve guard ostaje). Dokazuje da fix nije polomio YES putanju.
+        Transaction tx = inboundReceiveTx();
+        IdempotenceKey k2 = new IdempotenceKey(REMOTE_RN, "redelivery-K2-yes");
+
+        InterbankTransaction prepared = new InterbankTransaction();
+        prepared.setTransactionRoutingNumber(REMOTE_RN);
+        prepared.setTransactionIdString(tx.transactionId().id());
+        prepared.setRole(InterbankTransaction.InterbankTransactionRole.RECIPIENT);
+        prepared.setStatus(InterbankTransactionStatus.PREPARED);
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(
+                eq(REMOTE_RN), eq(tx.transactionId().id())))
+                .thenReturn(Optional.of(prepared));
+        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(
+                eq(REMOTE_RN), eq(tx.transactionId().id())))
+                .thenReturn(Optional.of(prepared));
+        lenient().when(messageService.findCachedMessage(k2)).thenReturn(Optional.empty());
+
+        TransactionVote vote = service.handleNewTx(tx, k2);
+
+        assertThat(vote.vote()).isEqualTo(TransactionVote.Vote.YES);
+        verify(reservationApplier, never()).reserveMonas(any(), any());
+        verify(txRepo, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("N3: inbound NEW_TX charging a LOCAL currency account → NO vote (drain rejected, no reservation)")
+    void handleNewTx_chargesLocalCurrencyAccount_rejected() throws Exception {
+        // N3 (IDOR/drain): sa validnim X-Api-Key, partner banka NE SME da inicira
+        // inbound transakciju koja TERETI (credit/charge, negativan iznos) lokalni
+        // racun. Lokalna strana inbound transakcije sme SAMO da prima (debit-into).
+        // localMonasTx tereti lokalni ACCT_B (-100) — to je tacno drain payload.
+        // PRE fix-a: ovo bi proslo (YES) i rezervisalo ACCT_B → drenaza.
+        // POSLE fix-a: NO vote, nikakva rezervacija.
+        Transaction tx = localMonasTx(); // ACCT_A +100 (debit-into), ACCT_B -100 (CHARGE lokalni)
+        IdempotenceKey key = new IdempotenceKey(REMOTE_RN, "drain-1");
+        // ACCT_A (debit-into) se i dalje validira; ACCT_B (charge) je odbijen N3 gate-om
+        // pre lookup-a, pa ga ne stub-ujemo (Mockito strict bi prijavio unused stub).
+        lenient().when(accountRepository.findByAccountNumber(ACCT_A))
+                .thenReturn(Optional.of(buildAccount(ACCT_A, "RSD", BigDecimal.ZERO, AccountStatus.ACTIVE)));
+        stubTxSave();
+
+        TransactionVote vote = service.handleNewTx(tx, key);
+
+        assertThat(vote.vote()).isEqualTo(TransactionVote.Vote.NO);
+        // Nijedna rezervacija na lokalnom racunu — drenaza odbijena pre Pass-2.
+        verify(reservationApplier, never()).reserveMonas(any(), any());
+    }
+
+    @Test
+    @DisplayName("N3: inbound NEW_TX charging a LOCAL person's money account → NO vote (drain rejected)")
+    void handleNewTx_chargesLocalPersonMonas_rejected() throws Exception {
+        // N3: isti drain preko Person+Monas oblika (lokalni Person se tereti).
+        // Balansirano: lokalni Person -100 (charge) + remote account +100 (receive).
+        Transaction tx = new Transaction(List.of(
+                new Posting(new TxAccount.Person(new ForeignBankId(MY_RN, "77")),
+                        BigDecimal.valueOf(-100), new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD))),
+                new Posting(new TxAccount.Account(ACCT_REMOTE),
+                        BigDecimal.valueOf(100), new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD)))
+        ), new ForeignBankId(REMOTE_RN, "drain-person"), null, null, null, null);
+        IdempotenceKey key = new IdempotenceKey(REMOTE_RN, "drain-2");
+        stubTxSave();
+
+        TransactionVote vote = service.handleNewTx(tx, key);
+
+        assertThat(vote.vote()).isEqualTo(TransactionVote.Vote.NO);
+        verify(reservationApplier, never()).reserveMonas(any(), any());
+    }
+
+    @Test
+    @DisplayName("N3 BYPASS: inbound NEW_TX with a legit option leg + malicious charge on a "
+            + "victim local account → NO vote, victim NEVER reserved (carve-out closed)")
+    void handleNewTx_optionContextSmugglesVictimCharge_rejected() throws Exception {
+        // N3 BYPASS exploit (the blocking hole the carve-out left open): a partner bank
+        // that holds ANY ACTIVE OTC contract attaches a LEGITIMATE option leg of its own
+        // negotiation (→ structural hasOptionContext=true) and smuggles a SEPARATE
+        // malicious credit(-X) leg charging an UNRELATED victim local RSD account
+        // (balanced by a remote +X leg). Under the old `!hasOptionContext` blanket
+        // carve-out the N3 gate was skipped for ALL Monas charges in this tx, so the
+        // victim's account was reserved (drain). After the fix the relationship gate binds
+        // the charge to the BUYER of the resolved negotiation — the victim is not that
+        // buyer → NO vote, no reservation.
+        ForeignBankId negId = new ForeignBankId(MY_RN, "neg-attacker");
+        OptionDescription opt = buildOptionDescription(
+                negId, "AAPL", BigDecimal.valueOf(10), "USD", BigDecimal.valueOf(150));
+
+        // The attacker's own (real) ACTIVE negotiation/contract — makes the option leg
+        // structurally valid. We are SELLER here (the attacker is buyer in another bank),
+        // so even resolving the negotiation, a buyer-premium charge is NOT authorized.
+        InterbankOtcNegotiation attackerNeg = new InterbankOtcNegotiation();
+        attackerNeg.setId(500L);
+        attackerNeg.setLocalPartyType(InterbankPartyType.SELLER); // we are seller, not buyer
+        attackerNeg.setLocalPartyId(7L);
+        attackerNeg.setLocalPartyRole("CLIENT");
+        attackerNeg.setPremium(BigDecimal.valueOf(700));
+        attackerNeg.setPremiumCurrency("USD");
+        lenient().when(otcNegotiationRepository
+                        .findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(eq(MY_RN), eq("neg-attacker")))
+                .thenReturn(Optional.of(attackerNeg));
+
+        // The victim's local account is a real, ACTIVE, fully-funded RSD account. This is
+        // load-bearing: under the OLD carve-out the smuggled charge would fall through to
+        // the normal Monas branch, pass validation (account exists, balance sufficient),
+        // and reserve the victim's funds (the drain). If we left ACCT_B unstubbed the test
+        // would pass for the WRONG reason (NO_SUCH_ACCOUNT) even under the buggy carve-out.
+        lenient().when(accountRepository.findByAccountNumber(ACCT_B))
+                .thenReturn(Optional.of(buildAccount(ACCT_B, "RSD", BigDecimal.valueOf(100000), AccountStatus.ACTIVE)));
+
+        // Tx: balanced option legs (Person↔Person, accept-shape) + a SMUGGLED malicious
+        // charge on victim local account ACCT_B (-100 RSD) balanced by remote +100.
+        Transaction tx = new Transaction(List.of(
+                new Posting(new TxAccount.Person(new ForeignBankId(REMOTE_RN, "C-1")),
+                        BigDecimal.ONE, new Asset.OptionAsset(opt)),
+                new Posting(new TxAccount.Person(new ForeignBankId(MY_RN, "C-7")),
+                        BigDecimal.ONE.negate(), new Asset.OptionAsset(opt)),
+                // SMUGGLED: charge victim local account (credit, -100) — drain attempt
+                new Posting(new TxAccount.Account(ACCT_B), BigDecimal.valueOf(-100),
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD))),
+                // balancing remote receive (+100)
+                new Posting(new TxAccount.Account(ACCT_REMOTE), BigDecimal.valueOf(100),
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD)))
+        ), new ForeignBankId(REMOTE_RN, "bypass-1"), null, null, null, null);
+        IdempotenceKey key = new IdempotenceKey(REMOTE_RN, "bypass-key-1");
+        stubTxSave();
+
+        TransactionVote vote = service.handleNewTx(tx, key);
+
+        assertThat(vote.vote()).isEqualTo(TransactionVote.Vote.NO);
+        // Victim's local account must NEVER be reserved — this is the drain that the
+        // carve-out allowed and the relationship gate now blocks.
+        verify(reservationApplier, never()).reserveMonas(eq(ACCT_B), any());
+        verify(reservationApplier, never()).reserveMonas(any(), any());
+    }
+
+    @Test
+    @DisplayName("N3 legit accept inbound: buyer premium charge bound to our BUYER negotiation "
+            + "(amount==premium) → YES vote (legitimate §3.6 path NOT broken)")
+    void handleNewTx_legitAcceptPremiumCharge_authorized() throws Exception {
+        // §3.6 accept inbound on the BUYER's bank (us): the seller's bank initiates the
+        // accept; we receive NEW_TX and legitimately debit our local buyer the agreed
+        // premium. The relationship gate must AUTHORIZE this: the charged party is the
+        // BUYER of our local negotiation referenced by the option leg, and the amount/
+        // currency match the negotiation's premium. Proves the fix did not break the
+        // legitimate path (it would, under a blanket-remove).
+        ForeignBankId negId = new ForeignBankId(REMOTE_RN, "neg-seller"); // authoritative at seller
+        OptionDescription opt = buildOptionDescription(
+                negId, "AAPL", BigDecimal.valueOf(50), "USD", BigDecimal.valueOf(200));
+        BigDecimal premium = BigDecimal.valueOf(700);
+
+        // Our local mirror of the negotiation: we are BUYER, local client id 7.
+        InterbankOtcNegotiation buyerNeg = new InterbankOtcNegotiation();
+        buyerNeg.setId(900L);
+        buyerNeg.setLocalPartyType(InterbankPartyType.BUYER);
+        buyerNeg.setLocalPartyId(7L);
+        buyerNeg.setLocalPartyRole("CLIENT");
+        buyerNeg.setPremium(premium);
+        buyerNeg.setPremiumCurrency("USD");
+        when(otcNegotiationRepository
+                        .findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(eq(REMOTE_RN), eq("neg-seller")))
+                .thenReturn(Optional.of(buyerNeg));
+
+        // §3.6 4-posting accept tx as seen on the buyer's bank: buyer (LOCAL) charged
+        // premium, seller (REMOTE) receives; option contract legs Person↔Person.
+        ForeignBankId buyerParty = new ForeignBankId(MY_RN, "C-7");   // local buyer
+        ForeignBankId sellerParty = new ForeignBankId(REMOTE_RN, "C-1"); // remote seller
+        Transaction tx = new Transaction(List.of(
+                new Posting(new TxAccount.Person(buyerParty), premium.negate(),
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.USD))),       // local buyer charge
+                new Posting(new TxAccount.Account(ACCT_REMOTE), premium,
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.USD))),       // remote seller receive
+                new Posting(new TxAccount.Person(buyerParty), BigDecimal.ONE,
+                        new Asset.OptionAsset(opt)),
+                new Posting(new TxAccount.Person(sellerParty), BigDecimal.ONE.negate(),
+                        new Asset.OptionAsset(opt))
+        ), new ForeignBankId(REMOTE_RN, "accept-inbound-1"), null, null, null, null);
+        IdempotenceKey key = new IdempotenceKey(REMOTE_RN, "accept-key-1");
+
+        // Resolve local buyer (C-7) money account for the reservation in Pass 2.
+        when(accountRepository.findByClientIdAndStatusOrderByAvailableBalanceDesc(eq(7L), eq(AccountStatus.ACTIVE)))
+                .thenReturn(List.of(buildAccount(MY_RN + "700001", "USD",
+                        BigDecimal.valueOf(5000), AccountStatus.ACTIVE)));
+        stubTxSave();
+
+        TransactionVote vote = service.handleNewTx(tx, key);
+
+        assertThat(vote.vote()).isEqualTo(TransactionVote.Vote.YES);
+        // Legitimate premium reservation happens on the resolved local buyer account.
+        verify(reservationApplier).reserveMonas(eq(MY_RN + "700001"), eq(premium));
+    }
+
+    @Test
+    @DisplayName("N3 relationship gate: option leg present but charge amount != premium → NO vote")
+    void handleNewTx_optionContextWrongPremiumAmount_rejected() throws Exception {
+        // Even with a real local BUYER negotiation referenced by the option leg, a charge
+        // whose amount does NOT equal the negotiation premium is NOT authorized — the
+        // relationship gate binds amount+currency, not just party. Defeats a "right buyer,
+        // inflated amount" variant of the smuggle.
+        ForeignBankId negId = new ForeignBankId(REMOTE_RN, "neg-amt");
+        OptionDescription opt = buildOptionDescription(
+                negId, "AAPL", BigDecimal.valueOf(50), "USD", BigDecimal.valueOf(200));
+
+        InterbankOtcNegotiation buyerNeg = new InterbankOtcNegotiation();
+        buyerNeg.setId(901L);
+        buyerNeg.setLocalPartyType(InterbankPartyType.BUYER);
+        buyerNeg.setLocalPartyId(7L);
+        buyerNeg.setLocalPartyRole("CLIENT");
+        buyerNeg.setPremium(BigDecimal.valueOf(700));
+        buyerNeg.setPremiumCurrency("USD");
+        lenient().when(otcNegotiationRepository
+                        .findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(eq(REMOTE_RN), eq("neg-amt")))
+                .thenReturn(Optional.of(buyerNeg));
+
+        ForeignBankId buyerParty = new ForeignBankId(MY_RN, "C-7");
+        ForeignBankId sellerParty = new ForeignBankId(REMOTE_RN, "C-1");
+        BigDecimal inflated = BigDecimal.valueOf(9000); // != premium 700
+        Transaction tx = new Transaction(List.of(
+                new Posting(new TxAccount.Person(buyerParty), inflated.negate(),
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.USD))),
+                new Posting(new TxAccount.Account(ACCT_REMOTE), inflated,
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.USD))),
+                new Posting(new TxAccount.Person(buyerParty), BigDecimal.ONE,
+                        new Asset.OptionAsset(opt)),
+                new Posting(new TxAccount.Person(sellerParty), BigDecimal.ONE.negate(),
+                        new Asset.OptionAsset(opt))
+        ), new ForeignBankId(REMOTE_RN, "accept-bad-amt-1"), null, null, null, null);
+        IdempotenceKey key = new IdempotenceKey(REMOTE_RN, "accept-bad-amt-key");
+        stubTxSave();
+
+        TransactionVote vote = service.handleNewTx(tx, key);
+
+        assertThat(vote.vote()).isEqualTo(TransactionVote.Vote.NO);
+        verify(reservationApplier, never()).reserveMonas(any(), any());
     }
 
     @Test
@@ -852,9 +1358,10 @@ class TransactionExecutorServiceTest {
         // u handler, drugi ce dobiti DataIntegrityViolationException pri save-u
         // (UNIQUE constraint). Mi to swallow-ujemo i vracamo izracunatu vote —
         // jer je handler deterministicki, vote je isti.
-        Transaction tx = localMonasTx();
+        Transaction tx = inboundReceiveTx();
         IdempotenceKey key = new IdempotenceKey(REMOTE_RN, "race-k1");
-        stubMonasAccounts("RSD");
+        when(accountRepository.findByAccountNumber(ACCT_B))
+                .thenReturn(Optional.of(buildAccount(ACCT_B, "RSD", BigDecimal.valueOf(500), AccountStatus.ACTIVE)));
         stubTxSave();
         doThrow(new org.springframework.dao.DataIntegrityViolationException("UNIQUE violation"))
                 .when(messageService).recordInboundResponse(eq(key), any(), any(), anyInt(), any(), any());
@@ -867,10 +1374,11 @@ class TransactionExecutorServiceTest {
     @Test
     @DisplayName("handleNewTx: YES vote response body is persisted as JSON containing YES")
     void handleNewTx_yesVote_responseBodyContainsYes() throws Exception {
-        Transaction tx = localMonasTx();
+        Transaction tx = inboundReceiveTx();
         IdempotenceKey key = new IdempotenceKey(REMOTE_RN, "k4");
         // BE-INT-01: handler vise ne radi cache lookup interno.
-        stubMonasAccounts("RSD");
+        when(accountRepository.findByAccountNumber(ACCT_B))
+                .thenReturn(Optional.of(buildAccount(ACCT_B, "RSD", BigDecimal.valueOf(500), AccountStatus.ACTIVE)));
         stubTxSave();
 
         service.handleNewTx(tx, key);
@@ -893,7 +1401,7 @@ class TransactionExecutorServiceTest {
         // BE-INT-01: handler vise ne radi cache lookup interno.
 
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         stubTxSave();
 
@@ -912,7 +1420,7 @@ class TransactionExecutorServiceTest {
         Transaction tx = localMonasTx();
         IdempotenceKey key = new IdempotenceKey(REMOTE_RN, "ck-race");
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         stubTxSave();
         doThrow(new org.springframework.dao.DataIntegrityViolationException("UNIQUE violation"))
@@ -934,7 +1442,7 @@ class TransactionExecutorServiceTest {
         // BE-INT-01: handler vise ne radi cache lookup interno.
 
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         stubTxSave();
 
@@ -952,7 +1460,7 @@ class TransactionExecutorServiceTest {
         Transaction tx = localMonasTx();
         IdempotenceKey key = new IdempotenceKey(REMOTE_RN, "rk-race");
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         stubTxSave();
         doThrow(new org.springframework.dao.DataIntegrityViolationException("UNIQUE violation"))
@@ -1166,7 +1674,7 @@ class TransactionExecutorServiceTest {
         ), new ForeignBankId(MY_RN, "tx-exercise"), null, null, null, null);
 
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         stubTxSave();
 
@@ -1212,7 +1720,7 @@ class TransactionExecutorServiceTest {
         ), new ForeignBankId(MY_RN, "tx-accept"), null, null, null, null);
 
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         stubTxSave();
 
@@ -1241,7 +1749,7 @@ class TransactionExecutorServiceTest {
         ), new ForeignBankId(MY_RN, "tx-opt-idem"), null, null, null, null);
 
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.COMMITTED);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
 
         service.commitLocal(tx.transactionId());
@@ -1264,7 +1772,7 @@ class TransactionExecutorServiceTest {
         ), new ForeignBankId(MY_RN, "tx-opt-rb"), null, null, null, null);
 
         InterbankTransaction ibt = savedIbt(tx, InterbankTransactionStatus.PREPARING);
-        when(txRepo.findByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
+        when(txRepo.findForUpdateByTransactionRoutingNumberAndTransactionIdString(anyInt(), any()))
                 .thenReturn(Optional.of(ibt));
         stubTxSave();
 
@@ -1272,6 +1780,54 @@ class TransactionExecutorServiceTest {
 
         verifyNoInteractions(otcNegotiationRepository, otcContractRepository, reservationApplier);
         assertThat(ibt.getStatus()).isEqualTo(InterbankTransactionStatus.ROLLED_BACK);
+    }
+
+    // =========================================================================
+    // R1-663b — assetKey grupisanje (krhka pretpostavka: OptionAsset po negotiationId)
+    // =========================================================================
+
+    /**
+     * R1-663b: {@code assetKey} grupisanje za balanced-check je krhka pretpostavka bez
+     * testa. Pinujemo format po varijanti aseta:
+     *  - Monas  → "MONAS:" + valuta (RSD/EUR/...)
+     *  - Stock  → "STOCK:" + ticker
+     *  - OptionAsset → "OPTION:" + negotiationId.id   (KLJUCNA pretpostavka: dve noge
+     *    iste opcije moraju deliti negotiationId pa se grupisu zajedno i ponistavaju)
+     * Tako se eksplicitno fiksira da postings ISTE opcije (isti negotiationId) padaju u
+     * istu grupu, dok razlicit negotiationId → razlicite grupe (ne ponistavaju se).
+     */
+    @Test
+    @DisplayName("R1-663b: assetKey — Monas po valuti, Stock po tickeru, Option po negotiationId")
+    void assetKey_groupsByExpectedDiscriminator() throws Exception {
+        java.lang.reflect.Method m = TransactionExecutorService.class
+                .getDeclaredMethod("assetKey", Asset.class);
+        m.setAccessible(true);
+
+        Asset monasRsd = new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD));
+        Asset monasEur = new Asset.Monas(new MonetaryAsset(CurrencyCode.EUR));
+        Asset stock = new Asset.Stock(new StockDescription("AAPL"));
+        OptionDescription optDesc = new OptionDescription(
+                new ForeignBankId(REMOTE_RN, "neg-42"),
+                new StockDescription("AAPL"),
+                new MonetaryValue(CurrencyCode.RSD, BigDecimal.TEN),
+                OffsetDateTime.now(ZoneOffset.UTC).plusDays(7),
+                BigDecimal.ONE);
+        OptionDescription optDescOther = new OptionDescription(
+                new ForeignBankId(REMOTE_RN, "neg-99"),
+                new StockDescription("AAPL"),
+                new MonetaryValue(CurrencyCode.RSD, BigDecimal.TEN),
+                OffsetDateTime.now(ZoneOffset.UTC).plusDays(7),
+                BigDecimal.ONE);
+        Asset option42 = new Asset.OptionAsset(optDesc);
+        Asset option99 = new Asset.OptionAsset(optDescOther);
+
+        assertThat(m.invoke(service, monasRsd)).isEqualTo("MONAS:RSD");
+        assertThat(m.invoke(service, monasEur)).isEqualTo("MONAS:EUR");
+        assertThat(m.invoke(service, stock)).isEqualTo("STOCK:AAPL");
+        assertThat(m.invoke(service, option42)).isEqualTo("OPTION:neg-42");
+        // Razlicit negotiationId → razlicit kljuc (ne grupisu se zajedno).
+        assertThat(m.invoke(service, option99)).isEqualTo("OPTION:neg-99");
+        assertThat(m.invoke(service, option42)).isNotEqualTo(m.invoke(service, option99));
     }
 
     // =========================================================================
@@ -1286,6 +1842,22 @@ class TransactionExecutorServiceTest {
                 new Posting(new TxAccount.Account(ACCT_B), BigDecimal.valueOf(-100),
                         new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD)))
         ), new ForeignBankId(MY_RN, "local-monas-1"), null, null, null, null);
+    }
+
+    /**
+     * N3: realisticna INBOUND NEW_TX payload — REMOTE strana se tereti (charge,
+     * negativan iznos), LOKALNA strana SAMO prima (debit-into, pozitivan iznos).
+     * Lokalni racun se nikad ne tereti, pa prolazi inbound authz gate.
+     */
+    private Transaction inboundReceiveTx() {
+        return new Transaction(List.of(
+                // remote sender se tereti (charge) — koordinator (REMOTE) je vec rezervisao
+                new Posting(new TxAccount.Account(ACCT_REMOTE), BigDecimal.valueOf(-100),
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD))),
+                // lokalni primalac prima (debit-into)
+                new Posting(new TxAccount.Account(ACCT_B), BigDecimal.valueOf(100),
+                        new Asset.Monas(new MonetaryAsset(CurrencyCode.RSD)))
+        ), new ForeignBankId(REMOTE_RN, "inbound-receive-1"), null, null, null, null);
     }
 
     /** Same as localMonasTx but posting currency is EUR. */
@@ -1393,7 +1965,10 @@ class TransactionExecutorServiceTest {
     }
 
     private void stubTxSave() {
-        when(txRepo.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        lenient().when(txRepo.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        // P2-concurrency-locks-1 (R3-1582): saveRecipientState sada koristi saveAndFlush
+        // (UNIQUE constraint barijera) + findForUpdate (default Optional.empty → fresh insert).
+        lenient().when(txRepo.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
     }
 
     private TransactionVote yesVote() {

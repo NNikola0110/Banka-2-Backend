@@ -103,6 +103,12 @@ public class WikipediaToolClient {
 
     @PreDestroy
     void shutdown() {
-        // java.net.http.HttpClient nema close() do Java 21+; resource cleanup je auto.
+        // Java 21+ (projekat je na Java 25): java.net.http.HttpClient je AutoCloseable —
+        // close() drena interni connection pool / selector thread na gasenju konteksta.
+        try {
+            http.close();
+        } catch (Exception e) {
+            log.debug("WikipediaToolClient HttpClient close failed (benigno): {}", e.getMessage());
+        }
     }
 }

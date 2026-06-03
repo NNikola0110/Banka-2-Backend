@@ -19,9 +19,9 @@ import java.time.LocalDateTime;
  * {@code @ManyToOne} veza ka {@link Listing} jer je {@code Listing} u
  * trading-service domenu (faza 2b). Sve ostale reference na banka-core
  * entitete su vec soft id-evi ({@code userId}, {@code accountId},
- * {@code reservedAccountId}, {@code fundId}). Dodata su dva NOVA polja
- * ({@code bankaCoreReservationId}, {@code sagaState}) — settlement SAGA
- * seam; monolitna kopija ih NEMA i nije dirana.
+ * {@code reservedAccountId}, {@code fundId}). Dodato je NOVO polje
+ * ({@code bankaCoreReservationId}) — settlement SAGA seam; monolitna kopija
+ * ga NEMA i nije dirana.
  */
 @Entity
 @Table(name = "orders")
@@ -128,6 +128,41 @@ public class Order {
     private BigDecimal fxCommission;
 
     /**
+     * N2 FIX (money): provizija CELOG naloga, izracunata JEDNOM po spec §308/§322
+     * ({@code min(14% × approxPrice, $7)} za MARKET/STOP, {@code min(24% × approxPrice, $12)}
+     * za LIMIT/STOP_LIMIT) u valuti LISTINGA. Postavlja se pri kreiranju/odobravanju
+     * ordera (isti broj koji ulazi u rezervaciju).
+     *
+     * <p>Pre N2 fix-a {@code SingleOrderExecutor} je racunao proviziju PO SVAKOM
+     * partial fill-u kao {@code min(rate × fillPrice, cap)} — suma provizija svih
+     * fill-ova je premasivala provizioni cap CELOG naloga (rezervacija drzi cap po
+     * celom nalogu), pa su se BUY orderi ZAGLAVLJIVALI (commit > rezervacija →
+     * IllegalState → vecni retry) ili je SELL preplaCivao banku. Cuvanjem ovog
+     * polja, fill engine PRO-RATA raspodeli ovu jednu vrednost po fill-u
+     * (proporcionalno kolicini), tako da je {@code Σ provizija_fill == orderCommission}.
+     *
+     * <p>Null za zaposlene/FUND (oni ne placaju proviziju) i za legacy ordere bez
+     * ovog polja (fallback na staru per-fill formulu radi backward-compat).
+     */
+    @Column(name = "order_commission", precision = 19, scale = 4)
+    private BigDecimal orderCommission;
+
+    /**
+     * N3 FIX (concurrency): optimisticko zakljucavanje hot order entiteta. Bez
+     * {@code @Version} dva konkurentna scheduler tick-a (npr. 2 k8s replike bez
+     * ShedLock-a, ili overlap istog tick-a) mogu istovremeno procitati isti
+     * APPROVED order, oba uraditi fill (double-fill / double-charge) i lost-update
+     * istisnuti {@code remainingPortions}. Sa {@code @Version}, drugi commit nad
+     * istim redom baca {@code OptimisticLockException} → njegova REQUIRES_NEW tx se
+     * rollback-uje izolovano (pa banka-core commit ne prodje), a sledeci tick
+     * regularno nastavi sa svezim stanjem. Postojeca tabela: kolona dobija default 0.
+     */
+    @jakarta.persistence.Version
+    @org.hibernate.annotations.ColumnDefault("0")
+    @Column(name = "version")
+    private Long version;
+
+    /**
      * Kada je najranije dozvoljen sledeci fill pokusaj. Postavlja se posle
      * svakog uspesnog fill-a po spec-formuli:
      *   Random(0, 24 * 60 / (volume / remaining)) sekundi
@@ -154,16 +189,10 @@ public class Order {
      * Id rezervacije sredstava koju je banka-core vratio na
      * {@code POST /internal/funds/reserve}. Cuva se da bi se rezervacija
      * mogla commit-ovati ({@code /commit}) ili oslobaditi ({@code /release})
-     * u settlement SAGA-i. Null dok rezervacija nije izvrsena.
+     * u settlement SAGA-i. Null dok rezervacija nije izvrsena. Ovo je polje
+     * koje stvarni recovery cita ({@code OrderRecovery} / cancel-flow), uz
+     * {@code status} / {@code isDone}.
      */
     @Column(name = "banka_core_reservation_id")
     private String bankaCoreReservationId;
-
-    /**
-     * Trenutna faza settlement SAGA-e za ovaj nalog. Null za naloge
-     * koji jos nisu usli u distribuiranu naplatu.
-     */
-    @Enumerated(EnumType.STRING)
-    @Column(name = "saga_state")
-    private SagaState sagaState;
 }

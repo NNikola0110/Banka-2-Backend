@@ -5,11 +5,16 @@ import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.Locale;
 
 @Component
 public class TransactionEmailTemplate {
 
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy.");
+
+    /** [P1-i18n-1 / 1853] fiksiran sr-RS Locale za novcani format (deterministicki
+     *  grouping/decimal separator nezavisno od JVM/kontejnerskog lokala). */
+    private static final Locale SR_RS = Locale.forLanguageTag("sr-RS");
 
     // ── 1. Payment confirmation ──────────────────────────────────────
 
@@ -173,10 +178,18 @@ public class TransactionEmailTemplate {
 
     private String formatAmount(BigDecimal amount, String currency) {
         if (amount == null) return "-";
-        return String.format("%,.2f %s", amount, currency != null ? currency : "");
+        // NB: rezultat se uvek prosledjuje u row(...) koji HTML-escape-uje value
+        // ([P1-notif-svc-1 / 1528]) — currency NE escape-ujemo ovde da izbegnemo
+        // dvostruki escape.
+        // [P1-i18n-1 / 1853] eksplicitan sr-RS Locale za grouping/decimal separator
+        // (nezavisno od JVM lokala kontejnera).
+        return String.format(SR_RS, "%,.2f %s", amount, currency != null ? currency : "");
     }
 
     private String row(String label, String value) {
+        // [P1-notif-svc-1 / 1528] value je user-controlled (fromAccount/toAccount/
+        // status/loanType/loanNumber...) → HTML escape pre umetanja. label je uvek
+        // hardkodiran literal ali se escape-uje radi konzistentnosti.
         return """
                 <tr>
                     <td style="padding:14px 20px;border-bottom:1px solid #c7d2fe;">
@@ -188,7 +201,7 @@ public class TransactionEmailTemplate {
                         </table>
                     </td>
                 </tr>
-                """.formatted(label, value);
+                """.formatted(EmailHtml.escape(label), EmailHtml.escape(value));
     }
 
     private String detailsTable(String... rows) {

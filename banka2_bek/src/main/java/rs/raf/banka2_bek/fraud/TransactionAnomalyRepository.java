@@ -25,10 +25,14 @@ import java.time.LocalDateTime;
 @Repository
 public interface TransactionAnomalyRepository extends JpaRepository<TransactionAnomalyEntity, Long> {
 
+    // Faza G (live-smoke fix): cast(:p as tip) na null-check strani — PG ne moze da
+    // zakljuci tip null bind-a (ERROR: could not determine data type of parameter $N).
+    // onlyPending je primitivni boolean (uvek tipiziran), reviewStatus IS NULL je
+    // kolona (ne param) — samo since/minRisk treba cast.
     @Query("""
         SELECT a FROM TransactionAnomalyEntity a
-        WHERE (:since IS NULL OR a.computedAt >= :since)
-          AND (:minRisk IS NULL OR a.riskScore >= :minRisk)
+        WHERE (cast(:since as timestamp) IS NULL OR a.computedAt >= :since)
+          AND (cast(:minRisk as big_decimal) IS NULL OR a.riskScore >= :minRisk)
           AND (:onlyPending = false OR a.reviewStatus IS NULL OR a.reviewStatus = 'pending')
         ORDER BY a.riskScore DESC, a.computedAt DESC
         """)

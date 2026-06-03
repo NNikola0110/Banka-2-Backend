@@ -29,6 +29,15 @@ public class OtcContractDto {
     private BigDecimal premium;
     /** Trenutna cena listinga — koristi se za prikaz ITM/OTM na UI. */
     private BigDecimal currentPrice;
+    /**
+     * Izvedeni NETO profit (Celina 4 §149 "Sklopljeni ugovori"): dobit ako se call
+     * opcija odmah iskoristi, umanjena za vec placenu premiju =
+     * {@code (currentPrice − strikePrice) × quantity − premium}. Spec primer
+     * (Celina 5 Primer 1): {@code 12500 − 10000 − 1150 = 1350}. Null kad trenutna
+     * cena nije poznata (isto kao {@link #currentPrice}). Racuna ga
+     * {@code OtcMapper.computeProfit}.
+     */
+    private BigDecimal profit;
 
     private LocalDate settlementDate;
     private String status;

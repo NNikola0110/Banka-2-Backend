@@ -29,6 +29,9 @@ import java.time.LocalDateTime;
 @RequiredArgsConstructor
 public class FraudAlertController {
 
+    /** [P2-input-validation-1 / R1 539] gornja granica page size-a (DoS guard). */
+    private static final int MAX_PAGE_SIZE = 200;
+
     private final FraudAlertService service;
 
     /**
@@ -48,7 +51,18 @@ public class FraudAlertController {
             @RequestParam(value = "only_pending", defaultValue = "true") boolean onlyPending,
             @RequestParam(value = "page", defaultValue = "0") int page,
             @RequestParam(value = "size", defaultValue = "50") int size) {
-        Pageable pageable = PageRequest.of(page, size);
+        // [P2-input-validation-1 / R1 539] validacija paginacije — negativan page
+        // (i nevalidan size) je inace bacao PageRequest.of IllegalArgumentException
+        // duboko u stack-u; size bez gornje granice (?size=2147483647) bi pokusao
+        // ogroman fetch. Odbij negativan page/size sa 400 i clamp-uj size na MAX.
+        if (page < 0) {
+            throw new IllegalArgumentException("page mora biti >= 0");
+        }
+        if (size < 1) {
+            throw new IllegalArgumentException("size mora biti >= 1");
+        }
+        int cappedSize = Math.min(size, MAX_PAGE_SIZE);
+        Pageable pageable = PageRequest.of(page, cappedSize);
         return ResponseEntity.ok(service.findAlerts(since, minRisk, onlyPending, pageable));
     }
 

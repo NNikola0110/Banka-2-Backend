@@ -246,7 +246,8 @@ class MarginAccountServiceExtendedTest {
             MarginAccount account = marginAccount(10L, "5000", "2500", MarginAccountStatus.ACTIVE);
 
             when(userResolver.resolveCurrent()).thenReturn(client(10L));
-            when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+            // P2-concurrency-locks-1 (R1-465/R3-1603): deposit zakljucava red preko findByIdForUpdate.
+            when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
             service.deposit(1L, new BigDecimal("1"));
 
@@ -264,7 +265,7 @@ class MarginAccountServiceExtendedTest {
             MarginAccount account = marginAccount(10L, "1000", "2000", MarginAccountStatus.BLOCKED);
 
             when(userResolver.resolveCurrent()).thenReturn(client(10L));
-            when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+            when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
             service.deposit(1L, new BigDecimal("50000"));
 
@@ -279,7 +280,7 @@ class MarginAccountServiceExtendedTest {
             MarginAccount account = marginAccount(10L, "10000", "5000", MarginAccountStatus.ACTIVE);
 
             when(userResolver.resolveCurrent()).thenReturn(client(10L));
-            when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+            when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
             service.deposit(1L, new BigDecimal("3000"));
 
@@ -306,7 +307,8 @@ class MarginAccountServiceExtendedTest {
             MarginAccount account = marginAccount(10L, "10000", "5000", MarginAccountStatus.ACTIVE);
 
             when(userResolver.resolveCurrent()).thenReturn(client(10L));
-            when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+            // P1-8: withdraw sad zakljucava red preko findByIdForUpdate.
+            when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
             service.withdraw(1L, new BigDecimal("5000"));
 
@@ -322,7 +324,7 @@ class MarginAccountServiceExtendedTest {
             MarginAccount account = marginAccount(10L, "10000", "5000", MarginAccountStatus.ACTIVE);
 
             when(userResolver.resolveCurrent()).thenReturn(client(10L));
-            when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+            when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
             // 10000 - 5001 = 4999 < 5000 (maintenance) => should fail
             assertThatThrownBy(() -> service.withdraw(1L, new BigDecimal("5001")))
@@ -338,7 +340,7 @@ class MarginAccountServiceExtendedTest {
             MarginAccount account = marginAccount(10L, "10000", "5000", MarginAccountStatus.ACTIVE);
 
             when(userResolver.resolveCurrent()).thenReturn(client(10L));
-            when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+            when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
             service.withdraw(1L, new BigDecimal("2000"));
 
@@ -357,7 +359,7 @@ class MarginAccountServiceExtendedTest {
             MarginAccount account = marginAccount(10L, "10000", "5000", MarginAccountStatus.BLOCKED);
 
             when(userResolver.resolveCurrent()).thenReturn(client(10L));
-            when(marginAccountRepository.findById(1L)).thenReturn(Optional.of(account));
+            when(marginAccountRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(account));
 
             assertThatThrownBy(() -> service.withdraw(1L, new BigDecimal("1")))
                     .isInstanceOf(IllegalStateException.class)

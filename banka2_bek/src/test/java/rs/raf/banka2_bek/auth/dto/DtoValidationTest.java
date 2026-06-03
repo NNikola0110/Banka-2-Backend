@@ -9,6 +9,8 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import rs.raf.banka2_bek.employee.dto.CreateEmployeeRequestDto;
 import rs.raf.banka2_bek.payment.dto.CreatePaymentRequestDto;
+import rs.raf.banka2_bek.card.dto.CreateCardRequestDto;
+import rs.raf.banka2_bek.card.model.CardType;
 import rs.raf.banka2_bek.account.dto.CreateAccountDto;
 import rs.raf.banka2_bek.account.model.AccountType;
 import rs.raf.banka2_bek.payment.model.PaymentCode;
@@ -399,6 +401,32 @@ class DtoValidationTest {
             assertThat(violations).isNotEmpty();
         }
 
+        // R1-645: @Digits(15,4) — vise od 4 decimale je nevalidno (kolona scale=4).
+        @Test
+        void amountTooManyDecimals_hasViolation() {
+            CreatePaymentRequestDto dto = buildValid();
+            dto.setAmount(new BigDecimal("10.123456"));
+            Set<ConstraintViolation<CreatePaymentRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("amount"));
+        }
+
+        // R1-645: @Digits(15,4) — vise od 15 cifara ispred zareza je nevalidno (precision=19).
+        @Test
+        void amountTooManyIntegerDigits_hasViolation() {
+            CreatePaymentRequestDto dto = buildValid();
+            dto.setAmount(new BigDecimal("1234567890123456")); // 16 cifara
+            Set<ConstraintViolation<CreatePaymentRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("amount"));
+        }
+
+        @Test
+        void amountFourDecimals_noAmountViolation() {
+            CreatePaymentRequestDto dto = buildValid();
+            dto.setAmount(new BigDecimal("100.1234"));
+            Set<ConstraintViolation<CreatePaymentRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).noneMatch(v -> v.getPropertyPath().toString().equals("amount"));
+        }
+
         @Test
         void nullPaymentCode_hasViolation() {
             CreatePaymentRequestDto dto = buildValid();
@@ -427,6 +455,71 @@ class DtoValidationTest {
         void nullReferenceNumber_isOptional_noViolation() {
             CreatePaymentRequestDto dto = buildValid();
             dto.setReferenceNumber(null);
+            Set<ConstraintViolation<CreatePaymentRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).isEmpty();
+        }
+
+        // ── [P2-input-validation-1 / R1 327] toAccount > 18 (kolona length=18) ──
+
+        @Test
+        void toAccount19Digits_hasViolation() {
+            CreatePaymentRequestDto dto = buildValid();
+            dto.setToAccount("1".repeat(19));
+            Set<ConstraintViolation<CreatePaymentRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).isNotEmpty();
+            assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("toAccount"));
+        }
+
+        @Test
+        void toAccount18Digits_noViolation() {
+            CreatePaymentRequestDto dto = buildValid();
+            dto.setToAccount("1".repeat(18));
+            Set<ConstraintViolation<CreatePaymentRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).isEmpty();
+        }
+
+        // ── [P2-input-validation-1 / R1 328] description > 200 (kolona purpose=200) ──
+
+        @Test
+        void description201Chars_hasViolation() {
+            CreatePaymentRequestDto dto = buildValid();
+            dto.setDescription("x".repeat(201));
+            Set<ConstraintViolation<CreatePaymentRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).isNotEmpty();
+            assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("description"));
+        }
+
+        @Test
+        void description200Chars_noViolation() {
+            CreatePaymentRequestDto dto = buildValid();
+            dto.setDescription("x".repeat(200));
+            Set<ConstraintViolation<CreatePaymentRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).isEmpty();
+        }
+
+        // ── [P2-input-validation-1 / R1 331] OTP @Pattern \d{6} ──────────────────
+
+        @Test
+        void otpCodeNonNumeric_hasViolation() {
+            CreatePaymentRequestDto dto = buildValid();
+            dto.setOtpCode("abcdef");
+            Set<ConstraintViolation<CreatePaymentRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).isNotEmpty();
+            assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("otpCode"));
+        }
+
+        @Test
+        void otpCodeWrongLength_hasViolation() {
+            CreatePaymentRequestDto dto = buildValid();
+            dto.setOtpCode("12345");
+            Set<ConstraintViolation<CreatePaymentRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).isNotEmpty();
+        }
+
+        @Test
+        void otpCodeSixDigits_noViolation() {
+            CreatePaymentRequestDto dto = buildValid();
+            dto.setOtpCode("123456");
             Set<ConstraintViolation<CreatePaymentRequestDto>> violations = validator.validate(dto);
             assertThat(violations).isEmpty();
         }
@@ -528,6 +621,163 @@ class DtoValidationTest {
             dto.setInitialBalance(null);
             dto.setInitialDeposit(null);
             assertThat(dto.getResolvedInitialBalance()).isEqualByComparingTo(BigDecimal.ZERO);
+        }
+
+        // ── [P2-input-validation-1 / R1 310] negativan initialDeposit ────────────
+
+        @Test
+        void negativeInitialDeposit_hasViolation() {
+            CreateAccountDto dto = buildValid();
+            dto.setInitialDeposit(-100.0);
+            Set<ConstraintViolation<CreateAccountDto>> violations = validator.validate(dto);
+            assertThat(violations).isNotEmpty();
+            assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("initialDeposit"));
+        }
+
+        @Test
+        void zeroInitialDeposit_noViolation() {
+            CreateAccountDto dto = buildValid();
+            dto.setInitialDeposit(0.0);
+            Set<ConstraintViolation<CreateAccountDto>> violations = validator.validate(dto);
+            assertThat(violations).isEmpty();
+        }
+
+        // ── [P2-input-validation-1 / R1 312] sifra delatnosti xx.xx format ───────
+
+        @Test
+        void invalidActivityCode_hasViolation() {
+            CreateAccountDto dto = buildValid();
+            dto.setActivityCode("6201"); // bez tacke
+            Set<ConstraintViolation<CreateAccountDto>> violations = validator.validate(dto);
+            assertThat(violations).isNotEmpty();
+            assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("activityCode"));
+        }
+
+        @Test
+        void validActivityCode_noViolation() {
+            CreateAccountDto dto = buildValid();
+            dto.setActivityCode("62.01");
+            Set<ConstraintViolation<CreateAccountDto>> violations = validator.validate(dto);
+            assertThat(violations).isEmpty();
+        }
+
+        @Test
+        void blankActivityCode_isOptional_noViolation() {
+            CreateAccountDto dto = buildValid();
+            dto.setActivityCode("");
+            Set<ConstraintViolation<CreateAccountDto>> violations = validator.validate(dto);
+            assertThat(violations).isEmpty();
+        }
+
+        // ── TEST-accounts-10: AD/FONDACIJA subtype → BE 400 (error-contract) ─────
+        // Celina 2 §43 pominje poslovne podvrste "DOO, AD, fondacija", ALI
+        // AccountSubtype enum NE sadrzi AD/FONDACIJA (samo PERSONAL/SAVINGS/PENSION/
+        // YOUTH/STUDENT/UNEMPLOYED/SALARY/STANDARD). Karakterizacija error-contract-a:
+        // JSON sa "accountSubtype":"AD" se NE moze deserijalizovati u CreateAccountDto
+        // (Jackson baca InvalidFormatException → Spring 400 Bad Request), tj. NEMA
+        // tihog coerce-a u null/STANDARD. Pinujemo i deserijalizaciju i enum.valueOf.
+
+        @Test
+        void accountSubtypeAD_jsonDeserialization_fails() throws Exception {
+            com.fasterxml.jackson.databind.ObjectMapper mapper =
+                    new com.fasterxml.jackson.databind.ObjectMapper();
+            String json = "{\"accountType\":\"BUSINESS\",\"accountSubtype\":\"AD\"}";
+            org.junit.jupiter.api.Assertions.assertThrows(
+                    com.fasterxml.jackson.databind.exc.InvalidFormatException.class,
+                    () -> mapper.readValue(json, CreateAccountDto.class));
+        }
+
+        @Test
+        void accountSubtypeFONDACIJA_jsonDeserialization_fails() throws Exception {
+            com.fasterxml.jackson.databind.ObjectMapper mapper =
+                    new com.fasterxml.jackson.databind.ObjectMapper();
+            String json = "{\"accountType\":\"BUSINESS\",\"accountSubtype\":\"FONDACIJA\"}";
+            org.junit.jupiter.api.Assertions.assertThrows(
+                    com.fasterxml.jackson.databind.exc.InvalidFormatException.class,
+                    () -> mapper.readValue(json, CreateAccountDto.class));
+        }
+
+        @Test
+        void accountSubtypeAD_isNotAValidEnumConstant() {
+            org.junit.jupiter.api.Assertions.assertThrows(
+                    IllegalArgumentException.class,
+                    () -> rs.raf.banka2_bek.account.model.AccountSubtype.valueOf("AD"));
+            org.junit.jupiter.api.Assertions.assertThrows(
+                    IllegalArgumentException.class,
+                    () -> rs.raf.banka2_bek.account.model.AccountSubtype.valueOf("FONDACIJA"));
+        }
+
+        @Test
+        void knownBusinessSubtypeSTANDARD_deserializesFine() throws Exception {
+            com.fasterxml.jackson.databind.ObjectMapper mapper =
+                    new com.fasterxml.jackson.databind.ObjectMapper();
+            String json = "{\"accountType\":\"BUSINESS\",\"accountSubtype\":\"STANDARD\"}";
+            CreateAccountDto dto = mapper.readValue(json, CreateAccountDto.class);
+            assertThat(dto.getAccountSubtype())
+                    .isEqualTo(rs.raf.banka2_bek.account.model.AccountSubtype.STANDARD);
+        }
+    }
+
+    // ── CreateCardRequestDto (R1-635: @PositiveOrZero na cardLimit/creditLimit) ──
+
+    @Nested
+    class CreateCardRequestDtoTests {
+
+        private CreateCardRequestDto buildValid() {
+            CreateCardRequestDto dto = new CreateCardRequestDto();
+            dto.setAccountId(1L);
+            dto.setCardType(CardType.VISA);
+            dto.setCardLimit(new BigDecimal("100000"));
+            dto.setCreditLimit(new BigDecimal("50000"));
+            return dto;
+        }
+
+        @Test
+        void validDto_noViolations() {
+            Set<ConstraintViolation<CreateCardRequestDto>> violations = validator.validate(buildValid());
+            assertThat(violations).isEmpty();
+        }
+
+        @Test
+        void nullAccountId_hasViolation() {
+            CreateCardRequestDto dto = buildValid();
+            dto.setAccountId(null);
+            Set<ConstraintViolation<CreateCardRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("accountId"));
+        }
+
+        @Test
+        void negativeCardLimit_hasViolation() {
+            CreateCardRequestDto dto = buildValid();
+            dto.setCardLimit(new BigDecimal("-1"));
+            Set<ConstraintViolation<CreateCardRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("cardLimit"));
+        }
+
+        @Test
+        void negativeCreditLimit_hasViolation() {
+            CreateCardRequestDto dto = buildValid();
+            dto.setCreditLimit(new BigDecimal("-0.01"));
+            Set<ConstraintViolation<CreateCardRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).anyMatch(v -> v.getPropertyPath().toString().equals("creditLimit"));
+        }
+
+        @Test
+        void nullLimits_areOptional_noViolation() {
+            CreateCardRequestDto dto = buildValid();
+            dto.setCardLimit(null);
+            dto.setCreditLimit(null);
+            Set<ConstraintViolation<CreateCardRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).isEmpty();
+        }
+
+        @Test
+        void zeroLimits_noViolation() {
+            CreateCardRequestDto dto = buildValid();
+            dto.setCardLimit(BigDecimal.ZERO);
+            dto.setCreditLimit(BigDecimal.ZERO);
+            Set<ConstraintViolation<CreateCardRequestDto>> violations = validator.validate(dto);
+            assertThat(violations).isEmpty();
         }
     }
 }

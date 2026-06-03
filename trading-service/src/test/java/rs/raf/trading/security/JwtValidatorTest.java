@@ -33,14 +33,41 @@ class JwtValidatorTest {
         secretKey = Keys.hmacShaKeyFor(TEST_SECRET.getBytes(StandardCharsets.UTF_8));
     }
 
-    /** Pomocna metoda za pravljenje validnog tokena sa zadatim sub/role. */
+    /** Pomocna metoda za pravljenje validnog ACCESS tokena sa zadatim sub/role. */
     private String buildToken(SecretKey key, String subject, String role, long expiryMs) {
+        return Jwts.builder()
+                .subject(subject)
+                .claim("type", "access")
+                .claim("role", role)
+                .claim("active", true)
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + expiryMs))
+                .signWith(key, Jwts.SIG.HS256)
+                .compact();
+    }
+
+    /**
+     * Refresh token kako ga banka-core {@code JwtService.generateRefreshToken}
+     * emituje: {@code type=refresh}, bez {@code role}/{@code active}, 7-dnevni TTL.
+     */
+    private String buildRefreshToken(SecretKey key, String subject) {
+        return Jwts.builder()
+                .subject(subject)
+                .claim("type", "refresh")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + 1000L * 60 * 60 * 24 * 7))
+                .signWith(key, Jwts.SIG.HS256)
+                .compact();
+    }
+
+    /** Legacy token bez {@code type} claim-a (izdat pre SEC-03 fix-a). */
+    private String buildLegacyToken(SecretKey key, String subject, String role) {
         return Jwts.builder()
                 .subject(subject)
                 .claim("role", role)
                 .claim("active", true)
                 .issuedAt(new Date())
-                .expiration(new Date(System.currentTimeMillis() + expiryMs))
+                .expiration(new Date(System.currentTimeMillis() + 60_000L))
                 .signWith(key, Jwts.SIG.HS256)
                 .compact();
     }
@@ -100,5 +127,49 @@ class JwtValidatorTest {
         Optional<Claims> result = jwtValidator.validate("");
 
         assertThat(result).isEmpty();
+    }
+
+    // ── N1 (P0-T4): refresh-as-access guard ──────────────────────────────────
+
+    /**
+     * N1: validan, potpisan REFRESH token (type=refresh, 7-dnevni TTL) NE sme da
+     * prodje kao Bearer access token na trading rutama. Pre fix-a je prolazio
+     * (deljeni jwt.secret + bez type provere) → 7-dnevni refresh je bio validan
+     * Bearer na /orders, /otc ... Usaglaseno sa banka-core JwtService koji refresh
+     * token emituje sa {@code type=refresh}.
+     */
+    @Test
+    void refreshToken_isRejected() {
+        String refresh = buildRefreshToken(secretKey, "stefan.jovanovic@gmail.com");
+
+        Optional<Claims> result = jwtValidator.validate(refresh);
+
+        assertThat(result).isEmpty();
+    }
+
+    /** N1: access token (type=access) i dalje prolazi — ne lomimo legitiman put. */
+    @Test
+    void accessToken_withTypeClaim_isAccepted() {
+        String token = buildToken(secretKey, "stefan.jovanovic@gmail.com", "CLIENT", 60_000L);
+
+        Optional<Claims> result = jwtValidator.validate(token);
+
+        assertThat(result).isPresent();
+        assertThat(result.get().get("type", String.class)).isEqualTo("access");
+    }
+
+    /**
+     * N1 backwards-compat: token bez {@code type} claim-a (izdat pre SEC-03)
+     * tretira se kao access — isto kao banka-core {@code JwtService.isRefreshToken}
+     * (samo {@code type=="refresh"} se odbija). Ne sme da pukne tokom prelaza.
+     */
+    @Test
+    void legacyTokenWithoutTypeClaim_isAcceptedAsAccess() {
+        String legacy = buildLegacyToken(secretKey, "user@example.com", "EMPLOYEE");
+
+        Optional<Claims> result = jwtValidator.validate(legacy);
+
+        assertThat(result).isPresent();
+        assertThat(result.get().getSubject()).isEqualTo("user@example.com");
     }
 }

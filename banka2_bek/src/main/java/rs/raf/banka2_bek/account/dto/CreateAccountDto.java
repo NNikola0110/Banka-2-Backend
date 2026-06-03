@@ -1,6 +1,7 @@
 package rs.raf.banka2_bek.account.dto;
 
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.PositiveOrZero;
 import lombok.Data;
 import rs.raf.banka2_bek.account.model.AccountSubtype;
@@ -22,6 +23,11 @@ public class CreateAccountDto {
 
     @PositiveOrZero(message = "Pocetno stanje mora biti 0 ili vece")
     private BigDecimal initialBalance;
+
+    // [P2-input-validation-1 / R1 310] initialDeposit je alternativni izvor za
+    // pocetno stanje (getResolvedInitialBalance) — bez validacije je negativan
+    // depozit prolazio i kreirao racun sa negativnim stanjem.
+    @PositiveOrZero(message = "Pocetni depozit mora biti 0 ili vece")
     private Double initialDeposit;
 
     private Long clientId;
@@ -33,6 +39,12 @@ public class CreateAccountDto {
     private String companyName;
     private String registrationNumber;
     private String taxId;
+
+    // [P2-input-validation-1 / R1 312] sifra delatnosti je u formatu xx.xx
+    // (Celina 2 §63, npr. "62.01" / "10.1"). Regex dozvoljava prazan string
+    // (opciono za fizicka lica) ali odbacuje nevalidan format. @Pattern preskace null.
+    @Pattern(regexp = "^(\\d{2}\\.\\d{1,2})?$",
+            message = "Sifra delatnosti mora biti u formatu xx.xx (npr. 62.01)")
     private String activityCode;
     private String firmAddress;
 

@@ -4,6 +4,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
+import rs.raf.banka2.contracts.internal.InterbankOtcExercisedDto;
 import rs.raf.banka2.contracts.internal.InternalUserDto;
 import rs.raf.banka2.contracts.internal.TaxCollectRequest;
 import rs.raf.banka2.contracts.internal.TaxCollectResponse;
@@ -14,9 +15,10 @@ import rs.raf.trading.order.model.Order;
 import rs.raf.trading.order.repository.OrderRepository;
 import rs.raf.trading.order.service.CurrencyConversionService;
 import rs.raf.trading.otc.model.OtcContract;
-import rs.raf.trading.otc.model.OtcContractStatus;
 import rs.raf.trading.otc.repository.OtcContractRepository;
+import rs.raf.trading.stock.model.Listing;
 import rs.raf.trading.stock.model.ListingType;
+import rs.raf.trading.stock.repository.ListingRepository;
 import rs.raf.trading.stock.util.ListingCurrencyResolver;
 import rs.raf.trading.tax.dto.TaxBreakdownItemDto;
 import rs.raf.trading.tax.dto.TaxRecordDto;
@@ -24,6 +26,7 @@ import rs.raf.trading.tax.model.TaxRecord;
 import rs.raf.trading.tax.processor.TaxCalculatorProcessor;
 import rs.raf.trading.tax.repository.TaxRecordBreakdownRepository;
 import rs.raf.trading.tax.repository.TaxRecordRepository;
+import rs.raf.trading.tax.util.TaxRealizedGainCalculator;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -65,6 +68,7 @@ public class TaxService {
     private final OrderRepository orderRepository;
     private final CurrencyConversionService currencyConversionService;
     private final OtcContractRepository otcContractRepository;
+    private final ListingRepository listingRepository;
     private final BankaCoreClient bankaCoreClient;
 
     /**
@@ -84,12 +88,14 @@ public class TaxService {
                       OrderRepository orderRepository,
                       CurrencyConversionService currencyConversionService,
                       OtcContractRepository otcContractRepository,
+                      ListingRepository listingRepository,
                       BankaCoreClient bankaCoreClient) {
         this.taxRecordRepository = taxRecordRepository;
         this.taxRecordBreakdownRepository = taxRecordBreakdownRepository;
         this.orderRepository = orderRepository;
         this.currencyConversionService = currencyConversionService;
         this.otcContractRepository = otcContractRepository;
+        this.listingRepository = listingRepository;
         this.bankaCoreClient = bankaCoreClient;
     }
 
@@ -165,6 +171,13 @@ public class TaxService {
      */
     public void calculateTaxForAllUsers() {
         LocalDateTime now = LocalDateTime.now();
+        // P2-tax OTC period-scoping (01.06): settlement period i kalendarski mesec
+        // run-a su run-globalni (zavise samo od {@code now} — settlementPeriod nije
+        // per-user). Izracunavamo ih JEDNOM ovde i koristimo da period-gate-ujemo
+        // OTC EXERCISED kontribucije (intra + inter) po {@code exercisedAt} — TACNO
+        // isti period model kao order SELL leg (TaxRealizedGainCalculator.inPeriod).
+        YearMonth period = TaxRealizedGainCalculator.settlementPeriod(now);
+        YearMonth nowMonth = YearMonth.from(now);
         // BE-ORD-06: spec Celina 3 Sc 58 — bank actuaries (zaposleni) trguju sa
         // bankinih racuna i NE placaju licni porez na kapitalnu dobit. Pre fix-a
         // filter je samo preskakao FUND ordere, pa su EMPLOYEE orderi padali u
@@ -178,21 +191,51 @@ public class TaxService {
                         && UserRole.isClient(o.getUserRole()))      // BE-ORD-06: samo CLIENT placa licni porez
                 .collect(Collectors.toList());
 
-        // Note: PUT exercise opcija i EXERCISED inter-bank OTC ugovori se trenutno
-        // ne ukljucuju eksplicitno u tax obracun. Intra-bank OTC trgovina ulazi
-        // kroz Order entitet (vidi grupisanje ispod). Inter-bank OTC tax obracun
-        // svaka banka radi nezavisno za domace korisnike (partner banka radi svoj).
+        // R1 430 (PUT/CALL exercise opcija — ACCEPTED-AS-CORRECT, NE TODO):
+        // Izvrsavanje opcija ({@code OptionService.exerciseOption}) je iskljucivo
+        // EMPLOYEE/aktuar/admin operacija — {@code ensureUserCanExerciseOptions}
+        // odbija sve sem aktuara, a vlasnik portfolija posle exercise-a je uvek
+        // {@code UserRole.EMPLOYEE} (novcana noga ide na/sa BANKINOG trading racuna).
+        // Po BE-ORD-06 (spec Celina 3 Sc 58) bank actuaries NE placaju licni porez na
+        // kapitalnu dobit — bankin profit ide kroz Profit Banke portal. Order filter
+        // iznad vec iskljucuje EMPLOYEE, pa je opciona noga DOSLEDNO iskljucena iz
+        // licnog poreza (NIJE propust). Ne postoji klijentski put izvrsavanja opcije.
+        //
+        // R1 431 / P2-tax-interbank-otc-1 (inter-bank OTC oporezivanje):
+        // {@code otc_contracts} tabela (trading-service) sadrzi ISKLJUCIVO intra-bank
+        // ugovore. INTER-bank OTC ugovori zive u banka-core ({@code interbank_otc_contracts},
+        // {@code InterbankOtcContract}) koji NEMA tax modul. Pre P2-tax-interbank-otc-1
+        // fix-a posledica je bila: lokalni CLIENT koji exercise-uje inter-bank opciju
+        // realizuje kapitalnu dobit koju NIJEDAN sistem ne oporezuje (under-taxation).
+        // Sad ih dohvatamo preko banka-core internog endpoint-a
+        // ({@code GET /internal/interbank-otc/exercised}) i merge-ujemo u ISTE
+        // per-user OTC mape (po listingId-u, razresenom iz ticker-a) sa ISTOM logikom
+        // kao intra: seller proceeds = strike×qty + premium, buyer cost-basis = strike×qty
+        // (premija NIJE na kupcevoj strani — R1-432), EMPLOYEE izuzet (BE-ORD-06).
+        // DEDUP: inter-bank ugovori su odvojeni entiteti/tabela od intra (ne mogu se
+        // preklopiti) — merge je aditivan; korisnik sa intra+inter exercised na istom
+        // listingu dobija ZBIR (svaka strana po jednom, bez duplog brojanja).
 
         // Grupisemo ordere po userId + userRole
         Map<String, List<Order>> grouped = allDoneOrders.stream()
                 .collect(Collectors.groupingBy(o -> o.getUserId() + ":" + o.getUserRole()));
 
-        // OTC: ucitaj sve EXERCISED ugovore — svaki utice na dva korisnika
-        // (kupca i prodavca), pa ne mozemo direktno groupingBy.
-        List<OtcContract> exercisedContracts = otcContractRepository.findAll().stream()
-                .filter(c -> c.getStatus() == OtcContractStatus.EXERCISED
-                        && c.getListing() != null
-                        && c.getListing().getListingType() == ListingType.STOCK)
+        // R5 1901: EXERCISED STOCK ugovori se ucitavaju DB-filtriranim upitom
+        // (status + listingType) umesto findAll()+in-memory filter (pun table-scan
+        // koji raste neograniceno jer EXERCISED ostaje zauvek). Svaki ugovor utice
+        // na dva korisnika (kupca i prodavca), pa ne mozemo direktno groupingBy.
+        //
+        // P2-tax OTC period-scoping (01.06): EXERCISED status je TRAJAN — ugovor ostaje
+        // EXERCISED u tabeli zauvek. Bez ovog period-gate-a isti jednokratni OTC dobitak
+        // bi se re-oporezovao na SVAKOM mesecnom run-u (over-taxation: idempotency kljuc
+        // ukljucuje period → svaki mesec daje NOV kljuc → svez realan debit u banka-core).
+        // Filtriramo po {@code exercisedAt} u settlement {@code period} — TACNO isti
+        // period model kao order SELL leg (TaxRealizedGainCalculator.inPeriod). Ugovor
+        // exercise-ovan u mesecu M oporezuje se SAMO u run-u koji settle-uje mesec M, i
+        // doprinosi 0 svakom kasnijem run-u.
+        List<OtcContract> exercisedContracts = otcContractRepository.findExercisedStockContracts().stream()
+                .filter(c -> c.getListing() != null)
+                .filter(c -> TaxRealizedGainCalculator.inPeriod(c.getExercisedAt(), period, nowMonth))
                 .collect(Collectors.toList());
 
         // userKey -> listingId -> akumulirana vrednost
@@ -210,8 +253,20 @@ public class TaxService {
             BigDecimal strikeTotal = c.getStrikePrice().multiply(qty);
             BigDecimal premium = c.getPremium() != null ? c.getPremium() : BigDecimal.ZERO;
 
-            // BE-ORD-06: ucitavamo OTC stranu samo ako je CLIENT (employee ucesnik
-            // ne placa licni porez — paritet sa Order filter-om iznad).
+            // R1 432 (premija samo na PRODAVCEVOJ strani — money-fix):
+            // U OTC opcionom modelu (Celina 4 §76-77) kupac placa premiju PRODAVCU pri
+            // sklapanju ugovora, a pri exercise-u placa strike × qty i DOBIJA akcije.
+            //   • PRODAVAC: realizovan dogadjaj sada = otudjenje akcija po strike-u +
+            //     premija kao prihod → proceeds = strikeTotal + premium. (Premija JE
+            //     prodavcev prihod.) Zadrzano.
+            //   • KUPAC: sticanje akcija NIJE realizovan kapitalni dogadjaj — kupceva
+            //     dobit/gubitak se realizuje TEK pri buducoj prodaji tih akcija.
+            //     strike + premija su kupcev COST-BASIS za stecene akcije, NE trenutni
+            //     gubitak. Pre fix-a se premija dodavala i na kupcevu buy-agregaciju, pa
+            //     kad bi isti korisnik bio i prodavac na istom listingu (sell − buy net),
+            //     premija (prodavcev prihod) bi se DRUGI PUT oduzela kao kupcev trosak →
+            //     premija dva puta u sistemu = under-taxation. Kupceva buy-agregacija sad
+            //     nosi SAMO strikeTotal (stvarni trosak sticanja), bez premije.
             if (UserRole.isClient(c.getSellerRole())) {
                 String sellerKey = c.getSellerId() + ":" + c.getSellerRole();
                 otcUserKeys.add(sellerKey);
@@ -222,9 +277,14 @@ public class TaxService {
                 String buyerKey = c.getBuyerId() + ":" + c.getBuyerRole();
                 otcUserKeys.add(buyerKey);
                 otcBuyByUser.computeIfAbsent(buyerKey, k -> new HashMap<>())
-                        .merge(listingId, strikeTotal.add(premium), BigDecimal::add);
+                        .merge(listingId, strikeTotal, BigDecimal::add);
             }
         }
+
+        // P2-tax-interbank-otc-1: merge INTER-bank OTC EXERCISED ugovore u iste mape.
+        // P2-tax OTC period-scoping (01.06): isti exercisedAt period-gate kao intra.
+        mergeInterbankExercised(otcSellByUser, otcBuyByUser, otcListingCurrency, otcUserKeys,
+                period, nowMonth);
 
         Set<String> allKeys = new HashSet<>(grouped.keySet());
         allKeys.addAll(otcUserKeys);
@@ -280,6 +340,111 @@ public class TaxService {
     }
 
     /**
+     * P2-tax-interbank-otc-1 — dohvata EXERCISED inter-bank OTC ugovore iz banka-core
+     * i merge-uje ih u iste per-user OTC sell/buy mape (po listingId-u) kao intra-OTC.
+     *
+     * <p><b>Conservation / dedup garancije:</b>
+     * <ul>
+     *   <li><b>Taxed exactly once:</b> svaki inter-bank EXERCISED ugovor ima TACNO
+     *       jednu lokalnu stranu (druga je u partnerskoj banci). SELLER doprinosi
+     *       {@code strike×qty + premium} prodavcevoj sell-mapi; BUYER doprinosi
+     *       {@code strike×qty} kupcevoj buy-mapi — jednom, na lokalnu stranu.</li>
+     *   <li><b>No intra/inter double-count:</b> inter-bank ugovori su odvojeni
+     *       entitet ({@code InterbankOtcContract}, banka-core) od intra
+     *       ({@code OtcContract}, trading) — ne mogu se preklopiti. Merge je aditivan
+     *       po listingId-u: korisnik sa intra+inter na istom listingu dobija ZBIR
+     *       proceeds/cost-basis (svaka kontribucija po jednom).</li>
+     *   <li><b>EMPLOYEE izuzet (BE-ORD-06):</b> samo {@code localPartyRole == CLIENT}
+     *       ulazi (bank actuaries ne placaju licni porez).</li>
+     *   <li><b>Premija samo na seller strani (mirror R1-432):</b> kupcev cost-basis
+     *       je goli {@code strike×qty} — premija je iskljucivo prodavcev prihod, da se
+     *       ne bi dvaput knjizila ako je isti korisnik i prodavac i kupac.</li>
+     * </ul>
+     *
+     * <p>banka-core nema trading {@code listingId}, samo {@code ticker} — razresavamo
+     * ga preko {@link ListingRepository#findByTicker}. Nepoznat ticker (nema trading
+     * listinga) se preskace. Best-effort: ako je banka-core nedostupan, loguje WARN i
+     * nastavlja (intra OTC + orderi se i dalje oporezuju) — paritet sa ostalim
+     * cross-service best-effort pozivima.
+     */
+    private void mergeInterbankExercised(Map<String, Map<Long, BigDecimal>> otcSellByUser,
+                                         Map<String, Map<Long, BigDecimal>> otcBuyByUser,
+                                         Map<Long, String> otcListingCurrency,
+                                         Set<String> otcUserKeys,
+                                         YearMonth period,
+                                         YearMonth nowMonth) {
+        List<InterbankOtcExercisedDto> interbank;
+        try {
+            interbank = bankaCoreClient.getExercisedInterbankOtc();
+        } catch (RuntimeException e) {
+            log.warn("Inter-bank OTC tax fetch failed (banka-core unavailable): {} — "
+                    + "inter-bank exercised contracts NOT taxed this run (intra OTC + orders still computed)",
+                    e.getMessage());
+            return;
+        }
+        if (interbank == null || interbank.isEmpty()) {
+            return;
+        }
+
+        // Ticker→listingId kes (vise ugovora na isti ticker → jedan repo poziv).
+        Map<String, Long> tickerToListingId = new HashMap<>();
+
+        for (InterbankOtcExercisedDto c : interbank) {
+            // BE-ORD-06: samo lokalni CLIENT placa licni porez; EMPLOYEE (bank actuary) izuzet.
+            if (c == null || !UserRole.isClient(c.localPartyRole())) {
+                continue;
+            }
+            if (c.ticker() == null || c.localPartyId() == null
+                    || c.strikePrice() == null || c.quantity() == null) {
+                continue;
+            }
+            // P2-tax OTC period-scoping (01.06): period-gate po exercisedAt — TACNO isti
+            // model kao intra. Inter-bank EXERCISED ugovor je TRAJAN (banka-core ga ne
+            // brise), pa bi bez ovog gate-a isti dobitak bio re-oporezovan svakog meseca
+            // (over-taxation). Ugovor exercise-ovan u mesecu M oporezuje se SAMO u run-u
+            // koji settle-uje M, i doprinosi 0 svakom kasnijem run-u.
+            if (!TaxRealizedGainCalculator.inPeriod(c.exercisedAt(), period, nowMonth)) {
+                continue;
+            }
+
+            // Razresi trading listingId iz ticker-a (banka-core ima samo ticker).
+            Long listingId = tickerToListingId.computeIfAbsent(c.ticker(), this::resolveListingIdByTicker);
+            if (listingId == null) {
+                log.debug("Inter-bank OTC ticker {} has no trading listing — skipping tax leg for contract {}",
+                        c.ticker(), c.id());
+                continue;
+            }
+
+            String currency = c.strikeCurrency() != null ? c.strikeCurrency() : "RSD";
+            otcListingCurrency.putIfAbsent(listingId, currency);
+
+            BigDecimal strikeTotal = c.strikePrice().multiply(c.quantity());
+            BigDecimal premium = c.premium() != null ? c.premium() : BigDecimal.ZERO;
+
+            String userKey = c.localPartyId() + ":" + UserRole.CLIENT;
+            if ("SELLER".equals(c.localPartyType())) {
+                // Prodavac: proceeds = strike×qty + premija (premija je prodavcev prihod).
+                otcUserKeys.add(userKey);
+                otcSellByUser.computeIfAbsent(userKey, k -> new HashMap<>())
+                        .merge(listingId, strikeTotal.add(premium), BigDecimal::add);
+            } else if ("BUYER".equals(c.localPartyType())) {
+                // Kupac: cost-basis = strike×qty (BEZ premije — mirror R1-432).
+                otcUserKeys.add(userKey);
+                otcBuyByUser.computeIfAbsent(userKey, k -> new HashMap<>())
+                        .merge(listingId, strikeTotal, BigDecimal::add);
+            }
+        }
+    }
+
+    /** Razresi trading {@code listingId} iz ticker-a; {@code null} ako listing ne postoji. */
+    private Long resolveListingIdByTicker(String ticker) {
+        if (ticker == null) {
+            return null;
+        }
+        return listingRepository.findByTicker(ticker).map(Listing::getId).orElse(null);
+    }
+
+    /**
      * BE-PAY-04: per-user delegate. U produkciji {@link #calculatorProcessor}
      * je auto-wired i izvrsava obracun u {@code REQUIRES_NEW} Tx — pad ne
      * rollback-uje vec persistovane TaxRecord-e iz batch-a. Legacy unit testovi
@@ -326,55 +491,27 @@ public class TaxService {
                                       Map<Long, BigDecimal> otcBuyByListing,
                                       Map<Long, String> otcListingCurrency,
                                       LocalDateTime now) {
-        // Racunamo profit per-asset: za svaki listing posebno racunamo sell - buy
-        // pa sabiramo samo pozitivne profite (kapitalna dobit).
-        Map<Long, BigDecimal> buyByListing = new HashMap<>();
-        Map<Long, BigDecimal> sellByListing = new HashMap<>();
-        Map<Long, String> currencyByListing = new HashMap<>();
-
-        for (Order order : userOrders) {
-            Long listingId = order.getListing().getId();
-            BigDecimal orderValue = order.getPricePerUnit()
-                    .multiply(BigDecimal.valueOf(order.getQuantity()))
-                    .multiply(BigDecimal.valueOf(order.getContractSize()));
-
-            currencyByListing.putIfAbsent(listingId, resolveOrderCurrency(order));
-
-            if (order.getDirection() == rs.raf.trading.order.model.OrderDirection.SELL) {
-                sellByListing.merge(listingId, orderValue, BigDecimal::add);
-            } else {
-                buyByListing.merge(listingId, orderValue, BigDecimal::add);
-            }
-        }
-
-        // OTC EXERCISED kontribucije za ovog korisnika.
-        otcSellByListing.forEach((listingId, value) -> {
-            sellByListing.merge(listingId, value, BigDecimal::add);
-            currencyByListing.putIfAbsent(listingId,
-                    otcListingCurrency.getOrDefault(listingId, "RSD"));
-        });
-        otcBuyByListing.forEach((listingId, value) -> {
-            buyByListing.merge(listingId, value, BigDecimal::add);
-            currencyByListing.putIfAbsent(listingId,
-                    otcListingCurrency.getOrDefault(listingId, "RSD"));
-        });
+        // P0-B3: realizovana kapitalna dobit po listingu sa FIFO cost-basis
+        // lot-matching-om i mesecnim periodom (spec Celina 3 §517-523). Identicno
+        // {@link TaxCalculatorProcessor#processOne} preko deljenog
+        // {@link TaxRealizedGainCalculator} — ovo je legacy inline put (samo unit
+        // testovi sa @InjectMocks; produkcija ide kroz processor sa REQUIRES_NEW).
+        YearMonth period = TaxRealizedGainCalculator.settlementPeriod(now);
+        YearMonth nowMonth = YearMonth.from(now);
+        java.util.List<TaxRealizedGainCalculator.ListingRealizedGain> listingGains =
+                TaxRealizedGainCalculator.computePeriodGains(
+                        userOrders, otcSellByListing, otcBuyByListing, otcListingCurrency, period, nowMonth);
 
         BigDecimal totalProfit = BigDecimal.ZERO;
-        Set<Long> realizedListings = new HashSet<>(sellByListing.keySet());
         java.util.List<PerListingProfit> perListingProfits = new java.util.ArrayList<>();
-        for (Long listingId : realizedListings) {
-            BigDecimal sell = sellByListing.getOrDefault(listingId, BigDecimal.ZERO);
-            BigDecimal buy = buyByListing.getOrDefault(listingId, BigDecimal.ZERO);
-            BigDecimal assetProfit = sell.subtract(buy);
-            String listingCurrency = currencyByListing.getOrDefault(listingId, "RSD");
-            BigDecimal profitInRsd = convertToRsd(assetProfit, listingCurrency);
+        for (TaxRealizedGainCalculator.ListingRealizedGain g : listingGains) {
+            BigDecimal profitInRsd = convertToRsd(g.gainNative(), g.listingCurrency());
             totalProfit = totalProfit.add(profitInRsd);
             perListingProfits.add(new PerListingProfit(
-                    listingId, listingCurrency, assetProfit, profitInRsd));
+                    g.listingId(), g.listingCurrency(), g.gainNative(), profitInRsd));
         }
         BigDecimal taxOwed = totalProfit.compareTo(BigDecimal.ZERO) > 0
-                ? totalProfit.multiply(rs.raf.trading.tax.util.TaxConstants.TAX_RATE)
-                        .setScale(4, java.math.RoundingMode.HALF_UP)
+                ? rs.raf.trading.tax.util.TaxConstants.computeTax(totalProfit)
                 : BigDecimal.ZERO;
 
         String userName = resolveUserName(userId, userRole);
@@ -392,16 +529,28 @@ public class TaxService {
         record.setTaxOwed(taxOwed);
         record.setCalculatedAt(now);
 
-        BigDecimal previouslyPaid = record.getTaxPaid() != null ? record.getTaxPaid() : BigDecimal.ZERO;
-        BigDecimal unpaidTax = taxOwed.subtract(previouslyPaid);
+        // B-1 fix (byte-identicno TaxCalculatorProcessor.processOne): mesecni
+        // neplaceni porez = taxOwed(mesecni) − placeno-u-tom-mesecu. Mesecni owed
+        // i mesecni paid u istoj dimenziji; godisnji kumulativ (taxPaid) odvojen.
+        BigDecimal unpaidTax = TaxRealizedGainCalculator.monthlyUnpaidTax(
+                taxOwed, record.getTaxPaidPeriod(), record.getTaxPaidInPeriod(), period);
 
         if (unpaidTax.compareTo(BigDecimal.ZERO) > 0) {
-            boolean collected = collectTaxFromUser(userId, userType, unpaidTax, now);
+            boolean collected = collectTaxFromUser(userId, userType, unpaidTax, period);
             if (collected) {
-                record.setTaxPaid(taxOwed);
-                log.info("Tax collected from user {} ({}): {} RSD", userName, userType, unpaidTax);
+                TaxRealizedGainCalculator.MonthlyTaxState state =
+                        TaxRealizedGainCalculator.applyMonthlyTaxPayment(
+                                record.getTaxPaidPeriod(), record.getTaxPaidInPeriod(),
+                                record.getTaxPaidYear(), record.getTaxPaid(),
+                                period, unpaidTax);
+                record.setTaxPaidPeriod(state.paidPeriod());
+                record.setTaxPaidInPeriod(state.paidInPeriod());
+                record.setTaxPaidYear(state.paidYear());
+                record.setTaxPaid(state.paidAnnual());
+                log.info("Tax collected from user {} ({}): {} RSD (period {}, annual paid {})",
+                        userName, userType, unpaidTax, period, state.paidAnnual());
             } else {
-                log.warn("Could not collect tax from user {} ({}): no RSD account or insufficient funds",
+                log.warn("Could not collect tax from user {} ({}): no account (RSD or foreign via FX) with sufficient funds",
                         userName, userType);
             }
         }
@@ -410,13 +559,18 @@ public class TaxService {
 
         if (record.getId() != null) {
             taxRecordBreakdownRepository.deleteByTaxRecordId(record.getId());
+            // R2 1420: ticker kes je METHOD-LOCAL (ne instance field na @Service
+            // singleton-u) — instance-field kes nikad se nije cistio (memory leak +
+            // stale ticker preko run-ova). Paritet sa TaxCalculatorProcessor.processOne.
+            // R1-736: pre-popuni kes iz korisnikovih ordera (Listing vec ucitan) —
+            // DB-skenirajuci resolveTicker se zove SAMO za OTC-only listinge.
+            Map<Long, String> listingTickerCache = buildTickerMapFromOrders(userOrders);
             for (PerListingProfit p : perListingProfits) {
                 if (p.listingId() == null) {
                     continue;
                 }
                 BigDecimal listingTaxOwed = p.profitRsd().compareTo(BigDecimal.ZERO) > 0
-                        ? p.profitRsd().multiply(rs.raf.trading.tax.util.TaxConstants.TAX_RATE)
-                                .setScale(4, java.math.RoundingMode.HALF_UP)
+                        ? rs.raf.trading.tax.util.TaxConstants.computeTax(p.profitRsd())
                         : BigDecimal.ZERO;
                 String ticker = listingTickerCache.computeIfAbsent(p.listingId(),
                         id -> resolveTicker(p.listingId()));
@@ -442,9 +596,34 @@ public class TaxService {
      */
     public List<TaxBreakdownItemDto> getTaxBreakdownForUser(Long userId, String userType) {
         Optional<TaxRecord> recordOpt = taxRecordRepository.findByUserIdAndUserType(userId, userType);
-        if (recordOpt.isEmpty()) return List.of();
+        return breakdownItems(recordOpt.orElse(null));
+    }
+
+    /**
+     * R2-1448: vraca per-listing breakdown za autentifikovanog korisnika u
+     * <b>jednom</b> identitet-lookup-u + jednom record-lookup-u. Pre fix-a je
+     * {@code TaxController.getMyBreakdown} radio 3 lookupa: {@code getMyTaxRecord}
+     * (banka-core getUserByEmail + findByUserIdAndUserType) pa zatim
+     * {@code getTaxBreakdownForUser} (drugi findByUserIdAndUserType). Sad se identitet
+     * razresi jednom, TaxRecord se ucita jednom, i breakdown se mapira iz njega.
+     */
+    public List<TaxBreakdownItemDto> getMyTaxBreakdown(String email) {
+        InternalUserDto user;
+        try {
+            user = bankaCoreClient.getUserByEmail(email);
+        } catch (BankaCoreClientException e) {
+            return List.of();
+        }
+        String userType = UserRole.isEmployee(user.userRole()) ? UserRole.EMPLOYEE : UserRole.CLIENT;
+        TaxRecord record = taxRecordRepository.findByUserIdAndUserType(user.userId(), userType).orElse(null);
+        return breakdownItems(record);
+    }
+
+    /** Mapira breakdown stavke datog {@link TaxRecord}-a (prazna lista ako je {@code null}). */
+    private List<TaxBreakdownItemDto> breakdownItems(TaxRecord record) {
+        if (record == null || record.getId() == null) return List.of();
         return taxRecordBreakdownRepository
-                .findByTaxRecordIdOrderByTaxOwedDesc(recordOpt.get().getId())
+                .findByTaxRecordIdOrderByTaxOwedDesc(record.getId())
                 .stream()
                 .map(b -> new TaxBreakdownItemDto(
                         b.getListingId(),
@@ -456,8 +635,25 @@ public class TaxService {
                 .collect(Collectors.toList());
     }
 
-    /** Privremeni kes ticker-a per listingId tokom calculateTax run-a. */
-    private final Map<Long, String> listingTickerCache = new HashMap<>();
+    /**
+     * R1-736: gradi {@code listingId -> ticker} mapu iz korisnikovih ordera
+     * (Listing je vec ucitan na Order entitetu — nula DB poziva). Paritet sa
+     * {@link TaxCalculatorProcessor}. Sluzi kao pre-popunjen kes za breakdown
+     * petlju da {@link #resolveTicker} (DB scan) ne radi za listinge iz ordera.
+     */
+    private static Map<Long, String> buildTickerMapFromOrders(List<Order> userOrders) {
+        Map<Long, String> map = new HashMap<>();
+        if (userOrders == null) {
+            return map;
+        }
+        for (Order o : userOrders) {
+            if (o != null && o.getListing() != null && o.getListing().getId() != null
+                    && o.getListing().getTicker() != null) {
+                map.putIfAbsent(o.getListing().getId(), o.getListing().getTicker());
+            }
+        }
+        return map;
+    }
 
     private String resolveTicker(Long listingId) {
         if (listingId == null) return null;
@@ -495,20 +691,21 @@ public class TaxService {
      * belezi, novac se interno prebacuje (no-op u banka-core seam-u, verno
      * monolitu koji je za zaposlene odmah vracao {@code true}).
      *
-     * <p>Idempotency key {@code "tax-" + userId + "-" + yearMonth + "-" + amount}
-     * ukljucuje i iznos naplate, ne samo korisnik-mesec. Razlog: kljuc samo po
-     * korisnik-mesecu se sudara pri intra-mesecnom ponovnom obracunu — drugi
-     * pokretanje (sa novim trgovinama, pa vecim neplacenim porezom) bi reuse-ovao
-     * isti kljuc, banka-core bi replay-ovao prvu kesiranu naplatu ({@code collected=true})
-     * i {@code TaxService} bi sad-veci porez obelezio kao placen iako nije naplacen.
-     * Sa iznosom u kljucu: pravi SAGA retry iste naplate vidi isti {@code unpaidTax}
-     * (taxPaid jos nije perzistiran) → isti kljuc → banka-core bezbedno replay-uje
-     * (nema dvostruke naplate); razlicit intra-mesecni re-run ima razlicit
-     * {@code unpaidTax} → razlicit kljuc → korektno naplacuje inkrement.
+     * <p>Idempotency key {@code "tax-" + userId + "-" + period + "-" + amount} se
+     * vezuje za settlement {@code period} (NE run-mesec — B-1: cron 1. u mesecu
+     * naplacuje prethodni mesec) i ukljucuje iznos naplate. Razlog za iznos: kljuc
+     * samo po korisnik-mesecu se sudara pri intra-mesecnom ponovnom obracunu —
+     * drugi pokretanje (sa novim trgovinama, pa vecim neplacenim porezom) bi
+     * reuse-ovao isti kljuc, banka-core bi replay-ovao prvu kesiranu naplatu
+     * ({@code collected=true}) i {@code TaxService} bi sad-veci porez obelezio kao
+     * placen iako nije naplacen. Sa iznosom u kljucu: pravi SAGA retry iste naplate
+     * vidi isti {@code unpaidTax} → isti kljuc → banka-core bezbedno replay-uje
+     * (nema dvostruke naplate); razlicit intra-mesecni re-run ima razlicit mesecni
+     * inkrement {@code unpaidTax} → razlicit kljuc → korektno naplacuje samo nov deo.
      */
-    private boolean collectTaxFromUser(Long userId, String userType, BigDecimal amount, LocalDateTime calculatedAt) {
+    private boolean collectTaxFromUser(Long userId, String userType, BigDecimal amount, YearMonth period) {
         if (UserRole.isClient(userType)) {
-            String idempotencyKey = "tax-" + userId + "-" + YearMonth.from(calculatedAt)
+            String idempotencyKey = "tax-" + userId + "-" + period
                     + "-" + amount.toPlainString();
             try {
                 TaxCollectResponse response = bankaCoreClient.collectTax(idempotencyKey,

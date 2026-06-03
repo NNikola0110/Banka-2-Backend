@@ -70,6 +70,9 @@ class InterbankOtcWrapperServiceExerciseTest {
     @Mock private TradingServiceInternalClient tradingServiceClient;
     @Mock private AccountRepository accountRepository;
     @Mock private TransactionExecutorService transactionExecutor;
+    @Mock private rs.raf.banka2_bek.interbank.repository.InterbankTransactionRepository interbankTransactionRepository;
+    @Mock private rs.raf.banka2_bek.payment.repository.PaymentRepository paymentRepository;
+    @Mock private rs.raf.banka2_bek.interbank.service.InterbankReservationApplier reservationApplier;
 
     private InterbankProperties properties;
     private InterbankOtcWrapperService service;
@@ -82,7 +85,32 @@ class InterbankOtcWrapperServiceExerciseTest {
                 negotiationService, properties,
                 negotiationRepository, contractRepository,
                 clientRepository, employeeRepository, tradingServiceClient,
-                accountRepository, transactionExecutor);
+                accountRepository, transactionExecutor,
+                interbankTransactionRepository, paymentRepository,
+                reservationApplier);
+        // R2 1336 — self-proxy za claim/revert (REQUIRES_NEW). U unit-testu nema
+        // Spring AOP, pa direktno postavljamo realni service kao self.
+        org.springframework.test.util.ReflectionTestUtils.setField(service, "self", service);
+        // R1 209 — ensureInterbankOtcAccess je sad prva provera u exerciseContract.
+        // Default: klijent 7L sme da trguje (canTradeStocks=true). lenient jer
+        // neki testovi bacaju pre/posle gate-a.
+        Client tradingClient = new Client();
+        tradingClient.setId(7L);
+        tradingClient.setCanTradeStocks(true);
+        org.mockito.Mockito.lenient().when(clientRepository.findById(7L))
+                .thenReturn(Optional.of(tradingClient));
+        // 999L (drugi klijent) takodje sme da trguje — koristi se u not-owned testu
+        // da bismo dosli DO ownership provere (a ne da gate presretne).
+        Client otherTradingClient = new Client();
+        otherTradingClient.setId(999L);
+        otherTradingClient.setCanTradeStocks(true);
+        org.mockito.Mockito.lenient().when(clientRepository.findById(999L))
+                .thenReturn(Optional.of(otherTradingClient));
+    }
+
+    /** Stub-uje claim happy-path: findByIdForUpdate vraca contract (ACTIVE → flip EXERCISING). */
+    private void stubClaimLock(InterbankOtcContract contract) {
+        when(contractRepository.findByIdForUpdate(contract.getId())).thenReturn(Optional.of(contract));
     }
 
     @Test
@@ -104,6 +132,9 @@ class InterbankOtcWrapperServiceExerciseTest {
         buyer.setId(7L);
         buyerAccount.setClient(buyer);
         when(accountRepository.findById(101L)).thenReturn(Optional.of(buyerAccount));
+
+        // R2 1336/1337 — claim lock + reserveMonas hold.
+        stubClaimLock(contract);
 
         // formTransaction passthrough
         when(transactionExecutor.formTransaction(any(), anyString(), any(), any(), any()))
@@ -273,6 +304,241 @@ class InterbankOtcWrapperServiceExerciseTest {
         when(contractRepository.findById(99L)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.exerciseContract("99", 101L, 7L, "CLIENT"))
+                .isInstanceOf(InterbankExceptions.InterbankProtocolException.class)
+                .hasMessageContaining("ne postoji");
+    }
+
+    // ── P1-9: getInterbankTransactionView ──
+
+    @Test
+    @DisplayName("P1-9: OTC contract EXERCISED → view status COMMITTED")
+    void getInterbankTransactionView_contractExercised_committed() {
+        InterbankOtcContract contract = buildActiveBuyerSideContract(33L, 42L);
+        contract.setStatus(InterbankOtcContractStatus.EXERCISED);
+        contract.setExercisedAt(java.time.LocalDateTime.now());
+        when(contractRepository.findById(33L)).thenReturn(Optional.of(contract));
+
+        InterbankOtcWrapperDtos.InterbankTransactionDto view =
+                service.getInterbankTransactionView("33", 7L, "CLIENT");
+
+        assertThat(view.status()).isEqualTo("COMMITTED");
+        assertThat(view.type()).isEqualTo("OTC");
+        assertThat(view.transactionId()).isEqualTo("33");
+        assertThat(view.listingTicker()).isEqualTo("AAPL");
+    }
+
+    @Test
+    @DisplayName("P1-9: OTC contract not owned by caller → AccessDenied (403, anti-IDOR)")
+    void getInterbankTransactionView_contractNotOwned_forbidden() {
+        InterbankOtcContract contract = buildActiveBuyerSideContract(33L, 42L); // localPartyId=7
+        when(contractRepository.findById(33L)).thenReturn(Optional.of(contract));
+
+        assertThatThrownBy(() -> service.getInterbankTransactionView("33", 999L, "CLIENT"))
+                .isInstanceOf(org.springframework.security.access.AccessDeniedException.class);
+    }
+
+    @Test
+    @DisplayName("P1-9: inter-bank payment tx ROLLED_BACK → view status ABORTED (ROLLED_BACK→ABORTED mapping)")
+    void getInterbankTransactionView_paymentRolledBack_aborted() {
+        // Lookup id koji nije numeric → preskace contract pretragu, ide direktno na
+        // payment-by-interbank-tx-id pretragu.
+        String txIdString = "tx-payment-1";
+
+        rs.raf.banka2_bek.account.model.Account fromAccount =
+                buildAccount(5L, "222000000000000001", "RSD", new BigDecimal("0"), AccountStatus.ACTIVE);
+        Client owner = new Client();
+        owner.setId(7L);
+        fromAccount.setClient(owner);
+
+        rs.raf.banka2_bek.payment.model.Payment payment =
+                rs.raf.banka2_bek.payment.model.Payment.builder()
+                        .id(1L)
+                        .fromAccount(fromAccount)
+                        .toAccountNumber("111900001")
+                        .amount(new BigDecimal("500"))
+                        .currency(fromAccount.getCurrency())
+                        .interbankTxIdString(txIdString)
+                        .interbankTxRoutingNumber(OUR_RN)
+                        .build();
+        when(paymentRepository.findByInterbankTxRoutingNumberAndInterbankTxIdString(eq(OUR_RN), eq(txIdString)))
+                .thenReturn(Optional.of(payment));
+
+        rs.raf.banka2_bek.interbank.model.InterbankTransaction ibTx =
+                new rs.raf.banka2_bek.interbank.model.InterbankTransaction();
+        ibTx.setId(1L);
+        ibTx.setTransactionRoutingNumber(OUR_RN);
+        ibTx.setTransactionIdString(txIdString);
+        ibTx.setStatus(rs.raf.banka2_bek.interbank.model.InterbankTransactionStatus.ROLLED_BACK);
+        ibTx.setRetryCount(0);
+        ibTx.setFailureReason("Banka primaoca je odbacila transakciju.");
+        when(interbankTransactionRepository.findByTransactionRoutingNumberAndTransactionIdString(
+                eq(OUR_RN), eq(txIdString))).thenReturn(Optional.of(ibTx));
+
+        InterbankOtcWrapperDtos.InterbankTransactionDto view =
+                service.getInterbankTransactionView(txIdString, 7L, "CLIENT");
+
+        // Kljucno mapiranje: ROLLED_BACK → ABORTED.
+        assertThat(view.status()).isEqualTo("ABORTED");
+        assertThat(view.type()).isEqualTo("PAYMENT");
+        assertThat(view.failureReason()).isEqualTo("Banka primaoca je odbacila transakciju.");
+    }
+
+    @Test
+    @DisplayName("P1-9: unknown lookup id → NoSuchElement (404)")
+    void getInterbankTransactionView_notFound() {
+        // Non-numeric → preskace contract pretragu; payment pretraga vraca empty.
+        when(paymentRepository.findByInterbankTxRoutingNumberAndInterbankTxIdString(any(), any()))
+                .thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.getInterbankTransactionView("does-not-exist", 7L, "CLIENT"))
+                .isInstanceOf(java.util.NoSuchElementException.class);
+    }
+
+    // ── R2 1336/1337: exercise claim (lock + reservation) ──
+
+    @Test
+    @DisplayName("R2 1336/1337: exercise rezervise sredstva (reserveMonas) i flip-uje EXERCISING pre 2PC")
+    void exerciseContract_claimReservesFundsAndFlipsExercising() {
+        Long contractId = 99L;
+        InterbankOtcContract contract = buildActiveBuyerSideContract(contractId, 42L);
+        when(contractRepository.findById(contractId)).thenReturn(Optional.of(contract));
+
+        InterbankOtcNegotiation neg = new InterbankOtcNegotiation();
+        neg.setId(42L);
+        neg.setForeignNegotiationIdString("src-neg");
+        when(negotiationRepository.findById(42L)).thenReturn(Optional.of(neg));
+
+        Account buyerAccount = buildAccount(101L, "222000111111111111", "USD",
+                new BigDecimal("10000.00"), AccountStatus.ACTIVE);
+        Client buyer = new Client();
+        buyer.setId(7L);
+        buyerAccount.setClient(buyer);
+        when(accountRepository.findById(101L)).thenReturn(Optional.of(buyerAccount));
+        stubClaimLock(contract);
+        when(transactionExecutor.formTransaction(any(), anyString(), any(), any(), any()))
+                .thenReturn(new Transaction(List.of(),
+                        new ForeignBankId(OUR_RN, "tx"), "d", "ref", "n", "desc"));
+        doNothing().when(transactionExecutor).execute(any(Transaction.class));
+
+        service.exerciseContract(String.valueOf(contractId), 101L, 7L, "CLIENT");
+
+        // 1337: hold buyer-ovih sredstava (totalCost = 50 * 200 = 10000 USD).
+        verify(reservationApplier).reserveMonas(eq("222000111111111111"), eq(new BigDecimal("10000")));
+        // 1336: contract flip-ovan u EXERCISING pod lock-om PRE 2PC.
+        assertThat(contract.getStatus()).isEqualTo(InterbankOtcContractStatus.EXERCISING);
+    }
+
+    @Test
+    @DisplayName("R2 1336: konkurentni exercise — drugi pod lock-om vidi EXERCISING → 409, NE pokrece 2PC")
+    void exerciseContract_concurrentSecondCall_seesNonActiveUnderLock_409() {
+        Long contractId = 99L;
+        InterbankOtcContract contract = buildActiveBuyerSideContract(contractId, 42L);
+        // Prvi exercise je vec claim-ovao (EXERCISING). findById (ne-locking) vraca
+        // ACTIVE snapshot (stale read pre lock-a), ali findByIdForUpdate vraca
+        // EXERCISING (committed claim drugog thread-a).
+        InterbankOtcContract staleActive = buildActiveBuyerSideContract(contractId, 42L);
+        when(contractRepository.findById(contractId)).thenReturn(Optional.of(staleActive));
+
+        Account buyerAccount = buildAccount(101L, "222000111111111111", "USD",
+                new BigDecimal("10000.00"), AccountStatus.ACTIVE);
+        Client buyer = new Client();
+        buyer.setId(7L);
+        buyerAccount.setClient(buyer);
+        when(accountRepository.findById(101L)).thenReturn(Optional.of(buyerAccount));
+
+        contract.setStatus(InterbankOtcContractStatus.EXERCISING);
+        when(contractRepository.findByIdForUpdate(contractId)).thenReturn(Optional.of(contract));
+
+        assertThatThrownBy(() -> service.exerciseContract(String.valueOf(contractId), 101L, 7L, "CLIENT"))
+                .isInstanceOf(InterbankExceptions.InterbankExerciseConflictException.class)
+                .hasMessageContaining("vec u toku");
+
+        verify(reservationApplier, never()).reserveMonas(anyString(), any());
+        verify(transactionExecutor, never()).execute(any());
+    }
+
+    @Test
+    @DisplayName("R2 1336/1337: 2PC pad → revert (releaseMonas + EXERCISING→ACTIVE), rethrow")
+    void exerciseContract_2pcFails_revertsClaimAndReleasesFunds() {
+        Long contractId = 99L;
+        InterbankOtcContract contract = buildActiveBuyerSideContract(contractId, 42L);
+        when(contractRepository.findById(contractId)).thenReturn(Optional.of(contract));
+
+        InterbankOtcNegotiation neg = new InterbankOtcNegotiation();
+        neg.setId(42L);
+        neg.setForeignNegotiationIdString("src-neg");
+        when(negotiationRepository.findById(42L)).thenReturn(Optional.of(neg));
+
+        Account buyerAccount = buildAccount(101L, "222000111111111111", "USD",
+                new BigDecimal("10000.00"), AccountStatus.ACTIVE);
+        Client buyer = new Client();
+        buyer.setId(7L);
+        buyerAccount.setClient(buyer);
+        when(accountRepository.findById(101L)).thenReturn(Optional.of(buyerAccount));
+        // findByIdForUpdate koriste i claim i revert (claim flip-uje na EXERCISING,
+        // pa revert vidi EXERCISING i radi release).
+        when(contractRepository.findByIdForUpdate(contractId)).thenReturn(Optional.of(contract));
+        when(transactionExecutor.formTransaction(any(), anyString(), any(), any(), any()))
+                .thenReturn(new Transaction(List.of(),
+                        new ForeignBankId(OUR_RN, "tx"), "d", "ref", "n", "desc"));
+        org.mockito.Mockito.doThrow(new RuntimeException("partner vote=NO"))
+                .when(transactionExecutor).execute(any(Transaction.class));
+
+        assertThatThrownBy(() -> service.exerciseContract(String.valueOf(contractId), 101L, 7L, "CLIENT"))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("partner vote=NO");
+
+        verify(reservationApplier).reserveMonas(eq("222000111111111111"), eq(new BigDecimal("10000")));
+        // Revert: oslobodi rezervaciju + vrati ACTIVE.
+        verify(reservationApplier).releaseMonas(eq("222000111111111111"), eq(new BigDecimal("10000")));
+        assertThat(contract.getStatus()).isEqualTo(InterbankOtcContractStatus.ACTIVE);
+    }
+
+    // ── R1 209: inter-bank OTC access gate ──
+
+    @Test
+    @DisplayName("R1 209: klijent bez canTradeStocks → 403 na exercise, ne dira contract")
+    void exerciseContract_clientWithoutTradeStocks_forbidden() {
+        Client noTrade = new Client();
+        noTrade.setId(7L);
+        noTrade.setCanTradeStocks(false);
+        when(clientRepository.findById(7L)).thenReturn(Optional.of(noTrade));
+
+        assertThatThrownBy(() -> service.exerciseContract("99", 101L, 7L, "CLIENT"))
+                .isInstanceOf(org.springframework.security.access.AccessDeniedException.class);
+
+        verify(contractRepository, never()).findById(any());
+        verify(transactionExecutor, never()).execute(any());
+    }
+
+    @Test
+    @DisplayName("R1 209: agent (EMPLOYEE bez SUPERVISOR) → 403 na exercise")
+    void exerciseContract_agentEmployee_forbidden() {
+        rs.raf.banka2_bek.employee.model.Employee agent =
+                new rs.raf.banka2_bek.employee.model.Employee();
+        agent.setId(50L);
+        agent.setPermissions(new java.util.HashSet<>(java.util.Set.of("AGENT", "TRADE_STOCKS")));
+        when(employeeRepository.findById(50L)).thenReturn(Optional.of(agent));
+
+        assertThatThrownBy(() -> service.exerciseContract("99", 101L, 50L, "EMPLOYEE"))
+                .isInstanceOf(org.springframework.security.access.AccessDeniedException.class);
+
+        verify(transactionExecutor, never()).execute(any());
+    }
+
+    @Test
+    @DisplayName("R1 209: supervizor (EMPLOYEE sa SUPERVISOR) prolazi gate")
+    void exerciseContract_supervisorEmployee_passesGate() {
+        rs.raf.banka2_bek.employee.model.Employee supervisor =
+                new rs.raf.banka2_bek.employee.model.Employee();
+        supervisor.setId(60L);
+        supervisor.setPermissions(new java.util.HashSet<>(java.util.Set.of("SUPERVISOR")));
+        when(employeeRepository.findById(60L)).thenReturn(Optional.of(supervisor));
+        // contract ne postoji → prolazak gate-a se dokazuje time sto pukne KASNIJE
+        // (na contract lookup-u), a ne sa AccessDenied.
+        when(contractRepository.findById(99L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.exerciseContract("99", 101L, 60L, "EMPLOYEE"))
                 .isInstanceOf(InterbankExceptions.InterbankProtocolException.class)
                 .hasMessageContaining("ne postoji");
     }

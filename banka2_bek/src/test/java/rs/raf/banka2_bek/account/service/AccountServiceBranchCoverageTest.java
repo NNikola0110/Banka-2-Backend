@@ -69,6 +69,7 @@ class AccountServiceBranchCoverageTest {
     @Mock private CardService cardService;
     @Mock private NotificationPublisher notificationPublisher;
     @Mock private rs.raf.banka2_bek.audit.service.AuditLogService auditLogService;
+    @Mock private rs.raf.banka2_bek.audit.service.CurrentAuditActorResolver currentAuditActorResolver;
 
     private AccountServiceImplementation accountService;
 
@@ -77,7 +78,8 @@ class AccountServiceBranchCoverageTest {
         accountService = new AccountServiceImplementation(
                 accountRepository, clientRepository, currencyRepository,
                 companyRepository, employeeRepository, userRepository,
-                cardService, notificationPublisher, "22200011", auditLogService
+                cardService, notificationPublisher, "22200011", auditLogService,
+                currentAuditActorResolver
         );
     }
 
@@ -270,7 +272,8 @@ class AccountServiceBranchCoverageTest {
                 .build();
 
         when(accountRepository.findById(1L)).thenReturn(Optional.of(target));
-        when(accountRepository.findAccessibleAccounts(5L, AccountStatus.ACTIVE))
+        // R1-307: dedup ide preko svih racuna vlasnika (findByClientId), svi statusi.
+        when(accountRepository.findByClientId(5L))
                 .thenReturn(List.of(target, other));
 
         assertThatThrownBy(() -> accountService.updateAccountName(1L, "Stednja"))
@@ -294,7 +297,7 @@ class AccountServiceBranchCoverageTest {
                 .build();
 
         when(accountRepository.findById(1L)).thenReturn(Optional.of(target));
-        when(accountRepository.findAccessibleAccounts(6L, AccountStatus.ACTIVE))
+        when(accountRepository.findByClientId(6L))
                 .thenReturn(List.of(target));
         when(accountRepository.save(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
 

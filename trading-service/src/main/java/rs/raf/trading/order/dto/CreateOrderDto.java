@@ -1,7 +1,6 @@
 package rs.raf.trading.order.dto;
 
 import jakarta.validation.constraints.Min;
-import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 
@@ -39,7 +38,12 @@ public class CreateOrderDto {
      */
     private Long accountId;
 
-    @NotBlank(message = "Verifikacioni kod je obavezan")
+    /**
+     * ACCEPTED-DEVIATION (user-directed 03.06): OTP/verifikacioni kod je UKLONJEN
+     * sa kreiranja ordera (OTP ostaje samo na placanja+transfere). Polje je
+     * zadrzano kao OPCIONI/ignorisan back-compat field — FE sme da ga salje,
+     * ali ga BE vise ne validira ni ne verifikuje.
+     */
     private String otpCode;
 
     /**

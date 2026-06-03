@@ -18,11 +18,20 @@ import rs.raf.trading.otc.controller.exception_handler.OtcExceptionHandler;
 import rs.raf.trading.otc.dto.CreateOtcOfferDto;
 import rs.raf.trading.otc.dto.OtcContractDto;
 import rs.raf.trading.otc.dto.OtcOfferDto;
+import rs.raf.trading.otc.model.OtcContract;
+import rs.raf.trading.otc.model.OtcContractStatus;
+import rs.raf.trading.otc.repository.OtcContractRepository;
+import rs.raf.trading.otc.saga.model.SagaLog;
+import rs.raf.trading.otc.saga.model.SagaStatus;
+import rs.raf.trading.otc.saga.repository.SagaLogRepository;
+import rs.raf.trading.otc.saga.service.OtcExerciseSagaOrchestrator;
+import rs.raf.trading.otc.saga.service.SagaResult;
 import rs.raf.trading.otc.service.OtcService;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Optional;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -50,6 +59,10 @@ class OtcControllerIntegrationTest {
             .findAndRegisterModules();
 
     @Mock private OtcService otcService;
+    @Mock private OtcExerciseSagaOrchestrator exerciseSagaOrchestrator;
+    @Mock private OtcContractRepository contractRepository;
+    @Mock private SagaLogRepository sagaLogRepository;
+    @Mock private rs.raf.trading.otc.service.OtcAccessGuard accessGuard;
 
     @InjectMocks
     private OtcController controller;
@@ -125,16 +138,100 @@ class OtcControllerIntegrationTest {
     }
 
     @Test
-    @DisplayName("POST /otc/contracts/{id}/exercise — 200")
+    @DisplayName("POST /otc/contracts/{id}/exercise — 200 (Model-B SAGA: COMPLETED -> EXERCISED)")
     void exerciseContract_ok() throws Exception {
-        OtcContractDto response = new OtcContractDto();
-        response.setId(7L);
-        response.setStatus("EXERCISED");
-        when(otcService.exerciseContract(eq(7L), eq(10L))).thenReturn(response);
+        when(exerciseSagaOrchestrator.exercise(eq(7L), eq(10L)))
+                .thenReturn(new SagaResult("saga-abc", SagaStatus.COMPLETED, 5));
+        OtcContract contract = new OtcContract();
+        contract.setId(7L);
+        contract.setStatus(OtcContractStatus.EXERCISED);
+        when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
 
         mockMvc.perform(post("/otc/contracts/7/exercise").param("buyerAccountId", "10"))
                 .andExpect(status().isOk())
+                .andExpect(jsonPath("$.sagaId").value("saga-abc"))
+                .andExpect(jsonPath("$.sagaStatus").value("COMPLETED"))
+                .andExpect(jsonPath("$.currentStep").value(5))
+                .andExpect(jsonPath("$.id").value(7))
                 .andExpect(jsonPath("$.status").value("EXERCISED"));
+
+        verify(exerciseSagaOrchestrator).exercise(7L, 10L);
+    }
+
+    @Test
+    @DisplayName("POST /otc/contracts/{id}/exercise — COMPENSATED rollback -> 200, ugovor ostaje ACTIVE")
+    void exerciseContract_compensated() throws Exception {
+        when(exerciseSagaOrchestrator.exercise(eq(7L), any()))
+                .thenReturn(new SagaResult("saga-roll", SagaStatus.COMPENSATED, 3));
+        OtcContract contract = new OtcContract();
+        contract.setId(7L);
+        contract.setStatus(OtcContractStatus.ACTIVE);
+        when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
+
+        mockMvc.perform(post("/otc/contracts/7/exercise"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.sagaStatus").value("COMPENSATED"))
+                .andExpect(jsonPath("$.status").value("ACTIVE"));
+    }
+
+    @Test
+    @DisplayName("GET /otc/saga/{id} — 200 sa log-om")
+    void getSagaStatus_ok() throws Exception {
+        SagaLog saga = new SagaLog();
+        saga.setSagaId("saga-abc");
+        saga.setContractId(7L);
+        saga.setStatus(SagaStatus.COMPLETED);
+        saga.setCurrentStep(5);
+        when(sagaLogRepository.findBySagaId("saga-abc")).thenReturn(Optional.of(saga));
+        // P1-authz-idor-1 (R1 217): kontroler razresava ugovor (saga.contractId) i
+        // proverava ucesnika preko OtcAccessGuard. Guard mock je no-op (ucesnik prolazi).
+        OtcContract contract = new OtcContract();
+        contract.setId(7L);
+        contract.setBuyerId(7001L);
+        contract.setBuyerRole("CLIENT");
+        contract.setSellerId(7002L);
+        contract.setSellerRole("CLIENT");
+        when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
+
+        mockMvc.perform(get("/otc/saga/saga-abc"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.sagaId").value("saga-abc"))
+                .andExpect(jsonPath("$.status").value("COMPLETED"))
+                .andExpect(jsonPath("$.currentStep").value(5))
+                .andExpect(jsonPath("$.log").isArray());
+    }
+
+    @Test
+    @DisplayName("GET /otc/saga/{id} — 403 kad pozivalac nije ucesnik (IDOR guard)")
+    void getSagaStatus_nonParticipant_forbidden() throws Exception {
+        SagaLog saga = new SagaLog();
+        saga.setSagaId("saga-xyz");
+        saga.setContractId(7L);
+        saga.setStatus(SagaStatus.COMPLETED);
+        saga.setCurrentStep(5);
+        when(sagaLogRepository.findBySagaId("saga-xyz")).thenReturn(Optional.of(saga));
+        OtcContract contract = new OtcContract();
+        contract.setId(7L);
+        contract.setBuyerId(8888L);
+        contract.setBuyerRole("CLIENT");
+        contract.setSellerId(9999L);
+        contract.setSellerRole("CLIENT");
+        when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
+        org.mockito.Mockito.doThrow(new org.springframework.security.access.AccessDeniedException("nije ucesnik"))
+                .when(accessGuard).ensureParticipantOrOversight(any(), any(), any(), any(),
+                        org.mockito.ArgumentMatchers.anyString());
+
+        mockMvc.perform(get("/otc/saga/saga-xyz"))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("GET /otc/saga/{id} — nepostojeca saga -> 404")
+    void getSagaStatus_notFound() throws Exception {
+        when(sagaLogRepository.findBySagaId("nema")).thenReturn(Optional.empty());
+
+        mockMvc.perform(get("/otc/saga/nema"))
+                .andExpect(status().isNotFound());
     }
 
     @Test
@@ -162,9 +259,9 @@ class OtcControllerIntegrationTest {
     }
 
     @Test
-    @DisplayName("OtcExceptionHandler — IllegalStateException → 409")
+    @DisplayName("OtcExceptionHandler — IllegalStateException (pre-saga) → 409")
     void handler_illegalState() throws Exception {
-        when(otcService.exerciseContract(eq(7L), any()))
+        when(exerciseSagaOrchestrator.exercise(eq(7L), any()))
                 .thenThrow(new IllegalStateException("ugovor istekao"));
 
         mockMvc.perform(post("/otc/contracts/7/exercise"))
@@ -184,13 +281,14 @@ class OtcControllerIntegrationTest {
     }
 
     @Test
-    @DisplayName("OtcExceptionHandler — InsufficientFundsException → 400")
+    @DisplayName("OtcExceptionHandler — InsufficientFundsException → 409 (R1 1007)")
     void handler_insufficientFunds() throws Exception {
         when(otcService.acceptOffer(eq(1L), any()))
                 .thenThrow(new InsufficientFundsException("nedovoljno sredstava"));
 
+        // R1 1007: nedovoljno sredstava je 409 Conflict (uskladjeno sa banka-core reserve), ne 400.
         mockMvc.perform(post("/otc/offers/1/accept"))
-                .andExpect(status().isBadRequest())
+                .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.error").value("nedovoljno sredstava"));
     }
 }

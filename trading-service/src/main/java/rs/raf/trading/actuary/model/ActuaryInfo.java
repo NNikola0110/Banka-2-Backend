@@ -38,10 +38,15 @@ public class ActuaryInfo {
     @Column(nullable = false)
     private ActuaryType actuaryType;
 
-    @Column(name = "daily_limit")
+    // R4-1772: novcana polja moraju imati eksplicitni precision/scale.
+    // Bez njih Hibernate emituje PG default numeric(38,2) (scale-2), dok je
+    // SVUDA drugde u codebase-u novac numeric(19,4) (scale-4) — npr. usedLimit
+    // se poredi sa order-amount-om (scale-4) u OrderServiceImpl, pa scale-2
+    // truncate moze pomeriti prelazak dailyLimit-a. Poravnato na scale-4.
+    @Column(name = "daily_limit", precision = 19, scale = 4)
     private BigDecimal dailyLimit;
 
-    @Column(name = "used_limit")
+    @Column(name = "used_limit", precision = 19, scale = 4)
     private BigDecimal usedLimit;
 
     @Column(name = "need_approval", nullable = false)

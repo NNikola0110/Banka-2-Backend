@@ -50,12 +50,29 @@ class TradingJwtAuthenticationFilterTest {
     }
 
     private String buildValidToken(String subject, String role) {
+        return buildToken(subject, role, true);
+    }
+
+    /** Access token sa kontrolisanim {@code active} flag-om (N2). */
+    private String buildToken(String subject, String role, boolean active) {
         return Jwts.builder()
                 .subject(subject)
+                .claim("type", "access")
                 .claim("role", role)
-                .claim("active", true)
+                .claim("active", active)
                 .issuedAt(new Date())
                 .expiration(new Date(System.currentTimeMillis() + 60_000L))
+                .signWith(secretKey, Jwts.SIG.HS256)
+                .compact();
+    }
+
+    /** Refresh token (type=refresh, 7-dnevni TTL) — banka-core generateRefreshToken oblik. */
+    private String buildRefreshToken(String subject) {
+        return Jwts.builder()
+                .subject(subject)
+                .claim("type", "refresh")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + 1000L * 60 * 60 * 24 * 7))
                 .signWith(secretKey, Jwts.SIG.HS256)
                 .compact();
     }
@@ -191,7 +208,10 @@ class TradingJwtAuthenticationFilterTest {
     }
 
     @Test
-    void clientToken_skipsPermissionResolver() throws Exception {
+    void clientWithoutTradePermission_getsOnlyRoleClient() throws Exception {
+        // Klijent bez canTradeStocks: resolver vraca praznu listu (default stub) →
+        // samo ROLE_CLIENT, bez TRADE_STOCKS. Lookup SE I DALJE radi (mora — banka-core
+        // odlucuje da li klijent sme da traduje), ali ne dodaje permisiju.
         String token = buildValidToken("stefan.jovanovic@gmail.com", "CLIENT");
 
         MockHttpServletRequest request = new MockHttpServletRequest();
@@ -201,11 +221,119 @@ class TradingJwtAuthenticationFilterTest {
 
         filter.doFilterInternal(request, response, chain);
 
-        // Klijent nema employee permisije — lookup se preskace.
-        verify(permissionResolver, never()).resolvePermissions(anyString());
+        verify(permissionResolver, times(1)).resolvePermissions("stefan.jovanovic@gmail.com");
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
         assertThat(auth.getAuthorities())
                 .extracting("authority")
                 .containsExactly("ROLE_CLIENT");
+    }
+
+    @Test
+    void clientWithTradeStocksPermission_getsTradeStocksAuthority() throws Exception {
+        // P0-2: klijent sa canTradeStocks=true — banka-core razresi TRADE_STOCKS.
+        // Filter mora dodati TRADE_STOCKS autoritet uz ROLE_CLIENT (inace 403 na POST /orders).
+        when(permissionResolver.resolvePermissions("stefan.jovanovic@gmail.com"))
+                .thenReturn(List.of("TRADE_STOCKS"));
+        String token = buildValidToken("stefan.jovanovic@gmail.com", "CLIENT");
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer " + token);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        verify(chain, times(1)).doFilter(request, response);
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        assertThat(auth).isNotNull();
+        assertThat(auth.getAuthorities())
+                .extracting("authority")
+                .containsExactlyInAnyOrder("ROLE_CLIENT", "TRADE_STOCKS");
+    }
+
+    // ── N1 (P0-T4): refresh token NE sme da prodje kao Bearer access na trading ──
+
+    @Test
+    void refreshTokenAsBearer_returns401_andChainNotCalled() throws Exception {
+        // N1: 7-dnevni refresh token (deljeni jwt.secret) — pre fix-a je prolazio
+        // kao validan Bearer na trading rutama. Mora dati 401, chain se ne zove,
+        // security context ostaje prazan.
+        String refresh = buildRefreshToken("stefan.jovanovic@gmail.com");
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer " + refresh);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        verify(chain, never()).doFilter(any(), any());
+        assertThat(response.getStatus()).isEqualTo(HttpServletResponse.SC_UNAUTHORIZED);
+        assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+        // permisije se NE razresavaju za odbijen token
+        verify(permissionResolver, never()).resolvePermissions(any());
+    }
+
+    // ── N2 (P0-T4): deaktiviran nalog (active=false claim) → 401 na trading ──
+
+    @Test
+    void deactivatedAccount_validAccessToken_returns401_andChainNotCalled() throws Exception {
+        // N2 (mirror B7 banka-core): access token sa active=false (nalog deaktiviran
+        // posle izdavanja tokena) ne sme da zadrzi trading pristup. active je claim
+        // koji banka-core JwtService stavlja na svaki access token (snapshot).
+        String token = buildToken("deactivated@banka.rs", "EMPLOYEE", false);
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer " + token);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        verify(chain, never()).doFilter(any(), any());
+        assertThat(response.getStatus()).isEqualTo(HttpServletResponse.SC_UNAUTHORIZED);
+        assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+    }
+
+    @Test
+    void activeAccount_validAccessToken_passes() throws Exception {
+        // N2 negativ-kontrola: active=true (default) i dalje prolazi.
+        String token = buildToken("active@banka.rs", "EMPLOYEE", true);
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer " + token);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        verify(chain, times(1)).doFilter(request, response);
+        assertThat(response.getStatus()).isNotEqualTo(HttpServletResponse.SC_UNAUTHORIZED);
+        assertThat(SecurityContextHolder.getContext().getAuthentication()).isNotNull();
+    }
+
+    @Test
+    void legacyTokenWithoutActiveClaim_passes() throws Exception {
+        // N2 backwards-compat: legacy access token bez active claim-a (izdat pre B7)
+        // se NE odbija samo zbog nedostatka claim-a — tretira se kao aktivan.
+        String legacy = Jwts.builder()
+                .subject("legacy@banka.rs")
+                .claim("type", "access")
+                .claim("role", "EMPLOYEE")
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + 60_000L))
+                .signWith(secretKey, Jwts.SIG.HS256)
+                .compact();
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer " + legacy);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        verify(chain, times(1)).doFilter(request, response);
+        assertThat(response.getStatus()).isNotEqualTo(HttpServletResponse.SC_UNAUTHORIZED);
+        assertThat(SecurityContextHolder.getContext().getAuthentication()).isNotNull();
     }
 }

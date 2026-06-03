@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import rs.raf.banka2_bek.interbank.exception.InterbankExceptions;
@@ -27,9 +28,21 @@ public class InterbankRetryScheduler {
     private final InterbankMessageService messageService;
     private final ObjectMapper objectMapper;
 
-    @Scheduled(fixedRate = 120_000)
+    /**
+     * R1-685: stale-message minimalna starost pre retry-a (sekunde). Default 120s
+     * (2 min) — usklađeno sa intervalom skeniranja. Override preko
+     * {@code interbank.retry.stale-after-seconds} (npr. brže u testu/demo-u).
+     */
+    @Value("${interbank.retry.stale-after-seconds:120}")
+    private long staleAfterSeconds;
+
+    /**
+     * R1-685: interval skeniranja PENDING poruka (ms). Ranije hardkodiran 120000.
+     * {@code fixedRateString} cita property-placeholder pre starta scheduler-a.
+     */
+    @Scheduled(fixedRateString = "${interbank.retry.interval-ms:120000}")
     public void retryStaleMessages() {
-        LocalDateTime cutoff = LocalDateTime.now().minusSeconds(120);
+        LocalDateTime cutoff = LocalDateTime.now().minusSeconds(staleAfterSeconds);
         List<InterbankMessage> pending =
                 messageRepository.findPendingForRetry(InterbankMessageStatus.PENDING, cutoff);
 

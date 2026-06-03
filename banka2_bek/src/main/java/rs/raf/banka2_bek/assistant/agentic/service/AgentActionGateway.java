@@ -109,6 +109,16 @@ public class AgentActionGateway {
         if (!properties.getAgentic().isEnabled()) {
             throw new AgenticDisabledException("Agentic mode nije aktivan na BE-u");
         }
+        // P0-B8 N1: privilege-escalation guard. Agentic in-process pozivi
+        // (direct-preview / LLM tool-loop / wizard) zaobilaze HTTP role check
+        // na kontroleru. Bez ove provere, CLIENT je mogao da pokrene
+        // EMPLOYEE-only akcije (approve_loan_request, update_actuary_limit,
+        // unblock_card, ...). createPending je jedinstven chokepoint kroz koji
+        // SVE agentic putanje prolaze, pa je ovde najjaca tacka za role gate.
+        if (!isRoleAllowed(handler, user)) {
+            throw new AgenticActionForbiddenException(
+                    "Akcija '" + toolName + "' nije dozvoljena za vasu ulogu.");
+        }
         if (!tryAcquireRate(user)) {
             throw new AgenticRateLimitedException(
                     "Previse agentic akcija. Sacekaj minut.");
@@ -338,9 +348,9 @@ public class AgentActionGateway {
         if (auth == null) return null;
         String name = auth.getName();
         if (name == null || name.isBlank() || "anonymousUser".equalsIgnoreCase(name)) return null;
-        // Suppress unused warning — userResolver is wired for future use cases
-        // where we may need to fetch employee/client email by user id.
-        if (userResolver == null) return name;
+        // Spring SecurityContext name JE email (JWT subject), pa ga vracamo direktno.
+        // userResolver se ovde ne koristi (nema email-by-id helper); ostaje wired za
+        // druge metode ove klase koje razresavaju userId.
         return name;
     }
 
@@ -360,6 +370,22 @@ public class AgentActionGateway {
         } catch (Exception e) {
             return new HashMap<>();
         }
+    }
+
+    /**
+     * P0-B8 N1: proverava da li trenutni korisnik (rola) sme da izvrsi datu
+     * akciju. {@link WriteToolHandler#allowedRoles()} vraca praznu listu za
+     * akcije dostupne svima; inace listu rola ("EMPLOYEE" / "CLIENT").
+     * Asistent sloj kolapsira sve zaposlene (ADMIN/SUPERVISOR/AGENT) u
+     * {@code UserContext.userRole == "EMPLOYEE"} (vidi UserResolver), pa je
+     * poredjenje case-insensitive na string roli dovoljno.
+     */
+    private boolean isRoleAllowed(WriteToolHandler handler, UserContext user) {
+        List<String> allowed = handler.allowedRoles();
+        if (allowed == null || allowed.isEmpty()) return true; // sve role
+        String role = user.userRole();
+        if (role == null) return false;
+        return allowed.stream().anyMatch(r -> r.equalsIgnoreCase(role));
     }
 
     private boolean tryAcquireRate(UserContext user) {
@@ -387,6 +413,16 @@ public class AgentActionGateway {
 
     public static class AgenticDisabledException extends RuntimeException {
         public AgenticDisabledException(String msg) { super(msg); }
+    }
+
+    /**
+     * P0-B8 N1: baca se kad korisnikova rola nije u
+     * {@link WriteToolHandler#allowedRoles()} akcije — sprecava da CLIENT
+     * kroz agentic put izvrsi EMPLOYEE-only akciju. Mapira se na HTTP 403
+     * u {@link rs.raf.banka2_bek.assistant.agentic.controller.AgentActionExceptionHandler}.
+     */
+    public static class AgenticActionForbiddenException extends RuntimeException {
+        public AgenticActionForbiddenException(String msg) { super(msg); }
     }
 
     /* ========================== READ HELPERS ========================== */

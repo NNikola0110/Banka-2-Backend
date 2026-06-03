@@ -53,7 +53,7 @@ class LoanServiceImplTest {
     @Mock private NotificationService notificationService;
     @Mock private rs.raf.banka2_bek.audit.service.AuditLogService auditLogService;
     @Mock private rs.raf.banka2_bek.employee.repository.EmployeeRepository employeeRepository;
-    @Mock private rs.raf.banka2_bek.otp.service.OtpService otpService;
+    @Mock private rs.raf.banka2_bek.exchange.CurrencyConversionService currencyConversionService;
 
     private LoanServiceImpl loanService;
 
@@ -68,11 +68,7 @@ class LoanServiceImplTest {
                 loanRequestRepository, loanRepository, installmentRepository,
                 accountRepository, clientRepository, currencyRepository,
                 notificationPublisher, "22200022", notificationService,
-                auditLogService, employeeRepository, otpService);
-
-        // BE-PAY-06: default OTP — verifikuje sve. Negativni testovi imaju dedikovan setup.
-        lenient().when(otpService.verify(anyString(), anyString()))
-                .thenReturn(java.util.Map.of("verified", true));
+                auditLogService, employeeRepository, currencyConversionService);
 
         rsd = new Currency();
         rsd.setId(8L);
@@ -258,6 +254,95 @@ class LoanServiceImplTest {
         }
 
         @Test
+        @DisplayName("P1: FX-band — strana valuta se konvertuje u RSD pre tranze nominalne stope")
+        void foreignCurrencyConvertedToRsdForRateBand() {
+            // R1-133/R3-1630: 100000 EUR (~11.7M RSD) ranije je padalo u najnizu RSD tranzu
+            // (6.25%, jer 100000 <= 500000) zbog sirovog double-poredjenja bez FX. Posle fix-a
+            // konverzija u RSD (117.5 RSD/EUR → 11.75M) → tranza <=20M = 5.00%.
+            Currency eur = new Currency();
+            eur.setId(2L);
+            eur.setCode("EUR");
+
+            Account eurAccount = Account.builder()
+                    .id(2L).accountNumber("222000112345678922")
+                    .accountType(AccountType.CHECKING)
+                    .currency(eur).client(client)
+                    .balance(BigDecimal.valueOf(100000))
+                    .availableBalance(BigDecimal.valueOf(100000))
+                    .status(AccountStatus.ACTIVE)
+                    .build();
+            Account bankEur = Account.builder()
+                    .id(98L).accountNumber("222000220000000002")
+                    .accountType(AccountType.CHECKING).currency(eur)
+                    .balance(BigDecimal.valueOf(999999999))
+                    .availableBalance(BigDecimal.valueOf(999999999))
+                    .status(AccountStatus.ACTIVE).build();
+
+            LoanRequest request = LoanRequest.builder()
+                    .id(7L).loanType(LoanType.CASH).interestType(InterestType.FIXED)
+                    .amount(BigDecimal.valueOf(100000)).currency(eur)
+                    .repaymentPeriod(24).account(eurAccount).client(client)
+                    .status(LoanStatus.PENDING).build();
+
+            when(currencyConversionService.convert(BigDecimal.valueOf(100000), "EUR", "RSD"))
+                    .thenReturn(new BigDecimal("11750000.0000"));
+            when(loanRequestRepository.findById(7L)).thenReturn(Optional.of(request));
+            when(loanRequestRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+            when(loanRepository.save(any(Loan.class))).thenAnswer(inv -> {
+                Loan l = inv.getArgument(0);
+                l.setId(7L);
+                return l;
+            });
+            when(accountRepository.findForUpdateById(2L)).thenReturn(Optional.of(eurAccount));
+            when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.of(bankEur));
+            when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+            when(installmentRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+            LoanResponseDto result = loanService.approveLoanRequest(7L);
+
+            // 11.75M RSD → tranza <=20M = 5.00% (NE 6.25% kao sirov amt=100000)
+            assertThat(result.getNominalRate()).isEqualByComparingTo("5.00");
+        }
+
+        @Test
+        @DisplayName("P1: FX nedostupan → defanzivno pada na sirov iznos (RSD krediti nedirnuti)")
+        void fxUnavailableFallsBackToRawAmount() {
+            Currency eur = new Currency();
+            eur.setId(2L);
+            eur.setCode("EUR");
+            Account eurAccount = Account.builder()
+                    .id(2L).accountNumber("222000112345678922")
+                    .accountType(AccountType.CHECKING).currency(eur).client(client)
+                    .balance(BigDecimal.valueOf(100000)).availableBalance(BigDecimal.valueOf(100000))
+                    .status(AccountStatus.ACTIVE).build();
+            Account bankEur = Account.builder()
+                    .id(98L).accountNumber("222000220000000002")
+                    .accountType(AccountType.CHECKING).currency(eur)
+                    .balance(BigDecimal.valueOf(999999999)).availableBalance(BigDecimal.valueOf(999999999))
+                    .status(AccountStatus.ACTIVE).build();
+            LoanRequest request = LoanRequest.builder()
+                    .id(8L).loanType(LoanType.CASH).interestType(InterestType.FIXED)
+                    .amount(BigDecimal.valueOf(100000)).currency(eur)
+                    .repaymentPeriod(24).account(eurAccount).client(client)
+                    .status(LoanStatus.PENDING).build();
+
+            when(currencyConversionService.convert(any(), eq("EUR"), eq("RSD")))
+                    .thenThrow(new RuntimeException("exchange servis nedostupan"));
+            when(loanRequestRepository.findById(8L)).thenReturn(Optional.of(request));
+            when(loanRequestRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+            when(loanRepository.save(any(Loan.class))).thenAnswer(inv -> { Loan l = inv.getArgument(0); l.setId(8L); return l; });
+            when(accountRepository.findForUpdateById(2L)).thenReturn(Optional.of(eurAccount));
+            when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "EUR")).thenReturn(Optional.of(bankEur));
+            when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+            when(installmentRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+            LoanResponseDto result = loanService.approveLoanRequest(8L);
+
+            // FX padne → sirov 100000 <= 500000 → 6.25% (degradacija, ali bez pada odobravanja)
+            assertThat(result.getNominalRate()).isEqualByComparingTo("6.25");
+        }
+
+        @Test
         @DisplayName("baca gresku za vec obradjen zahtev")
         void alreadyProcessed() {
             LoanRequest request = LoanRequest.builder()
@@ -322,6 +407,89 @@ class LoanServiceImplTest {
 
             LoanRequestResponseDto result = loanService.rejectLoanRequest(1L);
 
+            assertThat(result.getStatus()).isEqualTo("REJECTED");
+        }
+    }
+
+    @Nested
+    @DisplayName("P0-B8 N2: privilege-escalation guard za approve/reject")
+    class PrivilegeEscalationGuard {
+
+        @org.junit.jupiter.api.AfterEach
+        void clearCtx() {
+            org.springframework.security.core.context.SecurityContextHolder.clearContext();
+        }
+
+        private void authenticateAs(String... authorities) {
+            var auths = java.util.Arrays.stream(authorities)
+                    .map(org.springframework.security.core.authority.SimpleGrantedAuthority::new)
+                    .map(a -> (org.springframework.security.core.GrantedAuthority) a)
+                    .toList();
+            org.springframework.security.core.context.SecurityContextHolder.getContext()
+                    .setAuthentication(new org.springframework.security.authentication
+                            .UsernamePasswordAuthenticationToken("user@test.com", "n/a", auths));
+        }
+
+        @Test
+        @DisplayName("CLIENT poziva approveLoanRequest → AccessDeniedException (agentic escalation odbijen)")
+        void approveAsClient_denied() {
+            authenticateAs("ROLE_CLIENT");
+
+            assertThatThrownBy(() -> loanService.approveLoanRequest(1L))
+                    .isInstanceOf(org.springframework.security.access.AccessDeniedException.class);
+
+            // Guard fire-uje PRE bilo kakvog rada — repo se ne dira.
+            verify(loanRequestRepository, never()).findById(any());
+        }
+
+        @Test
+        @DisplayName("CLIENT poziva rejectLoanRequest → AccessDeniedException")
+        void rejectAsClient_denied() {
+            authenticateAs("ROLE_CLIENT");
+
+            assertThatThrownBy(() -> loanService.rejectLoanRequest(1L))
+                    .isInstanceOf(org.springframework.security.access.AccessDeniedException.class);
+
+            verify(loanRequestRepository, never()).findById(any());
+        }
+
+        @Test
+        @DisplayName("EMPLOYEE poziva approveLoanRequest → prolazi (legitiman put neometen)")
+        void approveAsEmployee_allowed() {
+            authenticateAs("ROLE_EMPLOYEE");
+            LoanRequest request = LoanRequest.builder()
+                    .id(1L).loanType(LoanType.CASH).interestType(InterestType.FIXED)
+                    .amount(BigDecimal.valueOf(100000)).currency(rsd)
+                    .repaymentPeriod(24).account(account).client(client)
+                    .status(LoanStatus.PENDING).build();
+            when(loanRequestRepository.findById(1L)).thenReturn(Optional.of(request));
+            when(loanRequestRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+            when(loanRepository.save(any(Loan.class))).thenAnswer(inv -> {
+                Loan l = inv.getArgument(0); l.setId(1L); return l;
+            });
+            when(accountRepository.findForUpdateById(1L)).thenReturn(Optional.of(account));
+            when(accountRepository.findBankAccountForUpdateByCurrency("22200022", "RSD"))
+                    .thenReturn(Optional.of(bankAccount));
+            when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+            when(installmentRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+            LoanResponseDto result = loanService.approveLoanRequest(1L);
+            assertThat(result.getStatus()).isEqualTo("ACTIVE");
+        }
+
+        @Test
+        @DisplayName("ADMIN poziva rejectLoanRequest → prolazi")
+        void rejectAsAdmin_allowed() {
+            authenticateAs("ROLE_EMPLOYEE", "ROLE_ADMIN");
+            LoanRequest request = LoanRequest.builder()
+                    .id(1L).loanType(LoanType.STUDENT).interestType(InterestType.VARIABLE)
+                    .amount(BigDecimal.valueOf(50000)).currency(rsd)
+                    .repaymentPeriod(12).account(account).client(client)
+                    .status(LoanStatus.PENDING).build();
+            when(loanRequestRepository.findById(1L)).thenReturn(Optional.of(request));
+            when(loanRequestRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+            LoanRequestResponseDto result = loanService.rejectLoanRequest(1L);
             assertThat(result.getStatus()).isEqualTo("REJECTED");
         }
     }

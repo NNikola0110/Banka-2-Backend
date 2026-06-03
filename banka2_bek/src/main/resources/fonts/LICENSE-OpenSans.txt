@@ -1,0 +1,12 @@
+Open Sans font (OpenSans-Regular.ttf, OpenSans-Bold.ttf)
+
+Open Sans is a humanist sans-serif typeface designed by Steve Matteson.
+Licensed under the Apache License, Version 2.0.
+
+You may obtain a copy of the License at:
+    http://www.apache.org/licenses/LICENSE-2.0
+
+These fonts are bundled so that the payment-receipt PDF generator
+(rs.raf.banka2_bek.payment.service.PaymentReceiptPdfGenerator) can embed a
+Unicode TTF (via Apache PDFBox PDType0Font) and correctly render Serbian
+Latin diacritics (č, ć, š, ž, đ) that the Standard-14 WinAnsi fonts cannot.

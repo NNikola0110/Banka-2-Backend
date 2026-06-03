@@ -32,6 +32,16 @@ public class VariableRateProcessor {
     private final LoanRepository loanRepository;
     private final LoanInstallmentRepository installmentRepository;
 
+    /**
+     * R1-660: minimalna efektivna kamatna stopa (safety floor) — kad
+     * nominalRate + offset + margin padne ispod ovoga, kapira se na ovu vrednost.
+     * Eksternalizovano u config ({@code loan.variable-rate.floor-percent}); ima
+     * in-code default 0.50% pa radi i bez Spring konteksta (unit testovi /
+     * {@code @InjectMocks} koji ne setuju {@code @Value} polja).
+     */
+    @org.springframework.beans.factory.annotation.Value("${loan.variable-rate.floor-percent:0.50}")
+    private BigDecimal rateFloor = new BigDecimal("0.50");
+
     public VariableRateProcessor(LoanRepository loanRepository,
                                  LoanInstallmentRepository installmentRepository) {
         this.loanRepository = loanRepository;
@@ -51,9 +61,9 @@ public class VariableRateProcessor {
         BigDecimal margin = getMargin(loan.getLoanType());
         BigDecimal newEffectiveRate = loan.getNominalRate().add(offset).add(margin);
 
-        // Ensure effective rate doesn't go below 0.50% (safety floor)
-        if (newEffectiveRate.compareTo(new BigDecimal("0.50")) < 0) {
-            newEffectiveRate = new BigDecimal("0.50");
+        // R1-660: efektivna stopa ne sme ispod safety floor-a (konfigurabilno, default 0.50%).
+        if (newEffectiveRate.compareTo(rateFloor) < 0) {
+            newEffectiveRate = rateFloor;
         }
 
         // Count remaining (unpaid) installments
@@ -71,7 +81,7 @@ public class VariableRateProcessor {
 
         // Recalculate monthly payment: A = P * r * (1+r)^n / ((1+r)^n - 1)
         // where P = remainingDebt, r = monthly rate, n = remaining months.
-        // Safety floor (>= 0.50%) above guarantees monthlyRate > 0, so no zero-rate branch.
+        // Safety floor (>= rateFloor, default 0.50%) above guarantees monthlyRate > 0, so no zero-rate branch.
         BigDecimal monthlyRate = newEffectiveRate.divide(BigDecimal.valueOf(1200), 10, RoundingMode.HALF_UP);
         BigDecimal onePlusR = BigDecimal.ONE.add(monthlyRate);
         BigDecimal onePlusRn = onePlusR.pow(remainingMonths, MathContext.DECIMAL128);
@@ -92,10 +102,19 @@ public class VariableRateProcessor {
             BigDecimal interestPortion = remainingPrincipal.multiply(monthlyRate).setScale(4, RoundingMode.HALF_UP);
             BigDecimal principalPortion = newMonthlyPayment.subtract(interestPortion);
 
-            // Last installment covers the remaining principal exactly
+            // R3-1596 (money-loss): poslednja rata je ranije postavljala principalPortion =
+            // CEO remainingPrincipal, dok amount ostaje newMonthlyPayment. InstallmentProcessor
+            // tada nula-ira remainingDebt po principalAmount-u, a naplacuje samo amount → posle
+            // LATE preskocenih rata jedna mala naplata gasi ceo dug (banka gubi glavnicu).
+            // Fix: principalPortion = min(remaining, amount - interest) — nikad vise nego sto
+            // se stvarno naplacuje. U normalnoj amortizaciji amount-interest >= remaining na
+            // poslednjoj rati pa je ovo no-op; u pathological slucaju kapira na naplaceno.
             if (i == unpaidInstallments.size() - 1) {
-                principalPortion = remainingPrincipal;
-                interestPortion = newMonthlyPayment.subtract(principalPortion).max(BigDecimal.ZERO);
+                principalPortion = principalPortion.min(remainingPrincipal);
+            }
+            // Defanzivno: principalPortion ne sme biti negativan (interest > rata).
+            if (principalPortion.compareTo(BigDecimal.ZERO) < 0) {
+                principalPortion = BigDecimal.ZERO;
             }
 
             remainingPrincipal = remainingPrincipal.subtract(principalPortion);
@@ -115,15 +134,10 @@ public class VariableRateProcessor {
     }
 
     /**
-     * Bank margin per loan type - mirrors LoanServiceImpl.getMargin().
+     * R1-657: bank margin per loan type — delegira na {@link LoanType#getMargin()}
+     * (jedinstven izvor istine; pre je tabela bila duplirana sa LoanServiceImpl).
      */
     private BigDecimal getMargin(LoanType type) {
-        return switch (type) {
-            case CASH -> new BigDecimal("1.75");
-            case MORTGAGE -> new BigDecimal("1.50");
-            case AUTO -> new BigDecimal("1.25");
-            case REFINANCING -> new BigDecimal("1.00");
-            case STUDENT -> new BigDecimal("0.75");
-        };
+        return type.getMargin();
     }
 }

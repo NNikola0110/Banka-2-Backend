@@ -66,4 +66,33 @@ public class Branch {
     @org.hibernate.annotations.ColumnDefault("CURRENT_TIMESTAMP")
     @Builder.Default
     private LocalDateTime createdAt = LocalDateTime.now();
+
+    /**
+     * R1-706 / R1-707: do sada su WGS84 opsezi i "has24h/hasDriveThrough samo za ATM"
+     * invarijanta postojali SAMO kao komentar (seed-only, bez create endpoint-a). Ova
+     * {@code @PrePersist @PreUpdate} provera ih ENFORCE-uje na JPA sloju za svako
+     * programsko kreiranje/izmenu (seed.sql ide sirovim SQL-om i ne prolazi kroz ovo,
+     * ali svaki repository.save() prolazi):
+     * <ul>
+     *   <li>latitude ∈ [-90, 90], longitude ∈ [-180, 180] (WGS84);</li>
+     *   <li>{@code has24h}/{@code hasDriveThrough} mogu biti true SAMO za {@code type=ATM}.</li>
+     * </ul>
+     */
+    @PrePersist
+    @PreUpdate
+    private void validateInvariants() {
+        if (latitude != null && (latitude.compareTo(BigDecimal.valueOf(-90)) < 0
+                || latitude.compareTo(BigDecimal.valueOf(90)) > 0)) {
+            throw new IllegalStateException("latitude mora biti u WGS84 opsegu [-90, 90]: " + latitude);
+        }
+        if (longitude != null && (longitude.compareTo(BigDecimal.valueOf(-180)) < 0
+                || longitude.compareTo(BigDecimal.valueOf(180)) > 0)) {
+            throw new IllegalStateException("longitude mora biti u WGS84 opsegu [-180, 180]: " + longitude);
+        }
+        if (type != BranchType.ATM
+                && (Boolean.TRUE.equals(has24h) || Boolean.TRUE.equals(hasDriveThrough))) {
+            throw new IllegalStateException(
+                    "has24h/hasDriveThrough mogu biti true samo za type=ATM (type=" + type + ")");
+        }
+    }
 }

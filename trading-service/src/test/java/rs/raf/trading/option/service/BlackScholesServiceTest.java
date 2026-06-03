@@ -65,6 +65,15 @@ class BlackScholesServiceTest {
             assertThat(price.doubleValue()).isLessThan(1);
         }
 
+        // [P2-input-validation-1 / R1 459] live-formula (T>0) ne sme vratiti negativnu cenu.
+        @Test
+        @DisplayName("very deep OTM call clamps to >= 0 (no negative price)")
+        void veryDeepOtmCall_nonNegative() {
+            // S=1, K=10000, mali sigma/T → live formula moze biti marginalno negativna pre clamp-a.
+            BigDecimal price = service.calculateCallPrice(1, 10000, 0.01, 0.05, 0.05);
+            assertThat(price.signum()).isGreaterThanOrEqualTo(0);
+        }
+
         @Test
         @DisplayName("higher volatility increases call price")
         void higherVolatilityIncreasesPrice() {
@@ -115,6 +124,14 @@ class BlackScholesServiceTest {
             BigDecimal price = service.calculatePutPrice(200, 50, 0.1, 0.05, 0.25);
 
             assertThat(price.doubleValue()).isLessThan(1);
+        }
+
+        // [P2-input-validation-1 / R1 459] live-formula (T>0) ne sme vratiti negativnu cenu.
+        @Test
+        @DisplayName("very deep OTM put clamps to >= 0 (no negative price)")
+        void veryDeepOtmPut_nonNegative() {
+            BigDecimal price = service.calculatePutPrice(10000, 1, 0.01, 0.05, 0.05);
+            assertThat(price.signum()).isGreaterThanOrEqualTo(0);
         }
     }
 

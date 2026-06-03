@@ -296,4 +296,37 @@ class TransactionEmailTemplateTest {
             assertThat(body).contains("automatska poruka");
         }
     }
+
+    // ── [P1-notif-svc-1 / 1528] HTML injection u detail rows ───────────────
+
+    @Test
+    void buildPaymentBody_escapesHtmlInAccountAndStatus() {
+        String body = template.buildPaymentBody(
+                new BigDecimal("100"), "RSD",
+                "<script>alert(1)</script>", "<img src=x onerror=alert(1)>",
+                LocalDate.of(2026, 3, 15), "<b>COMPLETED</b>");
+        assertThat(body).doesNotContain("<script>alert(1)</script>");
+        assertThat(body).doesNotContain("<img src=x");
+        assertThat(body).doesNotContain("<b>COMPLETED</b>");
+        assertThat(body).contains("&lt;script&gt;");
+        assertThat(body).contains("&lt;b&gt;COMPLETED&lt;/b&gt;");
+    }
+
+    @Test
+    void buildLoanRequestBody_escapesHtmlInLoanType() {
+        String body = template.buildLoanRequestBody(
+                "<a href='evil'>CASH</a>", new BigDecimal("100"), "RSD");
+        assertThat(body).doesNotContain("<a href='evil'>");
+        assertThat(body).contains("&lt;a href=");
+    }
+
+    @Test
+    void buildPaymentBody_preservesPlainAccountNumbers() {
+        // bezopasni brojevi racuna ostaju netaknuti (escape ne dira cifre)
+        String body = template.buildPaymentBody(
+                new BigDecimal("100"), "RSD", "2220001000000011", "2220001000000021",
+                LocalDate.of(2026, 3, 15), "Uspešno");
+        assertThat(body).contains("2220001000000011");
+        assertThat(body).contains("2220001000000021");
+    }
 }

@@ -37,4 +37,17 @@ public class ClientFundPosition {
 
     @Column(name = "last_modified_at", nullable = false)
     private LocalDateTime lastModifiedAt;
+
+    /**
+     * P1-funds-1 (1342/1620): optimistic-lock guard protiv lost-update na
+     * {@code totalInvested}. invest.upsertPosition i withdraw.decreasePosition
+     * rade read-modify-write bez locka; bez @Version konkurentni invest+withdraw
+     * (novac je vec presao banka-core) mogu pregaziti jedan drugog →
+     * {@code totalInvested} divergira od stvarno uplacenog. PG-DDL: INTEGER
+     * default 0 (NE boolean), @ColumnDefault da postojeci redovi dobiju 0.
+     */
+    @Version
+    @Column(name = "version", nullable = false)
+    @org.hibernate.annotations.ColumnDefault("0")
+    private Long version;
 }

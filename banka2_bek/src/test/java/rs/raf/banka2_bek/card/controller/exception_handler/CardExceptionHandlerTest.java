@@ -4,6 +4,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.authorization.AuthorizationDeniedException;
+import org.springframework.security.authorization.AuthorizationDecision;
 
 import java.util.Map;
 
@@ -16,6 +19,38 @@ class CardExceptionHandlerTest {
     @BeforeEach
     void setUp() {
         handler = new CardExceptionHandler();
+    }
+
+    @Test
+    void handleAccessDenied_returnsForbidden() {
+        AccessDeniedException ex = new AccessDeniedException("Access is denied");
+
+        ResponseEntity<Map<String, String>> response = handler.handleAccessDenied(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getBody()).containsEntry("error", "Access is denied");
+    }
+
+    @Test
+    void handlePreAuthorizeDenial_returnsForbiddenNot400() {
+        // P1-error-contract-1: @PreAuthorize denial baca AuthorizationDeniedException
+        // (extends AccessDeniedException). Pre fix-a scoped handleRuntime→400 ga je hvatao.
+        AuthorizationDeniedException ex =
+                new AuthorizationDeniedException("Access Denied", new AuthorizationDecision(false));
+
+        ResponseEntity<Map<String, String>> response = handler.handleAccessDenied(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    void handleAccessDenied_nullMessage_returnsForbiddenFallback() {
+        AccessDeniedException ex = new AccessDeniedException(null);
+
+        ResponseEntity<Map<String, String>> response = handler.handleAccessDenied(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(response.getBody()).containsEntry("error", "Forbidden");
     }
 
     @Test

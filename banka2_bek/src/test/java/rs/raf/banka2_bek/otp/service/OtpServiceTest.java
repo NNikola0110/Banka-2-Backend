@@ -9,17 +9,24 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import rs.raf.banka2_bek.auth.model.User;
 import rs.raf.banka2_bek.auth.repository.UserRepository;
+import rs.raf.banka2_bek.employee.model.Employee;
+import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.notification.NotificationPublisher;
 import rs.raf.banka2_bek.otp.model.TotpSecret;
+import rs.raf.banka2_bek.otp.repository.OtpConsumedCodeRepository;
 import rs.raf.banka2_bek.otp.repository.TotpSecretRepository;
+
+import org.springframework.dao.DataIntegrityViolationException;
 
 import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -29,20 +36,30 @@ import static org.mockito.Mockito.when;
 class OtpServiceTest {
 
     @Mock private UserRepository userRepository;
+    @Mock private EmployeeRepository employeeRepository;
     @Mock private TotpService totpService;
     @Mock private TotpSecretRepository totpSecretRepository;
     @Mock private NotificationPublisher notificationPublisher;
+    @Mock private OtpConsumedCodeRepository otpConsumedCodeRepository;
+    @Mock private OtpConsumedCodeWriter otpConsumedCodeWriter;
 
     private OtpService otpService;
 
     private static final int EMAIL_EXPIRY_MINUTES = 5;
+    private static final int MAX_FAILED_ATTEMPTS = 3; // R5-365: otp.max-attempts default
     private static final String EMAIL = "user@test.com";
     private static final Long USER_ID = 7L;
+    // P1-auth-2 (R2 1364): employee subject-id se offset-uje u disjunktan prostor.
+    private static final String EMPLOYEE_EMAIL = "employee@test.com";
+    private static final Long EMPLOYEE_ID = 7L; // namerno isti broj kao USER_ID — testira disjunktnost
+    private static final long EMPLOYEE_SUBJECT_ID_OFFSET = 1_000_000_000_000L;
+    private static final long EMPLOYEE_SUBJECT_ID = EMPLOYEE_SUBJECT_ID_OFFSET + EMPLOYEE_ID;
 
     @BeforeEach
     void setUp() {
         otpService = new OtpService(
-                userRepository, totpService, totpSecretRepository, notificationPublisher, EMAIL_EXPIRY_MINUTES);
+                userRepository, employeeRepository, totpService, totpSecretRepository, notificationPublisher,
+                otpConsumedCodeRepository, otpConsumedCodeWriter, EMAIL_EXPIRY_MINUTES, MAX_FAILED_ATTEMPTS);
     }
 
     private User user() {
@@ -50,6 +67,10 @@ class OtpServiceTest {
         u.setId(USER_ID);
         u.setEmail(EMAIL);
         return u;
+    }
+
+    private Employee employee() {
+        return Employee.builder().id(EMPLOYEE_ID).email(EMPLOYEE_EMAIL).build();
     }
 
     @Nested
@@ -144,6 +165,69 @@ class OtpServiceTest {
 
             assertThat(result.get("verified")).isEqualTo(true);
             assertThat((String) result.get("message")).contains("uspesno");
+            // N2: uspesna verifikacija MORA potrositi (consume) kod u single-use store.
+            // N2-a (V-1): consume ide kroz writer (REQUIRES_NEW), ne direktno repo.save.
+            verify(otpConsumedCodeWriter).consume(eq(USER_ID), anyString(), eq(null));
+        }
+
+        @Test
+        @DisplayName("N2: drugi put isti kod (replay) odbijen — verified=false, replayed=true")
+        void rejectsReplayOfAlreadyConsumedCode() {
+            when(userRepository.findByEmail(EMAIL)).thenReturn(Optional.of(user()));
+            // Single-use guard je PRE TOTP provere — totpService.verify se ne dosegne.
+            // Prvi verify uspeo i potrosio kod — drugi put store vec sadrzi (userId, codeHash).
+            when(otpConsumedCodeRepository.existsByUserIdAndCodeHash(eq(USER_ID), anyString()))
+                    .thenReturn(true);
+
+            Map<String, Object> result = otpService.verify(EMAIL, "123456");
+
+            assertThat(result.get("verified")).isEqualTo(false);
+            assertThat(result.get("replayed")).isEqualTo(true);
+            assertThat((String) result.get("message")).contains("vec iskoriscen");
+            // Ne sme se ponovo potrositi (nema dupli consume).
+            verify(otpConsumedCodeWriter, never()).consume(any(), any(), any());
+        }
+
+        @Test
+        @DisplayName("N2: konkurentni replay — UNIQUE violation na save → odbijen kao replay")
+        void rejectsConcurrentReplayViaUniqueViolation() {
+            when(userRepository.findByEmail(EMAIL)).thenReturn(Optional.of(user()));
+            when(totpService.verify(USER_ID, "123456")).thenReturn(true);
+            // existsBy vraca false (race: drugi thread jos nije commit-ovao), ali
+            // REQUIRES_NEW consume udari u UNIQUE constraint — atomicno odbijanje na DB nivou.
+            doThrow(new DataIntegrityViolationException("duplicate key uk_otp_consumed_user_code"))
+                    .when(otpConsumedCodeWriter).consume(eq(USER_ID), anyString(), eq(null));
+
+            Map<String, Object> result = otpService.verify(EMAIL, "123456");
+
+            assertThat(result.get("verified")).isEqualTo(false);
+            assertThat(result.get("replayed")).isEqualTo(true);
+            assertThat((String) result.get("message")).contains("vec iskoriscen");
+        }
+
+        @Test
+        @DisplayName("N2: legitiman jedan-OTP-jedna-transakcija prolazi (consume jednom)")
+        void legitimateSingleUseSucceeds() {
+            when(userRepository.findByEmail(EMAIL)).thenReturn(Optional.of(user()));
+            when(totpService.verify(USER_ID, "654321")).thenReturn(true);
+            when(otpConsumedCodeRepository.existsByUserIdAndCodeHash(eq(USER_ID), anyString()))
+                    .thenReturn(false);
+
+            Map<String, Object> result = otpService.verify(EMAIL, "654321");
+
+            assertThat(result.get("verified")).isEqualTo(true);
+            verify(otpConsumedCodeWriter).consume(eq(USER_ID), anyString(), eq(null));
+        }
+
+        @Test
+        @DisplayName("N2: pogresan kod se NE potrosi (nema consume save na mismatch)")
+        void wrongCodeIsNotConsumed() {
+            when(userRepository.findByEmail(EMAIL)).thenReturn(Optional.of(user()));
+            when(totpService.verify(USER_ID, "111111")).thenReturn(false);
+
+            otpService.verify(EMAIL, "111111");
+
+            verify(otpConsumedCodeWriter, never()).consume(any(), any(), any());
         }
 
         @Test
@@ -220,6 +304,28 @@ class OtpServiceTest {
         }
 
         @Test
+        @DisplayName("R5-365: otp.max-attempts je konfigurabilan — sa max=5 blokira tek na 5. pokusaju")
+        void maxAttemptsConfigurable() {
+            // Zaseban OtpService sa max=5 (umesto default 3) — pinuje da je vrednost
+            // sada citana iz @Value("${otp.max-attempts}") a ne hardkodirana konstanta.
+            OtpService svc5 = new OtpService(
+                    userRepository, employeeRepository, totpService, totpSecretRepository,
+                    notificationPublisher, otpConsumedCodeRepository, otpConsumedCodeWriter,
+                    EMAIL_EXPIRY_MINUTES, 5);
+            when(userRepository.findByEmail(EMAIL)).thenReturn(Optional.of(user()));
+            when(totpService.verify(USER_ID, "999999")).thenReturn(false);
+
+            for (int i = 1; i <= 4; i++) {
+                Map<String, Object> r = svc5.verify(EMAIL, "999999");
+                assertThat(r.get("blocked")).as("pokusaj %d sa max=5 ne sme biti blokiran", i).isEqualTo(false);
+                assertThat(r.get("maxAttempts")).isEqualTo(5);
+            }
+            Map<String, Object> fifth = svc5.verify(EMAIL, "999999");
+            assertThat(fifth.get("blocked")).isEqualTo(true);
+            assertThat(fifth.get("attempts")).isEqualTo(5);
+        }
+
+        @Test
         @DisplayName("BE-AUTH-01: missing TOTP secret takodje broji u failed attempts")
         void missingSecretCountsAsFailure() {
             when(userRepository.findByEmail(EMAIL)).thenReturn(Optional.of(user()));
@@ -244,6 +350,68 @@ class OtpServiceTest {
             assertThat(result.get("attempts")).isEqualTo(0);
             assertThat((String) result.get("message")).contains("nije pronadjen");
             verifyNoInteractions(totpService);
+        }
+
+        @Test
+        @DisplayName("P1-auth-2 (1364): EMPLOYEE OTP se resolvuje (User miss -> Employee) i prolazi verifikaciju")
+        void resolvesEmployeeWhenNoUser() {
+            // REPRODUKCIJA: ranije verify gledao samo userRepository -> employee-OTP
+            // akcija (Arbitro) uvek padala "kod nije pronadjen". Sada se resolvuje Employee.
+            when(userRepository.findByEmail(EMPLOYEE_EMAIL)).thenReturn(Optional.empty());
+            when(employeeRepository.findByEmail(EMPLOYEE_EMAIL)).thenReturn(Optional.of(employee()));
+            // Subject-id MORA biti offset-ovan, ne sirov employee id (disjunktnost od user-a).
+            when(totpService.verify(EMPLOYEE_SUBJECT_ID, "246810")).thenReturn(true);
+            when(otpConsumedCodeRepository.existsByUserIdAndCodeHash(eq(EMPLOYEE_SUBJECT_ID), anyString()))
+                    .thenReturn(false);
+
+            Map<String, Object> result = otpService.verify(EMPLOYEE_EMAIL, "246810");
+
+            assertThat(result.get("verified")).isEqualTo(true);
+            // consume i TOTP idu na OFFSET-ovan subject-id (ne raw EMPLOYEE_ID == USER_ID).
+            verify(totpService).verify(EMPLOYEE_SUBJECT_ID, "246810");
+            verify(otpConsumedCodeWriter).consume(eq(EMPLOYEE_SUBJECT_ID), anyString(), eq(null));
+        }
+
+        @Test
+        @DisplayName("P1-auth-2 (1364): User ima prednost — kad postoji i User i Employee istog email-a, koristi se User id")
+        void userTakesPrecedenceOverEmployee() {
+            when(userRepository.findByEmail(EMAIL)).thenReturn(Optional.of(user()));
+            when(totpService.verify(USER_ID, "135790")).thenReturn(true);
+
+            otpService.verify(EMAIL, "135790");
+
+            // Employee repo se ne konsultuje kad je User pronadjen (User-first).
+            verify(totpService).verify(USER_ID, "135790");
+            verify(employeeRepository, never()).findByEmail(anyString());
+        }
+    }
+
+    @Nested
+    @DisplayName("ensureSecret (employee fallback)")
+    class EnsureSecretEmployee {
+
+        @Test
+        @DisplayName("P1-auth-2 (1364): generateAndSend za EMPLOYEE koristi offset-ovan subject-id")
+        void generateForEmployeeUsesOffsetId() {
+            when(userRepository.findByEmail(EMPLOYEE_EMAIL)).thenReturn(Optional.empty());
+            when(employeeRepository.findByEmail(EMPLOYEE_EMAIL)).thenReturn(Optional.of(employee()));
+            when(totpSecretRepository.findByUserId(EMPLOYEE_SUBJECT_ID)).thenReturn(Optional.empty());
+            when(totpService.generateSecret(EMPLOYEE_SUBJECT_ID)).thenReturn("EMPSECRET");
+
+            otpService.generateAndSend(EMPLOYEE_EMAIL);
+
+            verify(totpService).generateSecret(EMPLOYEE_SUBJECT_ID);
+        }
+
+        @Test
+        @DisplayName("P1-auth-2 (1364): ensureSecret baca kad ni User ni Employee ne postoje")
+        void throwsWhenNeitherUserNorEmployee() {
+            when(userRepository.findByEmail("ghost@test.com")).thenReturn(Optional.empty());
+            when(employeeRepository.findByEmail("ghost@test.com")).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -> otpService.generateAndSend("ghost@test.com"))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("Korisnik nije pronadjen");
         }
     }
 }

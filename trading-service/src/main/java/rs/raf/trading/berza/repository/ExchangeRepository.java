@@ -16,11 +16,6 @@ public interface ExchangeRepository extends JpaRepository<Exchange, Long> {
     Optional<Exchange> findByAcronym(String acronym);
 
     /**
-     * Pronalazi berzu po MIC kodu (npr. "XNYS", "XBEL").
-     */
-    Optional<Exchange> findByMicCode(String micCode);
-
-    /**
      * Vraca sve aktivne berze.
      */
     List<Exchange> findByActiveTrue();

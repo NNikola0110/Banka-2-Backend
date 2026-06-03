@@ -116,7 +116,7 @@ public class InternalLookupService {
                             "Bankin racun u " + currencyCode + " ne postoji."));
             return toDto(account);
         }
-        throw new IllegalArgumentException("Unknown user role: " + userRole);
+        throw new UnknownUserRoleException(userRole);
     }
 
     /**
@@ -139,25 +139,63 @@ public class InternalLookupService {
     }
 
     /**
-     * Returns the permission strings for the employee identified by {@code email}.
-     * Returns an empty list if no employee with that email exists.
+     * Vraca permisije korisnika identifikovanog preko {@code email}.
+     *
+     * <p>Prvo trazi zaposlenog — ako postoji, vraca njegove eksplicitne permisije
+     * ({@code SUPERVISOR}, {@code AGENT}, {@code TRADE_STOCKS} ...).
+     *
+     * <p>Ako zaposlenog nema (npr. email je klijentov), pada na klijenta: klijent
+     * sa {@code canTradeStocks=true} razresava jedinu permisiju {@code TRADE_STOCKS}
+     * (FE AuthContext mapira isti flag → autoritet). Bez ovog fallback-a svaki
+     * klijent dobija 403 na {@code POST /orders} (P0-2), jer trading-service
+     * razresava per-permisija autoritete iskljucivo preko ovog endpoint-a.
+     *
+     * <p>Klijent sa {@code canTradeStocks=false}, kao i nepoznat email, vracaju
+     * praznu listu.
+     *
+     * <p>P2-config-2 (R1 403): lookup je case-INsensitive. Email se cuva u bazi
+     * onako kako je unet pri registraciji (bez normalizacije), a JWT subject moze
+     * doci sa drugacijim case-om → exact {@code findByEmail} bi vratio prazno →
+     * klijent gubi {@code TRADE_STOCKS} → 403 na trgovinu. Mirror login-putanje
+     * ({@code findByEmailIgnoreCase}).
      */
     @Transactional(readOnly = true)
     public List<String> getUserPermissions(String email) {
-        return employeeRepository.findByEmail(email)
-                .map(Employee::getPermissions)
-                .map(perms -> (List<String>) new ArrayList<>(perms))
+        Employee employee = employeeRepository.findByEmailIgnoreCase(email).orElse(null);
+        if (employee != null) {
+            return new ArrayList<>(employee.getPermissions());
+        }
+        return clientRepository.findByEmailIgnoreCase(email)
+                .filter(client -> Boolean.TRUE.equals(client.getCanTradeStocks()))
+                .map(client -> List.of("TRADE_STOCKS"))
                 .orElse(Collections.emptyList());
+    }
+
+    /**
+     * OT-1061: vraca id-eve svih AKTIVNIH supervizora (zaposleni sa
+     * {@code SUPERVISOR} permisijom). Koristi ga interni
+     * {@code GET /internal/users/supervisors} endpoint da trading-service razresi
+     * primaoce tax-FX-failure notifikacije — trading nema listu supervizora pa je
+     * rezolvuje preko ovog banka-core seam-a (mirror {@code getUserPermissions}
+     * obrasca: trading donosi authz/notify odluke iz banka-core izvora istine).
+     */
+    @Transactional(readOnly = true)
+    public List<Long> getSupervisorIds() {
+        return employeeRepository.findActiveEmployeeIdsByPermission(
+                rs.raf.banka2_bek.auth.util.UserRole.SUPERVISOR);
     }
 
     /**
      * Razresava identitet korisnika (numericki id + rola) na osnovu email-a.
      * Trazi prvo medju klijentima, pa medju zaposlenima.
      * Baca {@link IllegalArgumentException} (→ 404) ako nijedan ne postoji.
+     *
+     * <p>P2-config-2 (R1 403): case-INsensitive (isto kao {@link #getUserPermissions})
+     * da identity resolve ne razilazi sa permission resolve na razlicit case email-a.
      */
     @Transactional(readOnly = true)
     public InternalUserDto getUserByEmail(String email) {
-        Client client = clientRepository.findByEmail(email).orElse(null);
+        Client client = clientRepository.findByEmailIgnoreCase(email).orElse(null);
         if (client != null) {
             // Klijent nema radno mesto — position je null.
             return new InternalUserDto(
@@ -165,7 +203,7 @@ public class InternalLookupService {
                     client.getFirstName(), client.getLastName(),
                     Boolean.TRUE.equals(client.getActive()), null);
         }
-        Employee employee = employeeRepository.findByEmail(email).orElse(null);
+        Employee employee = employeeRepository.findByEmailIgnoreCase(email).orElse(null);
         if (employee != null) {
             return new InternalUserDto(
                     employee.getId(), "EMPLOYEE", email,
@@ -199,7 +237,7 @@ public class InternalLookupService {
                     employee.getFirstName(), employee.getLastName(),
                     Boolean.TRUE.equals(employee.getActive()), employee.getPosition());
         }
-        throw new IllegalArgumentException("Unknown user role: " + userRole);
+        throw new UnknownUserRoleException(userRole);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -208,6 +246,13 @@ public class InternalLookupService {
         return (value == null || value.isBlank()) ? null : value;
     }
 
+    /**
+     * R1-713: za sistemske racune (FUND / BANK_TRADING / MARGIN) ne postoji
+     * klijent/kompanija vlasnik, pa umesto generickog "Unknown" vracamo eksplicitan
+     * sistemski label izveden iz {@link AccountCategory}. Tako trading-service prikaz
+     * jasno oznacava bankine/fond pool racune umesto da ih predstavi kao nepoznatog
+     * vlasnika (zavaravajuce u audit/UI prikazu).
+     */
     private String resolveOwnerName(Account account) {
         if (account.getClient() != null) {
             return account.getClient().getFirstName() + " " + account.getClient().getLastName();
@@ -215,7 +260,16 @@ public class InternalLookupService {
         if (account.getCompany() != null) {
             return account.getCompany().getName();
         }
-        return "Unknown";
+        AccountCategory category = account.getAccountCategory();
+        if (category != null) {
+            return switch (category) {
+                case FUND -> "Investicioni fond (sistemski)";
+                case BANK_TRADING -> "Banka 2 (sistemski)";
+                case MARGIN -> "Margin racun (sistemski)";
+                case CLIENT -> "Nepoznat vlasnik";
+            };
+        }
+        return "Nepoznat vlasnik";
     }
 
     /**

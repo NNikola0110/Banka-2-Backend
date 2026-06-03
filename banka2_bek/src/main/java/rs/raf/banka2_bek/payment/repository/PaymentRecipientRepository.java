@@ -18,4 +18,8 @@ public interface PaymentRecipientRepository extends JpaRepository<PaymentRecipie
     Optional<PaymentRecipient> findByIdAndClient(Long id, Client client);
 
     boolean existsByIdAndClient(Long id, Client client);
+
+    // R1-647: dedup primaoca — isti klijent ne treba da ima N identicnih unosa
+    // (isti broj racuna). Aplikativni guard (bez DB UNIQUE indeksa da ne diramo schema).
+    boolean existsByClientAndAccountNumber(Client client, String accountNumber);
 }

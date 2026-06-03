@@ -44,6 +44,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -376,6 +377,129 @@ class DividendServiceTest {
         verify(dividendPayoutRepository, never()).findAllByOrderByPaymentDateDesc(any());
     }
 
+    // ── OT-1150: getAdminDividendHistory — samo 'to' defaultuje 'from' na epoch ─
+
+    @Test
+    void getAdminDividendHistory_toOnlyDefaultsEpochAsFrom() {
+        // OT-1150 (TEST-tr-funds-dividends-profitbank-1): kad je zadan SAMO 'to',
+        // 'from' se defaultuje na 1970-01-01 (epoch) — pokriva drugu granu (else if
+        // to != null) koju Test 9 (from-only) ne dira.
+        LocalDate to = LocalDate.of(2025, 6, 30);
+        LocalDate epoch = LocalDate.of(1970, 1, 1);
+        Pageable pageable = PageRequest.of(0, 20);
+
+        when(dividendPayoutRepository.findByPaymentDateBetween(eq(epoch), eq(to), eq(pageable)))
+                .thenReturn(new PageImpl<>(List.of()));
+
+        dividendService.getAdminDividendHistory(null, to, pageable);
+
+        verify(dividendPayoutRepository, times(1))
+                .findByPaymentDateBetween(eq(epoch), eq(to), eq(pageable));
+        verify(dividendPayoutRepository, never()).findAllByOrderByPaymentDateDesc(any());
+    }
+
+    @Test
+    void getAdminDividendHistory_bothFromAndTo_usesProvidedRange() {
+        // OT-1150: kad su zadati i 'from' i 'to', koristi tacno taj opseg (bez
+        // defaultovanja nijedne granice).
+        LocalDate from = LocalDate.of(2025, 1, 1);
+        LocalDate to = LocalDate.of(2025, 12, 31);
+        Pageable pageable = PageRequest.of(0, 50);
+
+        when(dividendPayoutRepository.findByPaymentDateBetween(eq(from), eq(to), eq(pageable)))
+                .thenReturn(new PageImpl<>(List.of()));
+
+        dividendService.getAdminDividendHistory(from, to, pageable);
+
+        verify(dividendPayoutRepository, times(1))
+                .findByPaymentDateBetween(eq(from), eq(to), eq(pageable));
+        verify(dividendPayoutRepository, never()).findAllByOrderByPaymentDateDesc(any());
+    }
+
+    @Test
+    void getAdminDividendHistory_noFilters_returnsFullHistory() {
+        // OT-1150: kad nijedan datum nije zadat, vraca kompletnu istoriju
+        // (findAllByOrderByPaymentDateDesc), bez between filtera.
+        Pageable pageable = PageRequest.of(0, 20);
+        when(dividendPayoutRepository.findAllByOrderByPaymentDateDesc(eq(pageable)))
+                .thenReturn(new PageImpl<>(List.of()));
+
+        dividendService.getAdminDividendHistory(null, null, pageable);
+
+        verify(dividendPayoutRepository, times(1)).findAllByOrderByPaymentDateDesc(eq(pageable));
+        verify(dividendPayoutRepository, never()).findByPaymentDateBetween(any(), any(), any());
+    }
+
+    // ── OT-1151: EMPLOYEE (tax-exempt) RSD fallback kad bankin valutni racun fali
+
+    @Test
+    void payDividend_employeeBankTradingAccountMissing_fallsBackToRsd() {
+        // OT-1151 (TEST-tr-funds-dividends-profitbank-1): za EMPLOYEE (aktuar,
+        // tax-exempt) ciljni je bankin trading racun u valuti listinga. Ako taj
+        // racun ne postoji (banka-core 4xx -> resolveBankTradingAccount vraca null),
+        // dividenda se konvertuje u RSD i kreditira bankin RSD trading racun.
+        // Test 2 pokriva SAMO happy USD putanju; ovo pokriva RSD fallback granu.
+        LocalDate paymentDate = LocalDate.of(2025, 12, 31);
+        Portfolio position = buildPortfolio(15L, "EMPLOYEE", 10L, 10);
+        Listing listing = buildListing(new BigDecimal("100.00"), new BigDecimal("0.08"), "USD");
+
+        when(portfolioRepository.findAllStockPositionsWithQuantity())
+                .thenReturn(List.of(position));
+        when(dividendPayoutRepository.findByStockListingIdAndPaymentDate(10L, paymentDate))
+                .thenReturn(List.of());
+        when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
+        // bankin USD trading racun ne postoji -> 404 -> RSD fallback
+        when(bankaCoreClient.getBankTradingAccount("USD"))
+                .thenThrow(new BankaCoreClientException(404, "no USD bank trading account"));
+        BigDecimal convertedRsd = new BigDecimal("2360.0000"); // gross 20 USD -> ~2360 RSD
+        when(currencyConversionService.convert(any(), eq("USD"), eq("RSD")))
+                .thenReturn(convertedRsd);
+        when(bankaCoreClient.getBankTradingAccount("RSD"))
+                .thenReturn(stubAccount(900L, "RSD"));
+        when(dividendPayoutRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        dividendService.processQuarterlyDividends(paymentDate);
+
+        // konverzija USD->RSD i RSD bankin racun moraju biti korisceni
+        verify(currencyConversionService).convert(any(), eq("USD"), eq("RSD"));
+        verify(bankaCoreClient).getBankTradingAccount("RSD");
+
+        ArgumentCaptor<CreditFundsRequest> reqCaptor =
+                ArgumentCaptor.forClass(CreditFundsRequest.class);
+        verify(bankaCoreClient).creditFunds(anyString(), reqCaptor.capture());
+        CreditFundsRequest req = reqCaptor.getValue();
+        assertThat(req.accountId()).isEqualTo(900L);
+        assertThat(req.currencyCode()).isEqualTo("RSD");
+        assertThat(req.amount()).isEqualByComparingTo(convertedRsd);
+
+        ArgumentCaptor<DividendPayout> payoutCaptor = ArgumentCaptor.forClass(DividendPayout.class);
+        verify(dividendPayoutRepository).save(payoutCaptor.capture());
+        DividendPayout saved = payoutCaptor.getValue();
+        assertThat(saved.getTaxExempt()).isTrue();
+        assertThat(saved.getTax()).isEqualByComparingTo(BigDecimal.ZERO);
+        assertThat(saved.getCurrencyCode()).isEqualTo("RSD");
+    }
+
+    @Test
+    void payDividend_employeeBankTradingAccount500_propagatesNotSwallowed() {
+        // OT-1151: 5xx od banka-core (banka-core dole) NE sme tiho na RSD fallback —
+        // propagira se (resolveBankTradingAccount baca za >=500).
+        LocalDate paymentDate = LocalDate.of(2025, 12, 31);
+        Portfolio position = buildPortfolio(16L, "EMPLOYEE", 10L, 10);
+        Listing listing = buildListing(new BigDecimal("100.00"), new BigDecimal("0.08"), "USD");
+
+        when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
+        when(bankaCoreClient.getBankTradingAccount("USD"))
+                .thenThrow(new BankaCoreClientException(503, "banka-core down"));
+
+        // payDividendForOwner direktno (zaobilazi catch u processQuarterlyDividends koji
+        // svaku gresku guta) — 5xx mora da izleti, ne tihi RSD fallback.
+        assertThatThrownBy(() -> dividendService.payDividendForOwner(position, paymentDate))
+                .isInstanceOf(BankaCoreClientException.class);
+        verify(bankaCoreClient, never()).getBankTradingAccount("RSD");
+        verify(bankaCoreClient, never()).creditFunds(anyString(), any());
+    }
+
     // ── Test 10a: TODO_final C4 #14 / Sc 70 — dispatch po politici fonda ──────
 
     /**
@@ -403,10 +527,11 @@ class DividendServiceTest {
 
         dividendService.dispatchFundDividendsByPolicy();
 
-        verify(fundDividendService, times(1)).reinvestDividends(1L);
-        verify(fundDividendService, never()).reinvestDividends(2L);
-        verify(fundDividendService, times(1)).distributeDividendsToClients(2L);
-        verify(fundDividendService, never()).distributeDividendsToClients(1L);
+        // R1 796: per-fund reinvest-vs-distribute switch zivi sad u
+        // FundDividendService.dispatchByPolicy(fund); DividendService samo delegira.
+        // Granjanje po reinvest flagu pokriva FundDividendServiceTest.
+        verify(fundDividendService, times(1)).dispatchByPolicy(reinvestFund);
+        verify(fundDividendService, times(1)).dispatchByPolicy(distributeFund);
     }
 
     /**
@@ -428,14 +553,14 @@ class DividendServiceTest {
 
         when(investmentFundRepository.findByActiveTrueOrderByNameAsc())
                 .thenReturn(List.of(failingFund, okFund));
-        when(fundDividendService.reinvestDividends(1L))
-                .thenThrow(new RuntimeException("boom"));
+        doThrow(new RuntimeException("boom"))
+                .when(fundDividendService).dispatchByPolicy(failingFund);
 
         dividendService.dispatchFundDividendsByPolicy();
 
-        verify(fundDividendService).reinvestDividends(1L);
+        verify(fundDividendService).dispatchByPolicy(failingFund);
         // I dalje pokusava drugi fond uprkos gresci u prvom.
-        verify(fundDividendService).distributeDividendsToClients(2L);
+        verify(fundDividendService).dispatchByPolicy(okFund);
     }
 
     /**
@@ -455,8 +580,80 @@ class DividendServiceTest {
 
         dividendService.dispatchFundDividendsByPolicy();
 
-        verify(fundDividendService).distributeDividendsToClients(7L);
-        verify(fundDividendService, never()).reinvestDividends(7L);
+        // Delegira na dispatchByPolicy; null->distribute granjanje pokriva FundDividendServiceTest.
+        verify(fundDividendService).dispatchByPolicy(legacyFund);
+    }
+
+    // ── P1-dividends-order-1 (R1 227): underpay — sumira sve Portfolio redove ──
+
+    /**
+     * Vlasnik sa VISE Portfolio redova za istu hartiju (parcijalni fillovi)
+     * mora dobiti dividendu na UKUPNU kolicinu, ne samo na prvi red.
+     * Pre fix-a: grupisalo se po (owner,role,listing) ali se placalo samo
+     * {@code group.get(0).getQuantity()} -> underpay.
+     */
+    @Test
+    void processQuarterlyDividends_sumsAllPortfolioRowsForSameSecurity() {
+        LocalDate paymentDate = LocalDate.of(2025, 12, 31);
+        // Isti vlasnik (CLIENT #8), ista hartija (listing 10), dva reda: 7 + 3 = 10 kom.
+        Portfolio row1 = buildPortfolio(8L, "CLIENT", 10L, 7);
+        Portfolio row2 = buildPortfolio(8L, "CLIENT", 10L, 3);
+        Listing listing = buildListing(new BigDecimal("100.00"), new BigDecimal("0.08"), "USD");
+
+        when(portfolioRepository.findAllStockPositionsWithQuantity())
+                .thenReturn(List.of(row1, row2));
+        when(dividendPayoutRepository.findByStockListingIdAndPaymentDate(10L, paymentDate))
+                .thenReturn(List.of());
+        when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
+        when(bankaCoreClient.getPreferredAccount("CLIENT", 8L, "USD"))
+                .thenReturn(stubAccount(80L, "USD"));
+        when(dividendPayoutRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        dividendService.processQuarterlyDividends(paymentDate);
+
+        ArgumentCaptor<DividendPayout> captor = ArgumentCaptor.forClass(DividendPayout.class);
+        verify(dividendPayoutRepository).save(captor.capture());
+        DividendPayout saved = captor.getValue();
+
+        // Kvantitet = 7+3 = 10; gross = 10 * 100 * (0.08/4) = 20.0000 (ne 14.0000 za samo 7 kom).
+        assertThat(saved.getQuantity()).isEqualTo(10);
+        assertThat(saved.getGrossAmount()).isEqualByComparingTo(new BigDecimal("20.0000"));
+    }
+
+    // ── P1-dividends-order-1 (R5 1843): truncate-pre-mnozenja ─────────────────
+
+    /**
+     * Za veliki quantity, zaokruzivanje quarterlyYield-a na scale-6 PRE mnozenja
+     * sa (qty×price) akumulira gresku do celih jedinica valute. Fix racuna
+     * gross u jednom lancu (qty×price×annualYield/4), zaokruzuje tek na kraju.
+     */
+    @Test
+    void payDividendForOwner_largeQuantity_noTruncationLoss() {
+        LocalDate paymentDate = LocalDate.of(2025, 12, 31);
+        // annualYield 0.0333 -> /4 = 0.008325 (egzaktno na 6 decimala u ovom slucaju
+        // nije problem), pa biramo yield koji se NE deli cisto na 6 decimala:
+        // 0.0001 / 4 = 0.000025 — ali da bismo videli truncation, koristimo yield
+        // ciji /4 ima 7+ znacajnih decimala: 0.01 / 4 = 0.0025 (cisto). Uzmimo
+        // annualYield = 0.001 -> /4 = 0.00025 (cisto). Da iznudimo truncation, treba
+        // /4 da ima vise od 6 decimala: annualYield = 0.0000004 -> /4 = 0.0000001.
+        // Realnije: koristimo yield koji u scale-6 gubi rep. annualYield = 0.013 ->
+        // /4 = 0.00325 (cisto). annualYield = 0.0133 -> /4 = 0.003325 (cisto, 6 dec).
+        // Truncation se vidi tek kad /4 ima 7. decimalu: annualYield = 0.00001 ->
+        // /4 = 0.0000025 -> scale6 round = 0.000003 (HALF_UP). Sa qty=1_000_000 i
+        // price=100: tacno = 1_000_000*100*0.00001/4 = 250.0000;
+        // truncate-pre = 1_000_000*100*round6(0.0000025=>0.000003) = 300.0000 -> greska 50.
+        int qty = 1_000_000;
+        Portfolio position = buildPortfolio(9L, "EMPLOYEE", 10L, qty); // EMPLOYEE = tax-exempt, gross==net
+        Listing listing = buildListing(new BigDecimal("100.00"), new BigDecimal("0.00001"), "USD");
+
+        when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
+        when(bankaCoreClient.getBankTradingAccount("USD")).thenReturn(stubAccount(90L, "USD"));
+        when(dividendPayoutRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        DividendPayout result = dividendService.payDividendForOwner(position, paymentDate);
+
+        // Egzaktno: 1_000_000 * 100 * 0.00001 / 4 = 250.0000 (NE 300.0000).
+        assertThat(result.getGrossAmount()).isEqualByComparingTo(new BigDecimal("250.0000"));
     }
 
     // ── Test 10: payDividendForOwner cuva prosledjeni paymentDate nepromenjeno ─
@@ -467,7 +664,11 @@ class DividendServiceTest {
         // Prosledi subotu direktno servisu — on je samo cuva.
         LocalDate saturday = LocalDate.of(2025, 12, 27); // subota
         Portfolio position = buildPortfolio(7L, "CLIENT", 10L, 2);
-        Listing listing = buildListing(new BigDecimal("50.00"), new BigDecimal("0.04"), "EUR");
+        // R1 797: baseCurrency je relevantan SAMO za FOREX listinge (vidi
+        // ListingCurrencyResolver.resolve). Ova akcija nije FOREX, pa valuta pada
+        // na "USD" fallback — zato je i account stub ispod za "USD". Ranije je
+        // stajalo "EUR" sto je zavaravalo (no-op, nikad nije menjalo razresenu valutu).
+        Listing listing = buildListing(new BigDecimal("50.00"), new BigDecimal("0.04"), "USD");
 
         when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
         when(bankaCoreClient.getPreferredAccount("CLIENT", 7L, "USD"))

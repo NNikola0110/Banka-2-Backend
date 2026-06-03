@@ -118,6 +118,29 @@ class ActuaryServiceImplIntegrationTest {
     }
 
     @Test
+    @org.springframework.transaction.annotation.Transactional
+    @DisplayName("R1-740: bulk resetAllUsedLimits (scheduler put) resetuje SAMO agente — supervizor usedLimit netaknut")
+    void bulkResetAllUsedLimitsTouchesOnlyAgents() {
+        // Supervizor sa NE-null usedLimit-om (ne realisticno spec-ski, ali dokazuje
+        // da bulk JPQL ne dira SUPERVISOR red posle R1-740 WHERE actuaryType=AGENT).
+        ActuaryInfo nina = actuaryInfoRepository.findByEmployeeId(SUPERVISOR_NINA_ID).orElseThrow();
+        nina.setUsedLimit(new BigDecimal("777.00"));
+        actuaryInfoRepository.saveAndFlush(nina);
+
+        int updated = actuaryInfoRepository.resetAllUsedLimits();
+
+        ActuaryInfo refreshedMarko = actuaryInfoRepository.findByEmployeeId(AGENT_MARKO_ID).orElseThrow();
+        ActuaryInfo refreshedJelena = actuaryInfoRepository.findByEmployeeId(AGENT_JELENA_ID).orElseThrow();
+        ActuaryInfo refreshedNina = actuaryInfoRepository.findByEmployeeId(SUPERVISOR_NINA_ID).orElseThrow();
+
+        // Samo 2 agenta azurirana; supervizor netaknut (i dalje 777).
+        assertEquals(2, updated);
+        assertEquals(0, refreshedMarko.getUsedLimit().compareTo(BigDecimal.ZERO));
+        assertEquals(0, refreshedJelena.getUsedLimit().compareTo(BigDecimal.ZERO));
+        assertEquals(0, refreshedNina.getUsedLimit().compareTo(new BigDecimal("777.00")));
+    }
+
+    @Test
     @DisplayName("updateAgentLimit menja samo trazena polja i cuva ih u bazi")
     void updateAgentLimitPersistsChanges() {
         authenticateAsSupervisor();
@@ -128,14 +151,16 @@ class ActuaryServiceImplIntegrationTest {
 
         ActuaryInfoDto result = actuaryService.updateAgentLimit(AGENT_MARKO_ID, dto);
 
-        assertEquals(new BigDecimal("250000.00"), result.getDailyLimit());
+        // R4-1772: usedLimit/dailyLimit se sada persistuju u scale-4 (numeric(19,4)),
+        // pa poredimo vrednosno (compareTo), ne striktno po scale-u.
+        assertEquals(0, result.getDailyLimit().compareTo(new BigDecimal("250000.00")));
         assertTrue(result.isNeedApproval());
-        assertEquals(new BigDecimal("15000.00"), result.getUsedLimit());
+        assertEquals(0, result.getUsedLimit().compareTo(new BigDecimal("15000.00")));
 
         ActuaryInfo refreshed = actuaryInfoRepository.findByEmployeeId(AGENT_MARKO_ID).orElseThrow();
-        assertEquals(new BigDecimal("250000.00"), refreshed.getDailyLimit());
+        assertEquals(0, refreshed.getDailyLimit().compareTo(new BigDecimal("250000.00")));
         assertTrue(refreshed.isNeedApproval());
-        assertEquals(new BigDecimal("15000.00"), refreshed.getUsedLimit());
+        assertEquals(0, refreshed.getUsedLimit().compareTo(new BigDecimal("15000.00")));
     }
 
     @Test
@@ -148,6 +173,7 @@ class ActuaryServiceImplIntegrationTest {
         ActuaryInfo refreshedMarko = actuaryInfoRepository.findByEmployeeId(AGENT_MARKO_ID).orElseThrow();
         ActuaryInfo refreshedJelena = actuaryInfoRepository.findByEmployeeId(AGENT_JELENA_ID).orElseThrow();
         assertEquals(0, refreshedMarko.getUsedLimit().compareTo(BigDecimal.ZERO));
-        assertEquals(new BigDecimal("999.99"), refreshedJelena.getUsedLimit());
+        // R4-1772: scale-4 persistencija → compareTo umesto striktnog equals.
+        assertEquals(0, refreshedJelena.getUsedLimit().compareTo(new BigDecimal("999.99")));
     }
 }

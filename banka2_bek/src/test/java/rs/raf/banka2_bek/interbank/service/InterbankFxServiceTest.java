@@ -28,14 +28,14 @@ class InterbankFxServiceTest {
     private InterbankFxService fxService;
 
     @Test
-    @DisplayName("Same-currency klijent fee: vraca razliku kao commission, target = source - fee")
-    void quoteOutbound_sameCurrencyWithFee_returnsCommission() {
-        InterbankFxService.InterbankFxQuote quote = fxService.quoteOutboundPayment(
-                new BigDecimal("100"), "RSD", "RSD", true);
+    @DisplayName("Inbound settlement same-currency: rate=1, fee=0, recipient = amount (regression guard)")
+    void quoteInboundSettlement_sameCurrency_noFeeNoConversion() {
+        InterbankFxService.InterbankFxQuote quote = fxService.quoteInboundSettlement(
+                new BigDecimal("250"), "RSD", "RSD");
 
-        assertThat(quote.isCrossCurrency()).isFalse();
-        assertThat(quote.commission()).isEqualByComparingTo("0.5000");
-        assertThat(quote.targetAmount()).isEqualByComparingTo("99.5000");
+        assertThat(quote.sourceCurrency()).isEqualTo(quote.targetCurrency());
+        assertThat(quote.commission()).isEqualByComparingTo("0");
+        assertThat(quote.targetAmount()).isEqualByComparingTo("250");
         assertThat(quote.midRate()).isEqualByComparingTo("1");
         assertThat(quote.effectiveRate()).isEqualByComparingTo("1");
         verify(currencyConversionService, never()).convertForPurchase(
@@ -43,93 +43,61 @@ class InterbankFxServiceTest {
     }
 
     @Test
-    @DisplayName("Same-currency bez fee-a (banka settlement): commission = 0")
-    void quoteBankSettlement_sameCurrency_zeroFee() {
-        InterbankFxService.InterbankFxQuote quote = fxService.quoteBankSettlement(
-                new BigDecimal("250"), "EUR", "EUR");
-
-        assertThat(quote.isCrossCurrency()).isFalse();
-        assertThat(quote.commission()).isEqualByComparingTo("0");
-        assertThat(quote.targetAmount()).isEqualByComparingTo("250");
-        verify(currencyConversionService, never()).convertForPurchase(
-                any(), any(), any(), anyBoolean());
-    }
-
-    @Test
-    @DisplayName("Cross-currency klijent fee: target je mid-rate konverzija, commission iz wrap-a")
-    void quoteOutbound_crossCurrencyWithFee_delegatesToConversionService() {
+    @DisplayName("Inbound settlement cross-currency: Banka B konvertuje mid-rate, naplacuje 0.5% proviziju; recipient = converted − fee")
+    void quoteInboundSettlement_crossCurrency_convertsMinusCommission() {
+        // 117000 RSD → mid-rate 0.008547 → 999.9990 EUR; fee = 0.5% = 5.0000;
+        // recipient credit = 994.9990 EUR ("Krajnja vrednost").
         when(currencyConversionService.convertForPurchase(
-                new BigDecimal("100"), "USD", "RSD", true))
+                new BigDecimal("117000"), "RSD", "EUR", false))
                 .thenReturn(new ConversionResult(
-                        new BigDecimal("11055.5500"),
-                        new BigDecimal("55.5500"),
-                        new BigDecimal("110.5555"),
-                        new BigDecimal("110.0000")));
-
-        InterbankFxService.InterbankFxQuote quote = fxService.quoteOutboundPayment(
-                new BigDecimal("100"), "USD", "RSD", true);
-
-        assertThat(quote.isCrossCurrency()).isTrue();
-        assertThat(quote.sourceAmount()).isEqualByComparingTo("100");
-        assertThat(quote.targetAmount()).isEqualByComparingTo("11000.0000");
-        assertThat(quote.commission()).isEqualByComparingTo("55.5500");
-        assertThat(quote.midRate()).isEqualByComparingTo("110.0000");
-        assertThat(quote.effectiveRate()).isEqualByComparingTo("110.5555");
-        assertThat(quote.sourceCurrency()).isEqualTo("USD");
-        assertThat(quote.targetCurrency()).isEqualTo("RSD");
-    }
-
-    @Test
-    @DisplayName("Cross-currency bez fee-a: target = mid-rate amount, commission = 0")
-    void quoteBankSettlement_crossCurrency_noFee() {
-        when(currencyConversionService.convertForPurchase(
-                new BigDecimal("100"), "EUR", "RSD", false))
-                .thenReturn(new ConversionResult(
-                        new BigDecimal("11700.0000"),
+                        new BigDecimal("999.9990"),
                         BigDecimal.ZERO,
-                        new BigDecimal("117.0000"),
-                        new BigDecimal("117.0000")));
+                        new BigDecimal("0.008547"),
+                        new BigDecimal("0.008547")));
 
-        InterbankFxService.InterbankFxQuote quote = fxService.quoteBankSettlement(
-                new BigDecimal("100"), "EUR", "RSD");
+        InterbankFxService.InterbankFxQuote quote = fxService.quoteInboundSettlement(
+                new BigDecimal("117000"), "RSD", "EUR");
 
-        assertThat(quote.isCrossCurrency()).isTrue();
-        assertThat(quote.targetAmount()).isEqualByComparingTo("11700.0000");
-        assertThat(quote.commission()).isEqualByComparingTo("0");
-        assertThat(quote.midRate()).isEqualByComparingTo("117.0000");
+        assertThat(quote.sourceCurrency()).isNotEqualTo(quote.targetCurrency());
+        assertThat(quote.sourceAmount()).isEqualByComparingTo("117000");
+        assertThat(quote.commission()).isEqualByComparingTo("5.0000");
+        assertThat(quote.targetAmount()).isEqualByComparingTo("994.9990");
+        assertThat(quote.midRate()).isEqualByComparingTo("0.008547");
+        assertThat(quote.sourceCurrency()).isEqualTo("RSD");
+        assertThat(quote.targetCurrency()).isEqualTo("EUR");
     }
 
     @Test
-    @DisplayName("Negativan iznos baca IllegalArgumentException")
-    void quoteOutbound_negativeAmount_throws() {
-        assertThatThrownBy(() -> fxService.quoteOutboundPayment(
-                new BigDecimal("-1"), "USD", "RSD", true))
+    @DisplayName("Inbound settlement: negativan iznos baca IllegalArgumentException")
+    void quoteInboundSettlement_negativeAmount_throws() {
+        assertThatThrownBy(() -> fxService.quoteInboundSettlement(
+                new BigDecimal("-1"), "RSD", "EUR"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("positive");
     }
 
     @Test
-    @DisplayName("Zero iznos baca IllegalArgumentException")
-    void quoteOutbound_zeroAmount_throws() {
-        assertThatThrownBy(() -> fxService.quoteOutboundPayment(
-                BigDecimal.ZERO, "USD", "RSD", true))
+    @DisplayName("Inbound settlement: zero iznos baca IllegalArgumentException")
+    void quoteInboundSettlement_zeroAmount_throws() {
+        assertThatThrownBy(() -> fxService.quoteInboundSettlement(
+                BigDecimal.ZERO, "USD", "RSD"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("positive");
     }
 
     @Test
-    @DisplayName("Null source currency baca IllegalArgumentException")
-    void quoteOutbound_nullSourceCurrency_throws() {
-        assertThatThrownBy(() -> fxService.quoteOutboundPayment(
-                new BigDecimal("100"), null, "RSD", true))
+    @DisplayName("Inbound settlement: null source currency baca IllegalArgumentException")
+    void quoteInboundSettlement_nullSourceCurrency_throws() {
+        assertThatThrownBy(() -> fxService.quoteInboundSettlement(
+                new BigDecimal("100"), null, "RSD"))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
     @DisplayName("Currency code se vraca uppercase u quote-u")
-    void quoteOutbound_returnsUppercaseCurrencyCodes() {
-        InterbankFxService.InterbankFxQuote quote = fxService.quoteOutboundPayment(
-                new BigDecimal("100"), "rsd", "rsd", false);
+    void quoteInboundSettlement_returnsUppercaseCurrencyCodes() {
+        InterbankFxService.InterbankFxQuote quote = fxService.quoteInboundSettlement(
+                new BigDecimal("100"), "rsd", "rsd");
 
         assertThat(quote.sourceCurrency()).isEqualTo("RSD");
         assertThat(quote.targetCurrency()).isEqualTo("RSD");

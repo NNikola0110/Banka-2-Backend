@@ -22,6 +22,11 @@ import rs.raf.banka2_bek.notification.repository.NotificationRepository;
 import javax.sql.DataSource;
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -150,6 +155,67 @@ class InternalNotificationsControllerIntegrationTest {
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.OK);
 
         assertThat(notificationRepository.count()).isEqualTo(1);
+    }
+
+    @Test
+    void postNotification_parallelRetriesSameKey_persistsExactlyOnce() throws InterruptedException {
+        // P2-notif-reliability-2 (R1 383): ATOMICAN dedup. N paralelnih retry-a istog
+        // kljuca (npr. trading retry + scheduler re-fire u isto vreme) sme da napravi
+        // TACNO JEDAN red u notifications. Stari check-then-act je dozvoljavao da vise
+        // paralelnih zahteva prodje read-proveru i SVI upisu notifikaciju.
+        String body = """
+                {
+                  "recipientId": 7,
+                  "recipientType": "CLIENT",
+                  "type": "ORDER_EXECUTED",
+                  "title": "Order izvrsen",
+                  "message": "Body",
+                  "referenceType": "ORDER",
+                  "referenceId": 42,
+                  "idempotencyKey": "test-notif-parallel-001"
+                }
+                """;
+
+        int threads = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+        AtomicInteger created = new AtomicInteger();
+        AtomicInteger okReplay = new AtomicInteger();
+
+        for (int i = 0; i < threads; i++) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    ResponseEntity<String> resp = restTemplate.postForEntity(
+                            url("/internal/notifications"),
+                            new HttpEntity<>(body, internalHeaders()),
+                            String.class);
+                    if (resp.getStatusCode() == HttpStatus.CREATED) {
+                        created.incrementAndGet();
+                    } else if (resp.getStatusCode() == HttpStatus.OK) {
+                        okReplay.incrementAndGet();
+                    }
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+
+        start.countDown(); // okini sve niti istovremeno
+        assertThat(done.await(30, TimeUnit.SECONDS)).isTrue();
+        pool.shutdownNow();
+
+        // KLJUCNA invarijanta: tacno jedan red u notifications (ne 8).
+        assertThat(notificationRepository.count())
+                .as("paralelni retry-i istog idempotency kljuca smeju da naprave TACNO 1 notifikaciju")
+                .isEqualTo(1);
+        // Tacno jedan 201 (rezervisao kljuc); ostali 200 (duplikat).
+        assertThat(created.get()).isEqualTo(1);
+        assertThat(created.get() + okReplay.get()).isEqualTo(threads);
+        assertThat(internalRequestRepository.findByIdempotencyKey("test-notif-parallel-001")).isPresent();
     }
 
     @Test

@@ -120,4 +120,28 @@ class GetMyOrdersFilteringTest {
     void getMyOrders_unknownListingType_ignoredGracefully() {
         assertDoesNotThrow(() -> orderService.getMyOrders(0, 10, null, null, null, "OPTION"));
     }
+
+    @Test
+    @DisplayName("P2-perf-nplus1-1 (R5 1896): size=10000 je clamp-ovan na MAX_PAGE_SIZE (100)")
+    void getMyOrders_sizeClampedTo100_R5_1896() {
+        org.mockito.ArgumentCaptor<Pageable> cap = org.mockito.ArgumentCaptor.forClass(Pageable.class);
+
+        orderService.getMyOrders(0, 10000, null, null, null, null);
+
+        verify(orderRepository).findAll(any(Specification.class), cap.capture());
+        assertEquals(OrderServiceImpl.MAX_PAGE_SIZE, cap.getValue().getPageSize(),
+                "size=10000 mora biti clamp-ovan na 100 (DoS guard)");
+        assertEquals(100, cap.getValue().getPageSize());
+    }
+
+    @Test
+    @DisplayName("P2-perf-nplus1-1 (R5 1896): size unutar granice prolazi nepromenjen")
+    void getMyOrders_sizeWithinLimitUnchanged_R5_1896() {
+        org.mockito.ArgumentCaptor<Pageable> cap = org.mockito.ArgumentCaptor.forClass(Pageable.class);
+
+        orderService.getMyOrders(0, 25, null, null, null, null);
+
+        verify(orderRepository).findAll(any(Specification.class), cap.capture());
+        assertEquals(25, cap.getValue().getPageSize());
+    }
 }

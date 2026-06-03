@@ -370,6 +370,24 @@ class ListingServiceImplTest {
         }
 
         @Test
+        @DisplayName("OT-1049: DAY period bez danasnjeg refresh-a (nema zapisa za danas) -> prazna lista")
+        void dayPeriod_noRefreshToday_returnsEmpty() {
+            // Refresh cron (15min) jos nije snimio cenu za danas → repo vraca praznu
+            // listu; servis ne sme da padne, vraca [] (chart je prazan dok prvi tick
+            // ne stigne). Pin trenutnog ponasanja za "DAY bez refresh-a".
+            mockAsEmployee();
+            Listing l = listing("AAPL", "Apple", ListingType.STOCK);
+            when(listingRepository.findById(1L)).thenReturn(Optional.of(l));
+            when(dailyPriceRepository.findByListingIdAndDate(eq(1L), eq(LocalDate.now())))
+                    .thenReturn(List.of());
+
+            var result = listingService.getListingHistory(1L, "DAY");
+
+            verify(dailyPriceRepository).findByListingIdAndDate(1L, LocalDate.now());
+            assertThat(result).isEmpty();
+        }
+
+        @Test
         @DisplayName("WEEK period poziva findByListingIdAndDateAfterOrderByDateDesc sa danas - 7 dana")
         void weekPeriod_callsFindByDateAfter() {
             mockAsEmployee();
@@ -504,6 +522,27 @@ class ListingServiceImplTest {
 
             verify(listingRepository, times(1))
                     .findAll(ArgumentMatchers.<Specification<Listing>>any(), any(Pageable.class));
+        }
+
+        @Test
+        @DisplayName("OT-1045 (Sc25): filtriranje po NEPOSTOJECEM exchange prefiksu -> prazna stranica "
+                + "(ListingSpec exchangePrefix LIKE ne matchuje nijedan acronym)")
+        void nonExistentExchangePrefix_returnsEmptyPage() {
+            // Sc25: listing sa nepostojece berze se ne prikazuje. ListingSpec dodaje
+            // `lower(exchangeAcronym) LIKE 'nonexistent%'` predikat; posto nijedan
+            // listing nema taj acronym, repo vraca praznu stranicu. Servis to verno
+            // propagira (bez izmisljanja rezultata).
+            mockAsEmployee();
+            when(listingRepository.findAll(ArgumentMatchers.<Specification<Listing>>any(), any(Pageable.class)))
+                    .thenReturn(Page.empty());
+
+            var result = listingService.getListings(
+                    "STOCK", null, "NONEXISTENT_EXCHANGE", null, null, null, null, 0, 20);
+
+            assertThat(result.getContent()).isEmpty();
+            assertThat(result.getTotalElements()).isZero();
+            verify(listingRepository).findAll(
+                    ArgumentMatchers.<Specification<Listing>>any(), any(Pageable.class));
         }
 
         @Test

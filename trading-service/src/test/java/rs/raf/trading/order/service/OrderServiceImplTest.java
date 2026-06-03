@@ -137,6 +137,12 @@ class OrderServiceImplTest {
         lenient().when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(anyLong(), anyString(), anyLong()))
                 .thenReturn(Optional.of(testPortfolio));
         lenient().when(currencyConversionService.getRate(anyString(), anyString())).thenReturn(BigDecimal.ONE);
+        // §66/R1-183: convertToRsdForLimit zove convert(amount, listing, "RSD").
+        // Default mid-rate=1 (identitet) → postojeci testovi (USD listing, ali rate 1)
+        // ostaju zeleni; testovi koji dokazuju RSD-konverziju eksplicitno stubuju convert.
+        lenient().when(currencyConversionService.convert(
+                any(BigDecimal.class), anyString(), anyString()))
+                .thenAnswer(inv -> inv.getArgument(0));
         lenient().when(currencyConversionService.convertForPurchase(
                 any(BigDecimal.class), anyString(), anyString(), anyBoolean()))
                 .thenAnswer(inv -> new CurrencyConversionService.ConversionResult(
@@ -231,6 +237,59 @@ class OrderServiceImplTest {
         }
 
         @Test
+        @DisplayName("R1 407 — contractSize se uzima iz listinga (autoritativno), klijentski DTO se ignorise")
+        void contractSizeReconciledFromListing() {
+            // Futures-like listing sa contractSize=10. Klijent salje contractSize=1
+            // (pokusava da umanji rezervaciju). Order MORA da koristi 10 (iz listinga).
+            CreateOrderDto dto = validMarketBuyDto();
+            dto.setContractSize(1); // klijentski "lowball"
+            asClient();
+            testListing.setContractSize(10); // autoritativna vrednost hartije
+            when(listingRepository.findById(1L)).thenReturn(Optional.of(testListing));
+            // calculateApproximatePrice se poziva sa efektivnim contractSize-om (10).
+            when(listingPriceService.getPricePerUnit(any(), any(), any(), any()))
+                    .thenReturn(new BigDecimal("151"));
+            when(listingPriceService.calculateApproximatePrice(anyInt(), any(), anyInt()))
+                    .thenReturn(new BigDecimal("7550.0000"));
+            when(orderStatusService.determineStatus(eq("CLIENT"), eq(CLIENT_ID), any()))
+                    .thenReturn(OrderStatus.APPROVED);
+            stubSave();
+
+            orderService.createOrder(dto);
+
+            // calculateApproximatePrice je pozvan sa contractSize=10 (ne 1 iz DTO-a).
+            org.mockito.ArgumentCaptor<Integer> csCaptor =
+                    org.mockito.ArgumentCaptor.forClass(Integer.class);
+            verify(listingPriceService).calculateApproximatePrice(csCaptor.capture(), any(), anyInt());
+            assertEquals(10, csCaptor.getValue().intValue());
+
+            // Persistovani order takodje nosi reconciled contractSize=10.
+            ArgumentCaptor<Order> orderCaptor = ArgumentCaptor.forClass(Order.class);
+            verify(orderRepository).save(orderCaptor.capture());
+            assertEquals(10, orderCaptor.getValue().getContractSize().intValue());
+        }
+
+        @Test
+        @DisplayName("R1 407 — listing bez contractSize (akcija) → efektivni contractSize = 1")
+        void contractSizeDefaultsToOneForStock() {
+            CreateOrderDto dto = validMarketBuyDto();
+            dto.setContractSize(5); // klijent salje 5, ali akcija nema contractSize
+            asClient();
+            testListing.setContractSize(null); // akcija — nema contractSize
+            when(listingRepository.findById(1L)).thenReturn(Optional.of(testListing));
+            stubPriceServices("151", "755.0000");
+            when(orderStatusService.determineStatus(eq("CLIENT"), eq(CLIENT_ID), any()))
+                    .thenReturn(OrderStatus.APPROVED);
+            stubSave();
+
+            orderService.createOrder(dto);
+
+            ArgumentCaptor<Order> orderCaptor = ArgumentCaptor.forClass(Order.class);
+            verify(orderRepository).save(orderCaptor.capture());
+            assertEquals(1, orderCaptor.getValue().getContractSize().intValue());
+        }
+
+        @Test
         @DisplayName("CLIENT BUY — rezervise sredstva preko FundReservationService")
         void clientBuyReservesFunds() {
             CreateOrderDto dto = validMarketBuyDto();
@@ -252,6 +311,68 @@ class OrderServiceImplTest {
             assertTrue(saved.getReservedAmount().compareTo(BigDecimal.ZERO) > 0);
             assertNotNull(saved.getApprovedAt());
             verify(fundReservationService).reserveForBuy(any(Order.class));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    @Nested
+    @DisplayName("Sc32 — futures sa isteklim settlement datumom se odbija PRI KREIRANJU")
+    class ExpiredFuturesUpfrontReject {
+
+        private Listing expiredFutures() {
+            Listing f = new Listing();
+            f.setId(1L);
+            f.setTicker("CLZ20");
+            f.setName("Crude Oil Dec 2020");
+            f.setListingType(ListingType.FUTURES);
+            f.setExchangeAcronym("NYMEX");
+            f.setPrice(new BigDecimal("50"));
+            f.setAsk(new BigDecimal("51"));
+            f.setBid(new BigDecimal("49"));
+            f.setContractSize(1000);
+            // Settlement u proslosti.
+            f.setSettlementDate(java.time.LocalDate.now().minusDays(1));
+            return f;
+        }
+
+        @Test
+        @DisplayName("Sc32: klijent (auto-approve) — istekli futures → IllegalArgumentException 'istekao' PRE save-a/rezervacije")
+        void clientExpiredFutures_rejectedUpfront_noSaveNoReservation() {
+            CreateOrderDto dto = validMarketBuyDto();
+            asClient();
+            when(listingRepository.findById(1L)).thenReturn(Optional.of(expiredFutures()));
+
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                    () -> orderService.createOrder(dto));
+            assertTrue(ex.getMessage().toLowerCase().contains("istekao"),
+                    "poruka mora reci da je ugovor istekao: " + ex.getMessage());
+
+            // Upfront-reject: order se NIKAD ne sacuva ni rezervise (za razliku od
+            // ranijeg ponasanja gde je order kreiran pa ga je executor declime-ovao).
+            verify(orderRepository, never()).save(any(Order.class));
+            verify(fundReservationService, never()).reserveForBuy(any(Order.class));
+            // Status nikad nije ni odredjen (guard je pre Step 7).
+            verify(orderStatusService, never()).determineStatus(anyString(), anyLong(), any());
+        }
+
+        @Test
+        @DisplayName("Sc32: granica — settlement TODAY (nije u proslosti) → NIJE odbijen upfront (order se kreira)")
+        void settlementToday_notRejected() {
+            CreateOrderDto dto = validMarketBuyDto();
+            Listing todayFutures = expiredFutures();
+            todayFutures.setSettlementDate(java.time.LocalDate.now()); // danas, ne proslost
+            todayFutures.setContractSize(1); // mali contract size da rezervacija stane u client balans (10000)
+            asClient();
+            when(listingRepository.findById(1L)).thenReturn(Optional.of(todayFutures));
+            stubPriceServices("51", "255.0000");
+            when(orderStatusService.determineStatus(eq("CLIENT"), eq(CLIENT_ID), any()))
+                    .thenReturn(OrderStatus.APPROVED);
+            stubSave();
+
+            OrderDto result = orderService.createOrder(dto);
+
+            assertNotNull(result);
+            verify(orderRepository).save(any(Order.class));
         }
     }
 
@@ -360,6 +481,52 @@ class OrderServiceImplTest {
             assertEquals("APPROVED", result.getStatus());
             verify(actuaryInfoRepository).save(info);
             assertEquals(new BigDecimal("1755.0000"), info.getUsedLimit());
+        }
+
+        @Test
+        @DisplayName("§66/R1-183 — AGENT BUY na USD hartiji: usedLimit raste za RSD-konvertovan iznos (ne sirov USD)")
+        void agentBuyUsedLimitInRsd() {
+            CreateOrderDto dto = validMarketBuyDto();
+            asEmployee();
+            ActuaryInfo info = agentInfo(new BigDecimal("1000"));
+            // listing je USD (NASDAQ); approx 755 USD → RSD po mid-rate-u 117 = 88335.
+            when(listingRepository.findById(1L)).thenReturn(Optional.of(testListing));
+            stubPriceServices("151", "755.0000");
+            when(currencyConversionService.convert(new BigDecimal("755.0000"), "USD", "RSD"))
+                    .thenReturn(new BigDecimal("88335.0000"));
+            when(orderStatusService.determineStatus(eq("EMPLOYEE"), eq(EMPLOYEE_ID), any()))
+                    .thenReturn(OrderStatus.APPROVED);
+            when(orderStatusService.getAgentInfo(EMPLOYEE_ID)).thenReturn(Optional.of(info));
+            stubSave();
+
+            orderService.createOrder(dto);
+
+            // §66: limit-check dobija RSD-konvertovanu cenu (88335), ne sirov USD 755.
+            verify(orderStatusService).determineStatus("EMPLOYEE", EMPLOYEE_ID, new BigDecimal("88335.0000"));
+            verify(actuaryInfoRepository).save(info);
+            // usedLimit += RSD iznos (1000 + 88335), ne 1000 + 755.
+            assertEquals(new BigDecimal("89335.0000"), info.getUsedLimit());
+        }
+
+        @Test
+        @DisplayName("R2-1355 — AGENT SELL ne troši usedLimit (limit je kontrola kupovine)")
+        void agentSellDoesNotConsumeUsedLimit() {
+            CreateOrderDto dto = validMarketSellDto();
+            asEmployee();
+            ActuaryInfo info = agentInfo(new BigDecimal("1000"));
+            lenient().when(orderValidationService.parseDirection(anyString())).thenReturn(OrderDirection.SELL);
+            when(listingRepository.findById(1L)).thenReturn(Optional.of(testListing));
+            stubPriceServices("149", "745.0000");
+            when(orderStatusService.determineStatus(eq("EMPLOYEE"), eq(EMPLOYEE_ID), any()))
+                    .thenReturn(OrderStatus.APPROVED);
+            // SELL portfolio dostupan iz default stub-a (testPortfolio qty=30).
+            stubSave();
+
+            orderService.createOrder(dto);
+
+            // SELL: usedLimit NE raste, ActuaryInfo se ne dira za increment.
+            verify(actuaryInfoRepository, never()).save(any());
+            assertEquals(new BigDecimal("1000"), info.getUsedLimit());
         }
 
         @Test
@@ -670,13 +837,15 @@ class OrderServiceImplTest {
         }
 
         @Test
-        @DisplayName("Order nije PENDING → IllegalStateException")
+        @DisplayName("Order nije PENDING → OrderStateConflictException (R1 410, →409)")
         void approveOrderNotPending() {
             Order o = pendingOrder(OrderDirection.BUY);
             o.setStatus(OrderStatus.APPROVED);
             when(orderRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(o));
 
-            assertThrows(IllegalStateException.class, () -> orderService.approveOrder(1L));
+            // R1 410: state-conflict je 409 (OrderStateConflictException), ne IllegalState→403.
+            assertThrows(rs.raf.trading.order.exception.OrderStateConflictException.class,
+                    () -> orderService.approveOrder(1L));
             verify(orderRepository, never()).save(any());
         }
 
@@ -840,12 +1009,14 @@ class OrderServiceImplTest {
         }
 
         @Test
-        @DisplayName("Order nije PENDING ni APPROVED → IllegalStateException")
+        @DisplayName("Order nije PENDING ni APPROVED → OrderStateConflictException (R1 410, →409)")
         void declineOrderNotPending() {
             Order o = order(OrderDirection.BUY, OrderStatus.DONE);
             when(orderRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(o));
 
-            assertThrows(IllegalStateException.class, () -> orderService.declineOrder(1L));
+            // R1 410: state-conflict je 409 (OrderStateConflictException), ne IllegalState→403.
+            assertThrows(rs.raf.trading.order.exception.OrderStateConflictException.class,
+                    () -> orderService.declineOrder(1L));
             verify(orderRepository, never()).save(any());
         }
 
@@ -1141,6 +1312,95 @@ class OrderServiceImplTest {
             when(orderRepository.findById(999L)).thenReturn(Optional.empty());
 
             assertThrows(EntityNotFoundException.class, () -> orderService.getOrderById(999L));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    @Nested
+    @DisplayName("R5 1878 — computeBuyReservation: createOrder i approveOrder se NE divergiraju")
+    class BuyReservationParity {
+
+        private InternalAccountDto rsdClientAccount() {
+            // CLIENT RSD racun + USD listing → FX marza + provizija se obracunavaju.
+            return account(100L, "RSD", "CLIENT", new BigDecimal("100000000.0000"));
+        }
+
+        /** convertForPurchase: primeni FX marzu (rate 117.5, +1% kad chargeFx) + 1% komisiju. */
+        private void stubFxConvertWithMarginAndCommission() {
+            lenient().when(currencyConversionService.convertForPurchase(
+                    any(BigDecimal.class), eq("USD"), eq("RSD"), anyBoolean()))
+                    .thenAnswer(inv -> {
+                        BigDecimal amt = inv.getArgument(0);
+                        boolean chargeFx = inv.getArgument(3);
+                        BigDecimal mid = new BigDecimal("117.5");
+                        BigDecimal midAmount = amt.multiply(mid).setScale(4, java.math.RoundingMode.HALF_UP);
+                        if (!chargeFx) {
+                            return new CurrencyConversionService.ConversionResult(
+                                    midAmount, BigDecimal.ZERO, mid, mid);
+                        }
+                        BigDecimal effRate = mid.multiply(new BigDecimal("1.01"));
+                        BigDecimal gross = amt.multiply(effRate).setScale(4, java.math.RoundingMode.HALF_UP);
+                        BigDecimal commission = gross.subtract(midAmount).setScale(4, java.math.RoundingMode.HALF_UP);
+                        return new CurrencyConversionService.ConversionResult(gross, commission, effRate, mid);
+                    });
+            lenient().when(currencyConversionService.getRate("USD", "RSD")).thenReturn(new BigDecimal("117.5"));
+        }
+
+        @Test
+        @DisplayName("CLIENT BUY (USD listing / RSD racun): createOrder i approveOrder daju ISTI reservedAmount")
+        void createOrderAndApproveOrder_produceIdenticalReservedAmount() {
+            stubFxConvertWithMarginAndCommission();
+            BigDecimal approx = new BigDecimal("1000.0000"); // USD
+
+            // ── createOrder put (status PENDING da ne ide u rezervaciju, ali totalReservation se racuna) ──
+            CreateOrderDto dto = validMarketBuyDto();
+            asClient();
+            when(listingRepository.findById(1L)).thenReturn(Optional.of(testListing));
+            stubPriceServices("151", approx.toPlainString());
+            when(bankaCoreClient.getAccount(100L)).thenReturn(rsdClientAccount());
+            when(orderStatusService.determineStatus(eq("CLIENT"), eq(CLIENT_ID), any()))
+                    .thenReturn(OrderStatus.PENDING);
+            stubSave();
+
+            orderService.createOrder(dto);
+
+            ArgumentCaptor<Order> createCap = ArgumentCaptor.forClass(Order.class);
+            verify(orderRepository, atLeastOnce()).save(createCap.capture());
+            BigDecimal createReserved = createCap.getValue().getReservedAmount();
+            BigDecimal createFx = createCap.getValue().getFxCommission();
+            assertNotNull(createReserved);
+            assertTrue(createReserved.compareTo(BigDecimal.ZERO) > 0);
+
+            // ── approveOrder put (isti approximatePrice + USD listing + RSD racun) ──
+            reset(orderRepository);
+            Order pending = new Order();
+            pending.setId(1L);
+            pending.setStatus(OrderStatus.PENDING);
+            pending.setListing(testListing);
+            pending.setUserId(CLIENT_ID);
+            pending.setUserRole("CLIENT");
+            pending.setDirection(OrderDirection.BUY);
+            pending.setOrderType(OrderType.MARKET);
+            pending.setQuantity(5);
+            pending.setContractSize(1);
+            pending.setApproximatePrice(approx);
+            pending.setAccountId(100L);
+            pending.setReservedAccountId(100L);
+            pending.setRemainingPortions(5);
+
+            when(orderRepository.findByIdForUpdate(1L)).thenReturn(Optional.of(pending));
+            when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
+            when(bankaCoreClient.getAccount(100L)).thenReturn(rsdClientAccount());
+            securityAuthorities("ROLE_EMPLOYEE", "SUPERVISOR");
+            when(tradingUserResolver.resolveCurrent()).thenReturn(new UserContext(10L, "EMPLOYEE"));
+
+            orderService.approveOrder(1L);
+
+            // R5 1878: ista matematika (computeBuyReservation) → ISTI reservedAmount + fxCommission.
+            assertEquals(0, createReserved.compareTo(pending.getReservedAmount()),
+                    "createOrder i approveOrder MORAJU da daju isti reservedAmount (R5 1878)");
+            assertEquals(0, createFx.compareTo(pending.getFxCommission()),
+                    "createOrder i approveOrder MORAJU da daju istu FX proviziju (R5 1878)");
         }
     }
 }

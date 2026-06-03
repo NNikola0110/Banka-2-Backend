@@ -131,6 +131,64 @@ class OptionMapperTest {
     }
 
     @Test
+    void toDto_callOption_atTheMoney_notInTheMoney() {
+        // OT-1099: ATM granica — current == strike. Za CALL je ITM samo kad je
+        // current STRIKTNO vece od strike-a (compareTo > 0). Na granici (jednako)
+        // → NIJE in-the-money. Postojeci testovi pokrivaju > i < ali ne == granicu.
+        Option option = new Option();
+        option.setId(20L);
+        option.setTicker("AAPL260402C00185000");
+        option.setOptionType(OptionType.CALL);
+        option.setStrikePrice(BigDecimal.valueOf(185));
+
+        BigDecimal currentPrice = BigDecimal.valueOf(185); // == strike => ATM
+
+        OptionDto dto = OptionMapper.toDto(option, currentPrice);
+
+        assertThat(dto.isInTheMoney()).isFalse();
+    }
+
+    @Test
+    void toDto_putOption_atTheMoney_notInTheMoney() {
+        // OT-1099: ATM granica za PUT — ITM samo kad je current STRIKTNO manje od
+        // strike-a (compareTo < 0). Na granici (jednako) → NIJE in-the-money.
+        Option option = new Option();
+        option.setId(21L);
+        option.setTicker("AAPL260402P00185000");
+        option.setOptionType(OptionType.PUT);
+        option.setStrikePrice(BigDecimal.valueOf(185));
+
+        BigDecimal currentPrice = BigDecimal.valueOf(185); // == strike => ATM
+
+        OptionDto dto = OptionMapper.toDto(option, currentPrice);
+
+        assertThat(dto.isInTheMoney()).isFalse();
+    }
+
+    @Test
+    void toDto_atTheMoney_scaleDifference_stillNotInTheMoney() {
+        // OT-1099: ATM granica robustna na razliku skale (compareTo, ne equals):
+        // 185 vs 185.00 su numericki jednaki → ATM → ni CALL ni PUT nije ITM.
+        Option call = new Option();
+        call.setId(22L);
+        call.setTicker("X");
+        call.setOptionType(OptionType.CALL);
+        call.setStrikePrice(new BigDecimal("185.00"));
+
+        OptionDto callDto = OptionMapper.toDto(call, new BigDecimal("185"));
+        assertThat(callDto.isInTheMoney()).isFalse();
+
+        Option put = new Option();
+        put.setId(23L);
+        put.setTicker("Y");
+        put.setOptionType(OptionType.PUT);
+        put.setStrikePrice(new BigDecimal("185"));
+
+        OptionDto putDto = OptionMapper.toDto(put, new BigDecimal("185.00"));
+        assertThat(putDto.isInTheMoney()).isFalse();
+    }
+
+    @Test
     void toDto_nullCurrentPrice_inTheMoneyNotSet() {
         Option option = new Option();
         option.setId(5L);

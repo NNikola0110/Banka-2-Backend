@@ -40,10 +40,4 @@ public class ProfitBankController {
         // banke i userRole = "CLIENT" (vidi InvestmentFundService.listBankPositions).
         return ResponseEntity.ok(investmentFundService.listBankPositions());
     }
-
-    // Buduci optional endpoint-i (Celina 4 (Nova) §4585-4628):
-    //   POST /profit-bank/fund-positions/{fundId}/invest  — supervizor uplata u ime banke
-    //   POST /profit-bank/fund-positions/{fundId}/withdraw — supervizor povlacenje u ime banke
-    // InvestmentFundService.invest/withdraw vec pokriva ovaj scenario sa userRole=CLIENT i
-    // userId=ownerClientId banke; dodatni endpointi su redundantni za trenutni demo flow.
 }

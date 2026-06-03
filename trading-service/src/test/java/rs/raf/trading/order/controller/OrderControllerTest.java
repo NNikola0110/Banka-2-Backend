@@ -15,8 +15,6 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
-import rs.raf.banka2.contracts.internal.InternalOtpVerifyResponse;
-import rs.raf.trading.client.BankaCoreClient;
 import rs.raf.trading.common.TradingGlobalExceptionHandler;
 import rs.raf.trading.order.controller.exception_handler.OrderExceptionHandler;
 import rs.raf.trading.order.dto.CreateOrderDto;
@@ -28,15 +26,14 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 /**
- * Test {@link OrderController} POST /orders — adaptacija monolitnog testa
- * (faza 2c). OTP verifikacija ide preko {@link BankaCoreClient#verifyOtp}
- * (umesto monolitnog {@code OtpService}); exception handling kroz
+ * Test {@link OrderController} POST /orders. ACCEPTED-DEVIATION (user-directed
+ * 03.06): OTP gate je uklonjen sa kreiranja ordera — kontroler kreira nalog
+ * direktno (bez {@code BankaCoreClient.verifyOtp}); exception handling kroz
  * {@link TradingGlobalExceptionHandler} + {@link OrderExceptionHandler}.
  */
 @ExtendWith(MockitoExtension.class)
@@ -50,9 +47,6 @@ class OrderControllerTest {
     @Mock
     private OrderService orderService;
 
-    @Mock
-    private BankaCoreClient bankaCoreClient;
-
     @InjectMocks
     private OrderController orderController;
 
@@ -64,9 +58,7 @@ class OrderControllerTest {
                 .build();
         SecurityContextHolder.getContext().setAuthentication(
                 new UsernamePasswordAuthenticationToken("test@example.com", null));
-        // OTP verify uvek uspesan u ovim testovima — OTP gate je pokriven OrderControllerOtpTest-om.
-        when(bankaCoreClient.verifyOtp(anyString(), anyString()))
-                .thenReturn(new InternalOtpVerifyResponse(true, false));
+        // ACCEPTED-DEVIATION (03.06): OTP gate je uklonjen — nema verifyOtp stub-a.
     }
 
     @AfterEach
@@ -196,8 +188,13 @@ class OrderControllerTest {
         }
 
         @Test
-        @DisplayName("Nedostaje accountId → 400")
-        void missingAccountIdReturns400() throws Exception {
+        @DisplayName("Nedostaje accountId — prolazi controller validaciju (accountId je opcioni "
+                + "zbog fund-trade XOR-a); servis odlucuje. Klijent bez racuna → 404")
+        void missingAccountId_passesValidation_serviceGoverns() throws Exception {
+            // ACCEPTED-DEVIATION (03.06): bez OTP @NotBlank gate-a vise nema
+            // controller-level 400 za ovaj body. accountId NIJE @NotNull (opcioni
+            // za fund-trade XOR), pa zahtev stize do servisa. Za klijenta bez racuna
+            // servis baca EntityNotFoundException("Racun ne postoji: null") → 404.
             String json = """
                     {
                       "listingId": 1,
@@ -208,10 +205,14 @@ class OrderControllerTest {
                     }
                     """;
 
+            when(orderService.createOrder(any()))
+                    .thenThrow(new EntityNotFoundException("Racun ne postoji: null"));
+
             mockMvc.perform(post("/orders")
                             .contentType(MediaType.APPLICATION_JSON)
                             .content(json))
-                    .andExpect(status().isBadRequest());
+                    .andExpect(status().isNotFound())
+                    .andExpect(jsonPath("$.error").value("Racun ne postoji: null"));
         }
 
         @Test

@@ -18,25 +18,61 @@ import java.util.stream.Collectors;
 @Order(Ordered.HIGHEST_PRECEDENCE)
 public class TransferExceptionHandler {
 
+    /**
+     * P0-B9 N4 (IDOR): ownership guard u {@code TransferService.getTransferById}
+     * baca {@link org.springframework.security.access.AccessDeniedException} kad
+     * klijent pokusa da procita tudji transfer. Ovaj scoped handler je
+     * HIGHEST_PRECEDENCE pa hvata RuntimeException PRE globalnog
+     * {@code GlobalExceptionHandler.handleAccessDenied}; bez eksplicitnog mappinga
+     * AccessDeniedException bi padala u generic else-granu -> 500. Mora -> 403.
+     * Deklarisan PRE handleRuntime jer Spring bira najspecifičniji handler, ali
+     * eksplicitan tip uklanja svaku dvosmislenost.
+     */
+    @ExceptionHandler(org.springframework.security.access.AccessDeniedException.class)
+    public ResponseEntity<Map<String, Object>> handleAccessDenied(
+            org.springframework.security.access.AccessDeniedException ex) {
+        String msg = ex.getMessage() != null ? ex.getMessage() : "Forbidden";
+        return buildResponse(HttpStatus.FORBIDDEN, msg);
+    }
+
+    /**
+     * R1 340 — TIPIZOVANO mapiranje (zamenjuje raniji fragilni {@code msg.contains(...)}
+     * string-match koji je "Authenticated client not found" slao na 404, a "Unable to
+     * resolve user email" / nepokrivene business-poruke tiho na 500).
+     * {@code TransferService} sada baca konkretne tipove:
+     * <ul>
+     *   <li>{@link rs.raf.banka2_bek.transfers.service.TransferAuthException} → 401</li>
+     *   <li>{@link jakarta.persistence.EntityNotFoundException} → 404</li>
+     *   <li>{@link IllegalArgumentException} (validacija / insufficient / not-active /
+     *       reserves — ocuvan postojeci 400 kontrakt) → 400</li>
+     *   <li>{@link org.springframework.security.access.AccessDeniedException} → 403 (gore)</li>
+     * </ul>
+     * Nepoznat/neocekivan {@code RuntimeException} ostaje 500 (vise NE business-leak —
+     * svi poznati ishodi su tipizovani).
+     */
+    @ExceptionHandler(rs.raf.banka2_bek.transfers.service.TransferAuthException.class)
+    public ResponseEntity<Map<String, Object>> handleAuth(
+            rs.raf.banka2_bek.transfers.service.TransferAuthException ex) {
+        return buildResponse(HttpStatus.UNAUTHORIZED,
+                ex.getMessage() != null ? ex.getMessage() : "Unauthorized");
+    }
+
+    @ExceptionHandler(jakarta.persistence.EntityNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNotFound(jakarta.persistence.EntityNotFoundException ex) {
+        return buildResponse(HttpStatus.NOT_FOUND,
+                ex.getMessage() != null ? ex.getMessage() : "Not found");
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, Object>> handleBadRequest(IllegalArgumentException ex) {
+        return buildResponse(HttpStatus.BAD_REQUEST,
+                ex.getMessage() != null ? ex.getMessage() : "Bad request");
+    }
+
     @ExceptionHandler(RuntimeException.class)
     public ResponseEntity<Map<String, Object>> handleRuntime(RuntimeException ex) {
-        String msg = ex.getMessage();
-        if (msg == null) msg = "Internal server error";
-
-        HttpStatus status;
-        if (msg.contains("not found")) {
-            status = HttpStatus.NOT_FOUND;
-        } else if (msg.contains("Insufficient funds") || msg.contains("not active")
-                || msg.contains("must be different") || msg.contains("same currency")
-                || msg.contains("different currencies") || msg.contains("do not have access")) {
-            status = HttpStatus.BAD_REQUEST;
-        } else if (msg.contains("not authenticated") || msg.contains("Client not found for authenticated")) {
-            status = HttpStatus.UNAUTHORIZED;
-        } else {
-            status = HttpStatus.INTERNAL_SERVER_ERROR;
-        }
-
-        return buildResponse(status, msg);
+        String msg = ex.getMessage() != null ? ex.getMessage() : "Internal server error";
+        return buildResponse(HttpStatus.INTERNAL_SERVER_ERROR, msg);
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

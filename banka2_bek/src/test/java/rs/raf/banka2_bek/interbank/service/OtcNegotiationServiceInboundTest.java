@@ -22,6 +22,7 @@ import rs.raf.banka2_bek.interbank.model.InterbankOtcNegotiationStatus;
 import rs.raf.banka2_bek.interbank.model.InterbankPartyType;
 import rs.raf.banka2_bek.interbank.protocol.Asset;
 import rs.raf.banka2_bek.interbank.protocol.ForeignBankId;
+import rs.raf.banka2_bek.interbank.protocol.OtcOffer;
 import rs.raf.banka2_bek.interbank.protocol.Posting;
 import rs.raf.banka2_bek.interbank.protocol.Transaction;
 import rs.raf.banka2_bek.interbank.protocol.TxAccount;
@@ -309,7 +310,274 @@ class OtcNegotiationServiceInboundTest {
                 .contains("stock-release");
     }
 
+    // ──────────────────────── §3.3 receiveCounterOffer (turn rule + integer qty) ──────────────────
+
+    /**
+     * <b>Sc-3.3-inbound (a) — valid counter-offer alternacijom turna.</b>
+     * Entitet je poslednje izmenjen od FOREIGN strane (buyer 111:C-101). LOCAL seller
+     * (222:C-7) je na redu → counter-offer prolazi i azurira polja + lastModifiedBy flip-uje
+     * na pozivaoca (local seller).
+     */
+    @Test
+    @DisplayName("§3.3 receiveCounterOffer: valid alt-turn (local seller posle foreign buyer) -> update + lastModifiedBy flip")
+    void receiveCounterOffer_validAlternatingTurn_updatesAndFlips() {
+        ForeignBankId negotiationId = new ForeignBankId(OUR_RN, "neg-1");
+        InterbankOtcNegotiation entity = buildAcceptableNegotiation();   // lastModifiedBy = 111:C-101 (foreign buyer)
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(OUR_RN), eq("neg-1"))).thenReturn(Optional.of(entity));
+        when(negotiationRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        // Counter-offer od LOCAL seller-a (222:C-7) — suprotna strana od poslednjeg modifikatora.
+        ForeignBankId localSeller = new ForeignBankId(OUR_RN, "C-7");
+        OtcOffer updated = counterOffer(localSeller, new BigDecimal("60"), new BigDecimal("210"));
+
+        service.receiveCounterOffer(negotiationId, updated);
+
+        assertThat(entity.getAmount()).isEqualByComparingTo(new BigDecimal("60"));
+        assertThat(entity.getPricePerUnit()).isEqualByComparingTo(new BigDecimal("210"));
+        // lastModifiedBy je flip-ovan na pozivaoca (local seller) — sledeci turn pripada foreign buyeru.
+        assertThat(entity.getLastModifiedByRoutingNumber()).isEqualTo(OUR_RN);
+        assertThat(entity.getLastModifiedByIdString()).isEqualTo("C-7");
+        verify(negotiationRepository).save(entity);
+    }
+
+    /**
+     * <b>Sc-3.3-turn-rule-literal — ista strana 2x uzastopno -> 409.</b>
+     * Entitet je poslednje izmenjen od FOREIGN buyer-a (111:C-101). Counter-offer od ISTE
+     * strane (foreign buyer) krsi pravilo turna (§3.3: turn je suprotna strana od poslednjeg
+     * modifikatora) → 409 Conflict, bez azuriranja entiteta.
+     */
+    @Test
+    @DisplayName("§3.3 turn-rule literal: ista strana (foreign buyer) 2x -> 409 NegotiationConflict, bez izmene")
+    void receiveCounterOffer_samePartyTwice_turnViolation_409() {
+        ForeignBankId negotiationId = new ForeignBankId(OUR_RN, "neg-1");
+        InterbankOtcNegotiation entity = buildAcceptableNegotiation();   // lastModifiedBy = 111:C-101
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(OUR_RN), eq("neg-1"))).thenReturn(Optional.of(entity));
+
+        // Counter-offer ponovo od ISTE strane (foreign buyer 111:C-101) — nije njihov turn.
+        ForeignBankId foreignBuyer = new ForeignBankId(BUYER_RN, "C-101");
+        OtcOffer updated = counterOffer(foreignBuyer, new BigDecimal("60"), new BigDecimal("210"));
+
+        assertThatThrownBy(() -> service.receiveCounterOffer(negotiationId, updated))
+                .isInstanceOf(InterbankExceptions.InterbankNegotiationConflictException.class)
+                .hasMessageContaining("turn");
+
+        // entitet netaknut (amount ostaje 50)
+        assertThat(entity.getAmount()).isEqualByComparingTo(new BigDecimal("50"));
+        verify(negotiationRepository, never()).save(any());
+    }
+
+    /**
+     * <b>Sc-3.3-inbound (c) — PUT na zatvoreni pregovor -> 409.</b>
+     * isOngoing=false / status=CLOSED → conflict (ne 400, jer nije malformed, vec stanje).
+     */
+    @Test
+    @DisplayName("§3.3 receiveCounterOffer: PUT na zatvoreni (CLOSED) pregovor -> 409 NegotiationConflict")
+    void receiveCounterOffer_onClosedNegotiation_409() {
+        ForeignBankId negotiationId = new ForeignBankId(OUR_RN, "neg-closed");
+        InterbankOtcNegotiation entity = buildAcceptableNegotiation();
+        entity.setOngoing(false);
+        entity.setStatus(InterbankOtcNegotiationStatus.CLOSED);
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(OUR_RN), eq("neg-closed"))).thenReturn(Optional.of(entity));
+
+        ForeignBankId localSeller = new ForeignBankId(OUR_RN, "C-7");
+        OtcOffer updated = counterOffer(localSeller, new BigDecimal("60"), new BigDecimal("210"));
+
+        assertThatThrownBy(() -> service.receiveCounterOffer(negotiationId, updated))
+                .isInstanceOf(InterbankExceptions.InterbankNegotiationConflictException.class)
+                .hasMessageContaining("nije aktivan");
+        verify(negotiationRepository, never()).save(any());
+    }
+
+    /**
+     * <b>Sc-3.3-inbound (d) — pozivalac nije ni buyer ni seller -> 400 IllegalArgument.</b>
+     * Turn check prolazi (lastModifiedBy != entity.lastModifiedBy) ali pozivalac nije nijedna
+     * od strana pregovora → IllegalArgumentException (mapira se na 400).
+     */
+    @Test
+    @DisplayName("§3.3 receiveCounterOffer: pozivalac nije buyer ni seller -> IllegalArgumentException (400)")
+    void receiveCounterOffer_callerNotAParty_400() {
+        ForeignBankId negotiationId = new ForeignBankId(OUR_RN, "neg-1");
+        InterbankOtcNegotiation entity = buildAcceptableNegotiation();   // lastModifiedBy = 111:C-101
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(OUR_RN), eq("neg-1"))).thenReturn(Optional.of(entity));
+
+        // Treca strana (999:C-999) — prolazi turn check (razlicit od lastModifiedBy) ali nije party.
+        ForeignBankId stranger = new ForeignBankId(999, "C-999");
+        OtcOffer updated = counterOffer(stranger, new BigDecimal("60"), new BigDecimal("210"));
+
+        assertThatThrownBy(() -> service.receiveCounterOffer(negotiationId, updated))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("buyer ili seller");
+        verify(negotiationRepository, never()).save(any());
+    }
+
+    /**
+     * <b>Sc-2.7.2-inbound — counter-offer sa frakcionim amount -> 400 ProtocolException.</b>
+     * §2.7.2: kolicina hartija mora biti ceo broj > 0. Frakcioni amount (npr. 1.5) na inbound
+     * counter-offer putu se odbacuje PRE persistiranja (M-3 validateIntegerAmount).
+     */
+    @Test
+    @DisplayName("§2.7.2 receiveCounterOffer: frakcioni amount (1.5) -> 400 ProtocolException, bez izmene")
+    void receiveCounterOffer_fractionalAmount_rejected() {
+        ForeignBankId negotiationId = new ForeignBankId(OUR_RN, "neg-1");
+        InterbankOtcNegotiation entity = buildAcceptableNegotiation();   // lastModifiedBy = 111:C-101
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(OUR_RN), eq("neg-1"))).thenReturn(Optional.of(entity));
+
+        // Turn je validan (local seller) — ali amount 1.5 nije ceo broj.
+        ForeignBankId localSeller = new ForeignBankId(OUR_RN, "C-7");
+        OtcOffer updated = counterOffer(localSeller, new BigDecimal("1.5"), new BigDecimal("210"));
+
+        assertThatThrownBy(() -> service.receiveCounterOffer(negotiationId, updated))
+                .isInstanceOf(InterbankExceptions.InterbankProtocolException.class)
+                .hasMessageContaining("ceo broj");
+
+        // entitet netaknut (amount ostaje 50, nije sacuvan)
+        assertThat(entity.getAmount()).isEqualByComparingTo(new BigDecimal("50"));
+        verify(negotiationRepository, never()).save(any());
+    }
+
+    // ──────────────────────── §3.4 getNegotiation (mapToProtocol + isOngoing) ──────────────────────
+
+    /**
+     * <b>Sc-3.4-inbound — GET mapira entitet u OtcNegotiation protokol shape.</b>
+     * Lokalna strana je SELLER → mapToProtocol mora seller=local(222:C-7), buyer=foreign(111:C-101);
+     * isOngoing se cita iz entity state-a (ACTIVE/ongoing=true → true).
+     */
+    @Test
+    @DisplayName("§3.4 getNegotiation: SELLER local -> seller=local/buyer=foreign, isOngoing=true (ACTIVE)")
+    void getNegotiation_sellerLocal_mapsProtocolShapeWithIsOngoing() {
+        ForeignBankId negotiationId = new ForeignBankId(OUR_RN, "neg-1");
+        InterbankOtcNegotiation entity = buildAcceptableNegotiation();   // SELLER local, ongoing=true
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(OUR_RN), eq("neg-1"))).thenReturn(Optional.of(entity));
+
+        var neg = service.getNegotiation(negotiationId);
+
+        assertThat(neg.stock().ticker()).isEqualTo("AAPL");
+        assertThat(neg.amount()).isEqualByComparingTo(new BigDecimal("50"));
+        // SELLER local: seller = local (222:C-7), buyer = foreign (111:C-101)
+        assertThat(neg.sellerId()).isEqualTo(new ForeignBankId(OUR_RN, "C-7"));
+        assertThat(neg.buyerId()).isEqualTo(new ForeignBankId(BUYER_RN, "C-101"));
+        // isOngoing iz entity state-a
+        assertThat(neg.isOngoing()).isTrue();
+    }
+
+    /**
+     * <b>Sc-3.4-inbound (isOngoing=false) — zatvoren pregovor mapira isOngoing=false.</b>
+     */
+    @Test
+    @DisplayName("§3.4 getNegotiation: zatvoren (CLOSED) pregovor -> isOngoing=false")
+    void getNegotiation_closed_isOngoingFalse() {
+        ForeignBankId negotiationId = new ForeignBankId(OUR_RN, "neg-closed");
+        InterbankOtcNegotiation entity = buildAcceptableNegotiation();
+        entity.setOngoing(false);
+        entity.setStatus(InterbankOtcNegotiationStatus.CLOSED);
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(OUR_RN), eq("neg-closed"))).thenReturn(Optional.of(entity));
+
+        var neg = service.getNegotiation(negotiationId);
+
+        assertThat(neg.isOngoing()).isFalse();
+    }
+
+    /**
+     * <b>Sc-3.4-inbound — GET nepostojeceg pregovora -> NotFound (404).</b>
+     */
+    @Test
+    @DisplayName("§3.4 getNegotiation: nepostojeci pregovor -> NegotiationNotFoundException (404)")
+    void getNegotiation_notFound_404() {
+        ForeignBankId negotiationId = new ForeignBankId(OUR_RN, "neg-missing");
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(OUR_RN), eq("neg-missing"))).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.getNegotiation(negotiationId))
+                .isInstanceOf(InterbankExceptions.InterbankNegotiationNotFoundException.class)
+                .hasMessageContaining("ne postoji");
+    }
+
+    // ──────────────────────── §3.5 closeReceivedNegotiation (idempotent close) ─────────────────────
+
+    /**
+     * <b>Sc-3.5-inbound (a) — close ACTIVE -> CLOSED + isOngoing=false.</b>
+     */
+    @Test
+    @DisplayName("§3.5 closeReceivedNegotiation: ACTIVE -> CLOSED, isOngoing=false")
+    void closeReceivedNegotiation_active_closes() {
+        ForeignBankId negotiationId = new ForeignBankId(OUR_RN, "neg-1");
+        InterbankOtcNegotiation entity = buildAcceptableNegotiation();   // ACTIVE, ongoing=true
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(OUR_RN), eq("neg-1"))).thenReturn(Optional.of(entity));
+        when(negotiationRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        service.closeReceivedNegotiation(negotiationId);
+
+        assertThat(entity.isOngoing()).isFalse();
+        assertThat(entity.getStatus()).isEqualTo(InterbankOtcNegotiationStatus.CLOSED);
+        verify(negotiationRepository).save(entity);
+    }
+
+    /**
+     * <b>Sc-3.5-inbound (b) — close VEC zatvorenog -> no-op (idempotent, bez save-a).</b>
+     */
+    @Test
+    @DisplayName("§3.5 closeReceivedNegotiation: vec zatvoren -> idempotent no-op (bez save-a)")
+    void closeReceivedNegotiation_alreadyClosed_idempotentNoOp() {
+        ForeignBankId negotiationId = new ForeignBankId(OUR_RN, "neg-1");
+        InterbankOtcNegotiation entity = buildAcceptableNegotiation();
+        entity.setOngoing(false);
+        entity.setStatus(InterbankOtcNegotiationStatus.CLOSED);
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(OUR_RN), eq("neg-1"))).thenReturn(Optional.of(entity));
+
+        service.closeReceivedNegotiation(negotiationId);
+
+        // vec zatvoren — nikakav save (idempotentno)
+        verify(negotiationRepository, never()).save(any());
+        assertThat(entity.getStatus()).isEqualTo(InterbankOtcNegotiationStatus.CLOSED);
+    }
+
+    /**
+     * <b>Sc-3.5-inbound (c) — close nepostojeceg -> no-op bez exception-a (idempotent).</b>
+     */
+    @Test
+    @DisplayName("§3.5 closeReceivedNegotiation: nepostojeci -> idempotent no-op (bez exception-a, bez save-a)")
+    void closeReceivedNegotiation_nonexistent_idempotentNoException() {
+        ForeignBankId negotiationId = new ForeignBankId(OUR_RN, "neg-ghost");
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(OUR_RN), eq("neg-ghost"))).thenReturn(Optional.empty());
+
+        // ne baca — idempotentno (DELETE nepostojeceg je no-op po §3.5)
+        service.closeReceivedNegotiation(negotiationId);
+
+        verify(negotiationRepository, never()).save(any());
+    }
+
     // ── helpers ──
+
+    /**
+     * Gradi minimalan §3.3 counter-offer {@link OtcOffer} sa zadatim modifikatorom (turn owner),
+     * kolicinom i cenom. buyer/seller polja su iz {@link #buildAcceptableNegotiation()} konvencije
+     * (foreign buyer 111:C-101, local seller 222:C-7); za turn-rule je relevantan samo lastModifiedBy.
+     */
+    private OtcOffer counterOffer(ForeignBankId lastModifiedBy, BigDecimal amount, BigDecimal pricePerUnit) {
+        ForeignBankId foreignBuyer = new ForeignBankId(BUYER_RN, "C-101");
+        ForeignBankId localSeller = new ForeignBankId(OUR_RN, "C-7");
+        return new OtcOffer(
+                new rs.raf.banka2_bek.interbank.protocol.StockDescription("AAPL"),
+                OffsetDateTime.now(ZoneOffset.UTC).plusDays(30),
+                new rs.raf.banka2_bek.interbank.protocol.MonetaryValue(
+                        rs.raf.banka2_bek.interbank.protocol.CurrencyCode.USD, pricePerUnit),
+                new rs.raf.banka2_bek.interbank.protocol.MonetaryValue(
+                        rs.raf.banka2_bek.interbank.protocol.CurrencyCode.USD, new BigDecimal("700")),
+                foreignBuyer,
+                localSeller,
+                amount,
+                lastModifiedBy);
+    }
 
     private InterbankOtcNegotiation buildAcceptableNegotiation() {
         InterbankOtcNegotiation entity = new InterbankOtcNegotiation();

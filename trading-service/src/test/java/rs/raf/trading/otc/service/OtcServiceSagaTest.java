@@ -1,6 +1,5 @@
 package rs.raf.trading.otc.service;
 
-import jakarta.persistence.EntityNotFoundException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -16,10 +15,6 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
-import rs.raf.banka2.contracts.internal.CommitFundsRequest;
-import rs.raf.banka2.contracts.internal.CommitFundsResponse;
-import rs.raf.banka2.contracts.internal.CreditFundsRequest;
-import rs.raf.banka2.contracts.internal.CreditFundsResponse;
 import rs.raf.banka2.contracts.internal.InternalAccountDto;
 import rs.raf.banka2.contracts.internal.ReleaseFundsRequest;
 import rs.raf.banka2.contracts.internal.ReleaseFundsResponse;
@@ -144,9 +139,13 @@ class OtcServiceSagaTest {
     // -- fixtures (deljeno sa OtcServiceTest stilom) -------------------------
 
     private void authClient() {
+        // P1-6: OTC operacije zahtevaju da klijent ima TRADE_STOCKS permisiju
+        // (Celina 4: "klijenti sa permisijama za trgovinu"). Ovi SAGA testovi
+        // predstavljaju klijenta KOJI SME da trguje — mirror OtcServiceTest.authClient().
         SecurityContextHolder.getContext().setAuthentication(
                 new UsernamePasswordAuthenticationToken("client@x.rs", "n",
-                        List.of(new SimpleGrantedAuthority("ROLE_CLIENT"))));
+                        List.of(new SimpleGrantedAuthority("ROLE_CLIENT"),
+                                new SimpleGrantedAuthority("TRADE_STOCKS"))));
     }
 
     private Listing stockListing(long id, String ticker, String ccy) {
@@ -236,8 +235,10 @@ class OtcServiceSagaTest {
         Listing listing = stockListing(100L, "AAPL", "USD");
         OtcOffer offer = activeOffer(offerId, 1L, 2L, listing, 5, "160.00", "50.00", 2L);
         Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 0);
-        when(portfolioRepository.findByUserIdAndUserRole(2L, UserRole.CLIENT))
-                .thenReturn(List.of(sellerPf));
+        // P2-authz-method-1 (R1 474): acceptOffer cita seller portfolio pod pessimistic
+        // lock-om (findByUserIdAndUserRoleAndListingIdForUpdate).
+        when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(2L, UserRole.CLIENT, 100L))
+                .thenReturn(Optional.of(sellerPf));
         when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(0);
         when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
         when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
@@ -253,41 +254,44 @@ class OtcServiceSagaTest {
     class AcceptPartialFailure {
 
         @Test
-        @DisplayName("SG-09a premium transfer (faza 3 pre-saga) fail -> reserve NE poziva, "
-                + "contract NE kreiran, seller portfolio rezervacija NE povecana")
+        @DisplayName("SG-09a P0-B6: premium transfer fail POSLE uspesne rezervacije -> "
+                + "rezervacija se kompenzuje (releaseFunds), contract NE kreiran, "
+                + "seller portfolio rezervacija NE povecana")
         void acceptOffer_premiumTransferFails_noReserveNoContractNoPortfolioChange() {
             authClient();
             OtcOffer offer = setupAcceptHappyPath(1L);
             when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
-            // Premium transfer baca BankaCoreClientException 409 (nedovoljno za premiju).
+            // P0-B6 (Nalaz 2): rezervacija sad ide PRVA i uspeva (RES-77)...
+            when(bankaCoreClient.reserveFunds(anyString(), any(ReserveFundsRequest.class)))
+                    .thenReturn(new ReserveFundsResponse("RES-77", 10L,
+                            new BigDecimal("800.00"), BigDecimal.ZERO));
+            // ...a transfer premije padne (409). Rezervacija MORA biti oslobodjena.
             when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
                     .thenThrow(new BankaCoreClientException(409, "nedovoljno za premiju"));
+            when(bankaCoreClient.releaseFunds(anyString(), anyString(), any(ReleaseFundsRequest.class)))
+                    .thenReturn(new ReleaseFundsResponse("RES-77", new BigDecimal("800.00"),
+                            new BigDecimal("800.00")));
 
             assertThatThrownBy(() -> service.acceptOffer(1L, 10L))
                     .isInstanceOf(InsufficientFundsException.class);
 
-            // Verifikuj da ostatak SAGA-e NIJE pokrenut posle prve faze fail-a:
-            // - reserveFunds (faza 2 sklapanja) ne sme se zvati
-            // - contract ne sme biti save-ovan (faza 4)
-            // - seller portfolio ne sme imati izmenjenu rezervaciju (faza 2 - akcije)
-            // - offer status ne sme preci na ACCEPTED (faza 5 finalizacija)
-            verify(bankaCoreClient, never()).reserveFunds(anyString(), any(ReserveFundsRequest.class));
+            // CONSERVATION (Nalaz 2): rezervacija RES-77 se kompenzuje (releaseFunds),
+            // contract NE save-ovan, seller portfolio rezervacija NE povecana, offer ACTIVE.
+            verify(bankaCoreClient).releaseFunds(eq("RES-77"), anyString(),
+                    any(ReleaseFundsRequest.class));
             verify(contractRepository, never()).save(any(OtcContract.class));
             verify(portfolioRepository, never()).save(any(Portfolio.class));
             assertThat(offer.getStatus()).isEqualTo(OtcOfferStatus.ACTIVE);
         }
 
         @Test
-        @DisplayName("SG-09b reserve fail (faza 1 sklapanja) -> premium uplata propustena "
-                + "u Pass 1; contract NE kreiran; offer status ostaje ACTIVE")
+        @DisplayName("SG-09b P0-B6: reserve fail (sad PRVA faza) -> premija NIKAD ne krene "
+                + "(conservation 0); contract NE kreiran; offer status ostaje ACTIVE")
         void acceptOffer_reserveFails_noContractCreatedOfferRemainsActive() {
             authClient();
             OtcOffer offer = setupAcceptHappyPath(1L);
             when(offerRepository.findById(1L)).thenReturn(Optional.of(offer));
-            // Premium prolazi (faza 3 pre-saga), reserve odbija (faza 1 - rezervacija sredstava).
-            when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
-                    .thenReturn(new TransferFundsResponse(10L, 88L, new BigDecimal("50.00"),
-                            BigDecimal.ZERO, BigDecimal.ZERO));
+            // P0-B6 (Nalaz 2): rezervacija sad ide PRVA i odbija (409). Premija ne sme krenuti.
             when(bankaCoreClient.reserveFunds(anyString(), any(ReserveFundsRequest.class)))
                     .thenThrow(new BankaCoreClientException(409, "nedovoljno za rezervaciju"));
 
@@ -295,12 +299,12 @@ class OtcServiceSagaTest {
                     .isInstanceOf(InsufficientFundsException.class)
                     .hasMessageContaining("rezervaciju");
 
-            // Premium je vec poslat (jedan poziv transferFunds), ali contract NIJE kreiran
-            // i seller portfolio rezervacija NIJE povecana. Spec napomena (PDF par. 6.4):
-            // ovo je tacka gde JPA @Transactional rollback bi vratio i premium -
-            // jedinicni test ne dokazuje rollback, ali dokazuje da je orkestracija
-            // STALA na fazi 1 (reserve) i nije nastavila ka kreaciji ugovora.
-            verify(bankaCoreClient, times(1)).transferFunds(anyString(), any(TransferFundsRequest.class));
+            // CONSERVATION: premija NIKAD nije premestena (pre fix-a je isla PRVA pa bi
+            // bila TRAJNO premestena → money-loss). Nista nije rezervisano (reserve pao),
+            // pa ni releaseFunds nije potreban. Contract NE kreiran, offer ostaje ACTIVE.
+            verify(bankaCoreClient, never()).transferFunds(anyString(), any(TransferFundsRequest.class));
+            verify(bankaCoreClient, never()).releaseFunds(anyString(), anyString(),
+                    any(ReleaseFundsRequest.class));
             verify(contractRepository, never()).save(any(OtcContract.class));
             verify(portfolioRepository, never()).save(any(Portfolio.class));
             verify(otcIntraTotal, never()).increment();
@@ -331,190 +335,11 @@ class OtcServiceSagaTest {
         }
     }
 
-    // -- SG-06 / SG-07: Partial failure mid-exercise -------------------------
-
-    @Nested
-    @DisplayName("SG-06/07 - partial failure tokom exercise (faze 3/4 SAGA toka)")
-    class ExercisePartialFailure {
-
-        @Test
-        @DisplayName("SG-06 commitFunds fail (faza 3 - debit buyer rezervacije) -> "
-                + "creditFunds NE poziva, portfolio NE menja, contract ostaje ACTIVE")
-        void exercise_commitFundsFails_creditNotCalledContractStaysActive() {
-            authClient();
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
-            Listing listing = stockListing(100L, "AAPL", "USD");
-            OtcContract contract = activeContract(7L, 1L, 2L, listing, 5, "160.00", "RES-77");
-            when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
-            when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
-                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
-            // commitFunds baca runtime - banka-core ne moze da skine rezervaciju.
-            when(bankaCoreClient.commitFunds(anyString(), anyString(), any(CommitFundsRequest.class)))
-                    .thenThrow(new BankaCoreClientException(500, "commit failed"));
-
-            assertThatThrownBy(() -> service.exerciseContract(7L, 10L))
-                    .isInstanceOf(BankaCoreClientException.class);
-
-            // SAGA stop: creditFunds (seller noga), portfolio transfer i contract.save
-            // ne smeju biti pozvani.
-            verify(bankaCoreClient, never()).creditFunds(anyString(), any(CreditFundsRequest.class));
-            verify(portfolioRepository, never()).save(any(Portfolio.class));
-            verify(portfolioRepository, never()).delete(any(Portfolio.class));
-            verify(contractRepository, never()).save(any(OtcContract.class));
-            assertThat(contract.getStatus()).isEqualTo(OtcContractStatus.ACTIVE);
-            assertThat(contract.getExercisedAt()).isNull();
-        }
-
-        @Test
-        @DisplayName("SG-06b creditFunds fail (faza 3 - credit seller) -> portfolio NE menja, "
-                + "contract ostaje ACTIVE; commit je vec naplacen (kompenzacija odgovornost JPA Tx)")
-        void exercise_creditFundsFails_portfolioNotTransferredContractStaysActive() {
-            authClient();
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
-            Listing listing = stockListing(100L, "AAPL", "USD");
-            OtcContract contract = activeContract(7L, 1L, 2L, listing, 5, "160.00", "RES-77");
-            when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
-            when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
-                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
-            when(bankaCoreClient.commitFunds(anyString(), anyString(), any(CommitFundsRequest.class)))
-                    .thenReturn(new CommitFundsResponse("RES-77", new BigDecimal("800.00"),
-                            BigDecimal.ZERO, BigDecimal.ZERO));
-            // creditFunds - seller noga - baca exception
-            when(bankaCoreClient.creditFunds(anyString(), any(CreditFundsRequest.class)))
-                    .thenThrow(new BankaCoreClientException(500, "credit failed"));
-
-            assertThatThrownBy(() -> service.exerciseContract(7L, 10L))
-                    .isInstanceOf(BankaCoreClientException.class);
-
-            // SAGA stop: portfolio prebacaj (faza 4) i contract.save (faza 5)
-            // ne smeju biti pozvani. Spec napomena (PDF par. 6.3 + Tabela 5 faza 3):
-            // ovo je tacka gde sistem mora osloboditi commit-ovana sredstva
-            // (kompenzacija); u testu se proverava da nije nastavljen tok.
-            verify(portfolioRepository, never()).save(any(Portfolio.class));
-            verify(portfolioRepository, never()).delete(any(Portfolio.class));
-            verify(contractRepository, never()).save(any(OtcContract.class));
-            assertThat(contract.getStatus()).isEqualTo(OtcContractStatus.ACTIVE);
-        }
-
-        @Test
-        @DisplayName("SG-07 portfolio save fail (faza 4 - prenos hartija) -> contract.save NE "
-                + "poziva, status ostaje ACTIVE")
-        void exercise_portfolioSaveFails_contractRemainsActive() {
-            authClient();
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
-            Listing listing = stockListing(100L, "AAPL", "USD");
-            OtcContract contract = activeContract(7L, 1L, 2L, listing, 5, "160.00", "RES-77");
-            when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
-            when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
-                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
-            when(bankaCoreClient.commitFunds(anyString(), anyString(), any(CommitFundsRequest.class)))
-                    .thenReturn(new CommitFundsResponse("RES-77", new BigDecimal("800.00"),
-                            BigDecimal.ZERO, BigDecimal.ZERO));
-            when(bankaCoreClient.creditFunds(anyString(), any(CreditFundsRequest.class)))
-                    .thenReturn(new CreditFundsResponse(88L, new BigDecimal("800.00"),
-                            new BigDecimal("100800.00")));
-            Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 5);
-            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                    2L, UserRole.CLIENT, 100L)).thenReturn(Optional.of(sellerPf));
-            // Portfolio save baca DataAccessResourceFailure - faza 4 fail.
-            when(portfolioRepository.save(any(Portfolio.class)))
-                    .thenThrow(new org.springframework.dao.DataAccessResourceFailureException("DB down"));
-
-            assertThatThrownBy(() -> service.exerciseContract(7L, 10L))
-                    .isInstanceOf(org.springframework.dao.DataAccessException.class);
-
-            // Faza 5 (contract.save sa EXERCISED) ne sme biti dosegnuta.
-            verify(contractRepository, never()).save(any(OtcContract.class));
-            assertThat(contract.getStatus()).isEqualTo(OtcContractStatus.ACTIVE);
-            assertThat(contract.getExercisedAt()).isNull();
-        }
-
-        @Test
-        @DisplayName("SG-07b seller portfolio nestao izmedju findById i exercise -> "
-                + "IllegalState; nista nije promenjeno")
-        void exercise_sellerPortfolioMissing_throwsIllegalState() {
-            authClient();
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
-            Listing listing = stockListing(100L, "AAPL", "USD");
-            OtcContract contract = activeContract(7L, 1L, 2L, listing, 5, "160.00", "RES-77");
-            when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
-            when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
-                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
-            when(bankaCoreClient.commitFunds(anyString(), anyString(), any(CommitFundsRequest.class)))
-                    .thenReturn(new CommitFundsResponse("RES-77", new BigDecimal("800.00"),
-                            BigDecimal.ZERO, BigDecimal.ZERO));
-            when(bankaCoreClient.creditFunds(anyString(), any(CreditFundsRequest.class)))
-                    .thenReturn(new CreditFundsResponse(88L, new BigDecimal("800.00"),
-                            new BigDecimal("100800.00")));
-            // Seller portfolio fetch vraca prazno - neko ga je obrisao iza ledjima.
-            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                    2L, UserRole.CLIENT, 100L)).thenReturn(Optional.empty());
-
-            assertThatThrownBy(() -> service.exerciseContract(7L, 10L))
-                    .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("nema ovu hartiju");
-
-            verify(contractRepository, never()).save(any(OtcContract.class));
-        }
-
-        @Test
-        @DisplayName("SG-07c seller portfolio ima manje akcija od ugovora -> "
-                + "IllegalState; nista nije promenjeno")
-        void exercise_sellerPortfolioInsufficientShares_throwsIllegalState() {
-            authClient();
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
-            Listing listing = stockListing(100L, "AAPL", "USD");
-            OtcContract contract = activeContract(7L, 1L, 2L, listing, 5, "160.00", "RES-77");
-            when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
-            when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
-                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
-            when(bankaCoreClient.commitFunds(anyString(), anyString(), any(CommitFundsRequest.class)))
-                    .thenReturn(new CommitFundsResponse("RES-77", new BigDecimal("800.00"),
-                            BigDecimal.ZERO, BigDecimal.ZERO));
-            when(bankaCoreClient.creditFunds(anyString(), any(CreditFundsRequest.class)))
-                    .thenReturn(new CreditFundsResponse(88L, new BigDecimal("800.00"),
-                            new BigDecimal("100800.00")));
-            // Prodavac sada ima samo 3 akcije, ugovor trazi 5.
-            Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 3, 0, 5);
-            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                    2L, UserRole.CLIENT, 100L)).thenReturn(Optional.of(sellerPf));
-
-            assertThatThrownBy(() -> service.exerciseContract(7L, 10L))
-                    .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("nema dovoljno akcija");
-
-            verify(contractRepository, never()).save(any(OtcContract.class));
-        }
-    }
-
     // -- SG-05 / SG-02 / SG-03 / SG-10: Validation + access guards -----------
 
     @Nested
     @DisplayName("SG-02/03/05 - access/state guard pre SAGA-e (ne sme se ni jedna faza pokrenuti)")
     class AccessAndStateGuards {
-
-        @Test
-        @DisplayName("SG-05 nepostojeci ugovor -> EntityNotFound; nijedna banka-core noga "
-                + "nije pozvana (404)")
-        void exercise_nonexistentContract_throwsNotFound_noBankaCoreCalls() {
-            authClient();
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
-            when(contractRepository.findById(999L)).thenReturn(Optional.empty());
-
-            assertThatThrownBy(() -> service.exerciseContract(999L, 10L))
-                    .isInstanceOf(EntityNotFoundException.class)
-                    .hasMessageContaining("ne postoji");
-
-            verify(bankaCoreClient, never()).commitFunds(anyString(), anyString(),
-                    any(CommitFundsRequest.class));
-            verify(bankaCoreClient, never()).creditFunds(anyString(), any(CreditFundsRequest.class));
-            verify(bankaCoreClient, never()).transferFunds(anyString(), any(TransferFundsRequest.class));
-        }
 
         @Test
         @DisplayName("SG-02 acceptOffer od ne-ucesnika -> AccessDenied; nijedna banka-core "
@@ -621,47 +446,6 @@ class OtcServiceSagaTest {
             verify(contractRepository, times(1)).save(any(OtcContract.class));
             verify(otcIntraTotal, times(1)).increment();
         }
-
-        @Test
-        @DisplayName("SG-11b dvostruki exerciseContract istog contractId: prvi uspeva, "
-                + "drugi dobija IllegalState (contract.status != ACTIVE)")
-        void exerciseContract_repeatedAfterSuccess_secondGetsIllegalState() {
-            authClient();
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
-            Listing listing = stockListing(100L, "AAPL", "USD");
-            OtcContract contract = activeContract(7L, 1L, 2L, listing, 5, "160.00", "RES-77");
-            when(contractRepository.findById(7L)).thenReturn(Optional.of(contract));
-            when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
-                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
-            when(bankaCoreClient.commitFunds(anyString(), anyString(), any(CommitFundsRequest.class)))
-                    .thenReturn(new CommitFundsResponse("RES-77", new BigDecimal("800.00"),
-                            BigDecimal.ZERO, BigDecimal.ZERO));
-            when(bankaCoreClient.creditFunds(anyString(), any(CreditFundsRequest.class)))
-                    .thenReturn(new CreditFundsResponse(88L, new BigDecimal("800.00"),
-                            new BigDecimal("100800.00")));
-            Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 5);
-            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                    2L, UserRole.CLIENT, 100L)).thenReturn(Optional.of(sellerPf));
-            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                    1L, UserRole.CLIENT, 100L)).thenReturn(Optional.empty());
-            when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
-            when(contractRepository.save(any(OtcContract.class))).thenAnswer(inv -> inv.getArgument(0));
-
-            // Prvi exercise prolazi.
-            service.exerciseContract(7L, 10L);
-            assertThat(contract.getStatus()).isEqualTo(OtcContractStatus.EXERCISED);
-
-            // Drugi exercise odbija - contract.status je EXERCISED.
-            assertThatThrownBy(() -> service.exerciseContract(7L, 10L))
-                    .isInstanceOf(IllegalStateException.class)
-                    .hasMessageContaining("nije aktivan");
-
-            // SAGA noge zvane TACNO 1x (drugi poziv stao pre prve faze).
-            verify(bankaCoreClient, times(1)).commitFunds(anyString(), anyString(),
-                    any(CommitFundsRequest.class));
-            verify(bankaCoreClient, times(1)).creditFunds(anyString(), any(CreditFundsRequest.class));
-        }
     }
 
     // -- SG-01-style concurrency: race za acceptOffer / exerciseContract -----
@@ -701,8 +485,9 @@ class OtcServiceSagaTest {
 
             when(userResolver.resolveCurrent()).thenReturn(new UserContext(2L, UserRole.CLIENT));
             when(offerRepository.findById(1L)).thenReturn(Optional.of(sharedOffer));
-            when(portfolioRepository.findByUserIdAndUserRole(2L, UserRole.CLIENT))
-                    .thenReturn(List.of(sellerPf));
+            // P2-authz-method-1 (R1 474): pessimistic lock na seller portfolio.
+            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(2L, UserRole.CLIENT, 100L))
+                    .thenReturn(Optional.of(sellerPf));
             when(contractRepository.sumActiveReservedByListing(2L, UserRole.CLIENT, 100L)).thenReturn(0);
             when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
             when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
@@ -753,12 +538,18 @@ class OtcServiceSagaTest {
                 return inv.getArgument(0);
             });
 
+            // P1-6: ensureOtcAccess cita SecurityContext (ThreadLocal) — worker thread-ovi
+            // ga ne nasledjuju automatski, pa ga eksplicitno re-establish-ujemo u svakom.
+            var sagaAuth = SecurityContextHolder.getContext().getAuthentication();
             ExecutorService exec = Executors.newFixedThreadPool(2);
             Callable<Object> attempt = () -> {
+                SecurityContextHolder.getContext().setAuthentication(sagaAuth);
                 try {
                     return service.acceptOffer(1L, 10L);
                 } catch (Throwable t) {
                     return t;
+                } finally {
+                    SecurityContextHolder.clearContext();
                 }
             };
             Future<Object> f1 = exec.submit(attempt);
@@ -795,98 +586,6 @@ class OtcServiceSagaTest {
             // U produkciji sa pravim JPA, drugi attempt rollback-uje sve njegove
             // novcane noge (premium transfer + reserve). Jedinicni test pokazuje
             // da je optimistic lock obavezan da bi ova invarijanta vazila.
-        }
-
-        @Test
-        @DisplayName("exerciseContract - dva paralelna pokusaja istog ugovora + simulirani "
-                + "JPA @Version: prvi prolazi, drugi dobija OptimisticLockingFailureException")
-        void exerciseContract_concurrentBuyers_optimisticLockProtectsAgainstDoubleExercise()
-                throws InterruptedException, ExecutionException, TimeoutException {
-            authClient();
-            Listing listing = stockListing(100L, "AAPL", "USD");
-            OtcContract sharedContract = activeContract(7L, 1L, 2L, listing, 5, "160.00", "RES-77");
-
-            when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
-            when(contractRepository.findById(7L)).thenReturn(Optional.of(sharedContract));
-            when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
-            when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
-                    .thenReturn(account(88L, "222", "Seller", "USD", 2L));
-            Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 5);
-            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                    2L, UserRole.CLIENT, 100L)).thenReturn(Optional.of(sellerPf));
-            when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
-                    1L, UserRole.CLIENT, 100L)).thenReturn(Optional.empty());
-            when(userResolver.resolveName(anyLong(), anyString())).thenReturn("Name");
-            when(bankaCoreClient.commitFunds(anyString(), anyString(), any(CommitFundsRequest.class)))
-                    .thenReturn(new CommitFundsResponse("RES-77", new BigDecimal("800.00"),
-                            BigDecimal.ZERO, BigDecimal.ZERO));
-            when(bankaCoreClient.creditFunds(anyString(), any(CreditFundsRequest.class)))
-                    .thenReturn(new CreditFundsResponse(88L, new BigDecimal("800.00"),
-                            new BigDecimal("100800.00")));
-
-            CountDownLatch startGate = new CountDownLatch(1);
-            CountDownLatch bothStarted = new CountDownLatch(2);
-            AtomicInteger contractSaveCounter = new AtomicInteger(0);
-
-            // bothStarted countdown se okida pri prvom commit pozivu, startGate
-            // koordinise drugi nakon sto su oba thread-a u SAGA-i.
-            when(bankaCoreClient.commitFunds(anyString(), anyString(), any(CommitFundsRequest.class)))
-                    .thenAnswer(inv -> {
-                        bothStarted.countDown();
-                        startGate.await(5, TimeUnit.SECONDS);
-                        return new CommitFundsResponse("RES-77", new BigDecimal("800.00"),
-                                BigDecimal.ZERO, BigDecimal.ZERO);
-                    });
-
-            // SIMULIRANI JPA @Version na OtcContract: drugi save sa EXERCISED
-            // statusom baca OptimisticLockingFailureException.
-            when(contractRepository.save(any(OtcContract.class))).thenAnswer(inv -> {
-                OtcContract arg = inv.getArgument(0);
-                if (arg.getStatus() == OtcContractStatus.EXERCISED) {
-                    int order = contractSaveCounter.incrementAndGet();
-                    if (order > 1) {
-                        throw new org.springframework.orm.ObjectOptimisticLockingFailureException(
-                                "OtcContract", arg.getId());
-                    }
-                }
-                return arg;
-            });
-
-            ExecutorService exec = Executors.newFixedThreadPool(2);
-            Callable<Object> attempt = () -> {
-                try {
-                    return service.exerciseContract(7L, 10L);
-                } catch (Throwable t) {
-                    return t;
-                }
-            };
-            Future<Object> f1 = exec.submit(attempt);
-            Future<Object> f2 = exec.submit(attempt);
-            assertThat(bothStarted.await(5, TimeUnit.SECONDS))
-                    .as("oba exercise thread-a moraju startovati pre release-a").isTrue();
-            startGate.countDown();
-
-            Object r1 = f1.get(5, TimeUnit.SECONDS);
-            Object r2 = f2.get(5, TimeUnit.SECONDS);
-            exec.shutdownNow();
-
-            int successes = 0;
-            int lockFailures = 0;
-            for (Object r : List.of(r1, r2)) {
-                if (r instanceof Throwable t) {
-                    if (t instanceof org.springframework.dao.OptimisticLockingFailureException) {
-                        lockFailures++;
-                    }
-                } else {
-                    successes++;
-                }
-            }
-            assertThat(successes).as("tacno jedan exercise uspeva").isEqualTo(1);
-            assertThat(lockFailures).as("tacno jedan exercise dobija OptimisticLockingFailureException")
-                    .isEqualTo(1);
-            assertThat(contractSaveCounter.get())
-                    .as("samo prvi save EXERCISED je perzistovan; drugi je odbijen")
-                    .isEqualTo(2); // oba su pokusala save, samo prvi je perzistovan
         }
 
         @Test
@@ -931,12 +630,17 @@ class OtcServiceSagaTest {
                 return arg;
             });
 
+            // P1-6: propagiraj SecurityContext u worker thread-ove (ensureOtcAccess gate).
+            var sagaAuth = SecurityContextHolder.getContext().getAuthentication();
             ExecutorService exec = Executors.newFixedThreadPool(2);
             Callable<Object> attempt = () -> {
+                SecurityContextHolder.getContext().setAuthentication(sagaAuth);
                 try {
                     return service.abandonContract(7L);
                 } catch (Throwable t) {
                     return t;
+                } finally {
+                    SecurityContextHolder.clearContext();
                 }
             };
             Future<Object> f1 = exec.submit(attempt);

@@ -16,6 +16,7 @@ import rs.raf.banka2.contracts.internal.CreditFundsRequest;
 import rs.raf.banka2.contracts.internal.InternalAccountDto;
 import rs.raf.trading.client.BankaCoreClient;
 import rs.raf.trading.investmentfund.service.FundLiquidationService;
+import rs.raf.trading.margin.service.MarginOrderSettlementService;
 import rs.raf.trading.order.model.Order;
 import rs.raf.trading.order.model.OrderDirection;
 import rs.raf.trading.order.model.OrderStatus;
@@ -29,26 +30,24 @@ import rs.raf.trading.stock.repository.ListingRepository;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Phase 6 testovi {@link OrderExecutionService} — adaptacija monolitnog testa
- * (faza 2c): verifikuju initial delay guard, BUY rewire na
+ * Phase 6 testovi {@link SingleOrderExecutor} — adaptacija monolitnog testa
+ * (faza 2c, retargetovano u P2-3): BUY rewire na
  * {@code FundReservationService.consumeForBuyFill}, SELL rewire na
- * {@code BankaCoreClient.creditFunds}, i scheduler izolaciju (jedan failing
- * order ne sprecava ostale).
+ * {@code BankaCoreClient.creditFunds}, zaposleni bez provizije, OrderCompletedEvent.
+ *
+ * <p>Initial-delay guard i scheduler izolacija su sada orkestratorov posao
+ * (pokriveni u {@code OrderExecutionServiceTest}), pa su tu testirani.
  */
 @ExtendWith(MockitoExtension.class)
 @MockitoSettings(strictness = Strictness.LENIENT)
@@ -63,13 +62,11 @@ class OrderExecutionServicePhase6Test {
     @Mock private BankaCoreClient bankaCoreClient;
     @Mock private ApplicationEventPublisher eventPublisher;
     @Mock private rs.raf.trading.notification.service.NotificationService notificationService;
-    // W2-T1: Counter/Timer dependence dodate u OrderExecutionService — mockuju se
-    // ovde da @InjectMocks ne ostavi null polje (NPE u executeSingleOrder).
+    @Mock private MarginOrderSettlementService marginOrderSettlementService;
     @Mock private io.micrometer.core.instrument.Counter ordersExecutedCounter;
-    @Mock private io.micrometer.core.instrument.Timer orderExecutionTimer;
 
     @InjectMocks
-    private OrderExecutionService service;
+    private SingleOrderExecutor service;
 
     private Listing listing;
 
@@ -81,7 +78,6 @@ class OrderExecutionServicePhase6Test {
 
     @BeforeEach
     void setUp() {
-        ReflectionTestUtils.setField(service, "initialDelaySeconds", 60L);
         ReflectionTestUtils.setField(service, "afterHoursDelaySeconds", 60L);
         ReflectionTestUtils.setField(service, "maxFillIntervalSeconds", 600L);
 
@@ -112,6 +108,8 @@ class OrderExecutionServicePhase6Test {
         o.setBankaCoreReservationId("res-100");
         o.setApprovedAt(approvedAt);
         o.setCreatedAt(approvedAt);
+        // P2-concurrency-locks-1 (R6-1998): execute() re-fetch-uje order pod lockom.
+        when(orderRepository.findByIdForUpdate(o.getId())).thenReturn(Optional.of(o));
         return o;
     }
 
@@ -119,54 +117,23 @@ class OrderExecutionServicePhase6Test {
         Order o = buyOrder(approvedAt);
         o.setId(101L);
         o.setDirection(OrderDirection.SELL);
+        // SELL ima drugi id (101) — re-stub-uj re-fetch za njega.
+        when(orderRepository.findByIdForUpdate(101L)).thenReturn(Optional.of(o));
         return o;
     }
 
-    // ── 1. Initial delay guard ────────────────────────────────────────────────
+    // ── BUY rewire ────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("executeApprovedOrders: order mladji od initialDelay se preskace")
-    void executeApprovedOrders_skipsOrdersWithinInitialDelay() {
-        Order fresh = buyOrder(LocalDateTime.now());
-        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED))
-                .thenReturn(List.of(fresh));
-
-        service.executeOrders();
-
-        verify(listingRepository, never()).findById(any());
-        verify(fundReservationService, never()).consumeForBuyFill(any(), anyInt(), any(), any());
-    }
-
-    @Test
-    @DisplayName("executeApprovedOrders: order stariji od initialDelay se izvrsava")
-    void executeApprovedOrders_executesAfterInitialDelay() {
-        Order stale = buyOrder(LocalDateTime.now().minusSeconds(65));
-        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED))
-                .thenReturn(List.of(stale));
-        when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
-        when(aonValidationService.checkCanExecuteAon(any(), anyInt())).thenReturn(true);
-
-        service.executeOrders();
-
-        verify(listingRepository, times(1)).findById(10L);
-        verify(fundReservationService, times(1))
-                .consumeForBuyFill(eq(stale), anyInt(), any(BigDecimal.class), any(BigDecimal.class));
-    }
-
-    // ── 2. BUY rewire ────────────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("executeSingleOrder BUY: poziva consumeForBuyFill sa fill quantity i cenom")
-    void executeSingleOrder_clientBuy_callsConsumeForBuyFill_withFillQuantity() {
+    @DisplayName("execute BUY: poziva consumeForBuyFill sa fill quantity i cenom")
+    void execute_clientBuy_callsConsumeForBuyFill_withFillQuantity() {
         Order order = buyOrder(LocalDateTime.now().minusSeconds(120));
         order.setAllOrNone(true); // forsiraj deterministican fill = 10
 
-        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED))
-                .thenReturn(List.of(order));
         when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
         when(aonValidationService.checkCanExecuteAon(any(), anyInt())).thenReturn(true);
 
-        service.executeOrders();
+        service.execute(order);
 
         ArgumentCaptor<Integer> qtyCap = ArgumentCaptor.forClass(Integer.class);
         ArgumentCaptor<BigDecimal> priceCap = ArgumentCaptor.forClass(BigDecimal.class);
@@ -180,11 +147,11 @@ class OrderExecutionServicePhase6Test {
         verify(fundReservationService, times(1)).releaseForBuy(order);
     }
 
-    // ── 3. SELL rewire ───────────────────────────────────────────────────────
+    // ── SELL rewire ───────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("executeSingleOrder SELL: poziva creditFunds sa neto prihodom")
-    void executeSingleOrder_clientSell_callsCreditFunds_andConsumeForSellFill() {
+    @DisplayName("execute SELL: poziva creditFunds sa neto prihodom")
+    void execute_clientSell_callsCreditFunds_andConsumeForSellFill() {
         Order order = sellOrder(LocalDateTime.now().minusSeconds(120));
         order.setAllOrNone(true);
 
@@ -199,16 +166,13 @@ class OrderExecutionServicePhase6Test {
         portfolio.setReservedQuantity(10);
         portfolio.setAverageBuyPrice(new BigDecimal("80.00"));
 
-        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED))
-                .thenReturn(List.of(order));
         when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
         when(aonValidationService.checkCanExecuteAon(any(), anyInt())).thenReturn(true);
-        // BE-ORD-05: SELL fill putanja sad koristi forUpdate lock metod.
         when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(42L, "CLIENT", 10L))
                 .thenReturn(Optional.of(portfolio));
         when(bankaCoreClient.getAccount(1L)).thenReturn(usdAccount());
 
-        service.executeOrders();
+        service.execute(order);
 
         verify(fundReservationService, times(1))
                 .consumeForSellFill(eq(order), eq(portfolio), eq(10));
@@ -222,45 +186,19 @@ class OrderExecutionServicePhase6Test {
         assertThat(creditCap.getValue().accountId()).isEqualTo(1L);
     }
 
-    // ── 4. Scheduler isolation ───────────────────────────────────────────────
+    // ── Zaposleni ne placa proviziju ──────────────────────────────────────────
 
     @Test
-    @DisplayName("executeApprovedOrders: jedan failing order ne sprecava ostale")
-    void executeApprovedOrders_continuesOtherOrders_whenOneFails() {
-        Order bad = buyOrder(LocalDateTime.now().minusSeconds(120));
-        bad.setId(200L);
-        Order good = buyOrder(LocalDateTime.now().minusSeconds(120));
-        good.setId(201L);
-        good.setAllOrNone(true);
-
-        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED))
-                .thenReturn(List.of(bad, good));
-        when(listingRepository.findById(10L))
-                .thenThrow(new RuntimeException("boom"))
-                .thenReturn(Optional.of(listing));
-        when(aonValidationService.checkCanExecuteAon(any(), anyInt())).thenReturn(true);
-
-        service.executeOrders();
-
-        verify(fundReservationService, times(1))
-                .consumeForBuyFill(eq(good), anyInt(), any(BigDecimal.class), any(BigDecimal.class));
-    }
-
-    // ── 5. Zaposleni ne placa proviziju ──────────────────────────────────────
-
-    @Test
-    @DisplayName("executeSingleOrder BUY (EMPLOYEE): commission = 0")
-    void executeSingleOrder_employeeBuy_zeroCommission() {
+    @DisplayName("execute BUY (EMPLOYEE): commission = 0")
+    void execute_employeeBuy_zeroCommission() {
         Order order = buyOrder(LocalDateTime.now().minusSeconds(120));
         order.setUserRole("EMPLOYEE");
         order.setAllOrNone(true);
 
-        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED))
-                .thenReturn(List.of(order));
         when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
         when(aonValidationService.checkCanExecuteAon(any(), anyInt())).thenReturn(true);
 
-        service.executeOrders();
+        service.execute(order);
 
         ArgumentCaptor<BigDecimal> priceCap = ArgumentCaptor.forClass(BigDecimal.class);
         ArgumentCaptor<BigDecimal> commCap = ArgumentCaptor.forClass(BigDecimal.class);
@@ -271,17 +209,15 @@ class OrderExecutionServicePhase6Test {
     }
 
     @Test
-    @DisplayName("executeSingleOrder: kompletiranje BUY-a emituje OrderCompletedEvent")
-    void executeSingleOrder_buyCompleted_publishesEvent() {
+    @DisplayName("execute: kompletiranje BUY-a emituje OrderCompletedEvent")
+    void execute_buyCompleted_publishesEvent() {
         Order order = buyOrder(LocalDateTime.now().minusSeconds(120));
         order.setAllOrNone(true);
 
-        when(orderRepository.findByStatusAndIsDoneFalse(OrderStatus.APPROVED))
-                .thenReturn(List.of(order));
         when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
         when(aonValidationService.checkCanExecuteAon(any(), anyInt())).thenReturn(true);
 
-        service.executeOrders();
+        service.execute(order);
 
         assertThat(order.getStatus()).isEqualTo(OrderStatus.DONE);
         verify(eventPublisher).publishEvent(any(Object.class));

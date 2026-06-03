@@ -1,8 +1,10 @@
 package rs.raf.banka2_bek.interbank.wrapper;
 
+import jakarta.validation.constraints.Future;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
+import jakarta.validation.constraints.PositiveOrZero;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -65,16 +67,22 @@ public final class InterbankOtcWrapperDtos {
             @NotBlank String listingTicker,
             @NotNull @Positive BigDecimal quantity,
             @NotNull @Positive BigDecimal pricePerStock,
-            @NotNull BigDecimal premium,
-            @NotNull LocalDate settlementDate
+            // §3.2 — premija ne sme biti negativna (0 = besplatna opcija je
+            // dozvoljena, mirror inbound `acceptCreatedNegotiation` rule).
+            // Pre P1-interbank-otc-2 nije imala validaciju → negativan premium
+            // je prolazio bean-validaciju i isao partner banci.
+            @NotNull @PositiveOrZero BigDecimal premium,
+            // §2.4/§2.7.2 — settlementDate mora biti u buducnosti; opcija sa
+            // settlement-om u proslosti je vec istekla (exercise bi odmah 409).
+            @NotNull @Future LocalDate settlementDate
     ) {}
 
     public record CounterOtcInterbankOfferRequest(
             String offerId,
             @NotNull @Positive BigDecimal quantity,
             @NotNull @Positive BigDecimal pricePerStock,
-            @NotNull BigDecimal premium,
-            @NotNull LocalDate settlementDate
+            @NotNull @PositiveOrZero BigDecimal premium,
+            @NotNull @Future LocalDate settlementDate
     ) {}
 
     public record OtcInterbankContract(

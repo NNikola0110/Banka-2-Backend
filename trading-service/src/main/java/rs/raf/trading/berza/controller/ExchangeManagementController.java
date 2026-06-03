@@ -18,7 +18,12 @@ import java.util.Set;
  * Endpointovi:
  *   GET  /exchanges              - lista svih aktivnih berzi sa statusom
  *   GET  /exchanges/{acronym}    - detalji jedne berze
- *   PATCH /exchanges/{acronym}/test-mode - ukljuci/iskljuci test mode (samo admin)
+ *   PATCH /exchanges/{acronym}/test-mode - ukljuci/iskljuci test mode (ADMIN/SUPERVISOR)
+ *   PUT/POST/DELETE /exchanges/{acronym}/holidays - praznici (ADMIN/SUPERVISOR)
+ *
+ * R4-444: mutacije globalne berza-config (test-mode + praznici) su admin/oversight
+ * alat — gejtovane na ADMIN+SUPERVISOR (route layer u {@code TradingSecurityConfig}
+ * + ovaj {@code @PreAuthorize}, defense-in-depth). Agenti i klijenti su iskljuceni.
  *
  * Specifikacija: Celina 3 - Berza
  */
@@ -45,7 +50,7 @@ public class ExchangeManagementController {
     }
 
     @PatchMapping("/{acronym}/test-mode")
-    @PreAuthorize("hasAnyRole('ADMIN', 'EMPLOYEE')")
+    @PreAuthorize("hasAnyAuthority('ROLE_ADMIN', 'ADMIN', 'SUPERVISOR')")
     public ResponseEntity<Map<String, String>> setTestMode(
             @PathVariable String acronym,
             @RequestBody Map<String, Boolean> body) {
@@ -68,7 +73,7 @@ public class ExchangeManagementController {
      * Postavlja kompletnu listu praznika za berzu (zamenjuje postojece).
      */
     @PutMapping("/{acronym}/holidays")
-    @PreAuthorize("hasAnyRole('ADMIN', 'EMPLOYEE')")
+    @PreAuthorize("hasAnyAuthority('ROLE_ADMIN', 'ADMIN', 'SUPERVISOR')")
     public ResponseEntity<Map<String, String>> setHolidays(
             @PathVariable String acronym,
             @RequestBody Set<LocalDate> holidays) {
@@ -81,13 +86,37 @@ public class ExchangeManagementController {
      * Dodaje pojedinacni praznik za berzu.
      */
     @PostMapping("/{acronym}/holidays")
-    @PreAuthorize("hasAnyRole('ADMIN', 'EMPLOYEE')")
+    @PreAuthorize("hasAnyAuthority('ROLE_ADMIN', 'ADMIN', 'SUPERVISOR')")
     public ResponseEntity<Map<String, String>> addHoliday(
             @PathVariable String acronym,
             @RequestBody Map<String, String> body) {
-        LocalDate date = LocalDate.parse(body.get("date"));
+        // R1-753: nedostajuci/prazan "date" je bacao NPE (LocalDate.parse(null)) ili
+        // nejasan 400 bez poruke. Eksplicitno vrati 400 sa porukom; neispravan format
+        // (DateTimeParseException) takodje hvatamo i vracamo razumljiv 400.
+        LocalDate date = parseHolidayDate(body == null ? null : body.get("date"));
         exchangeManagementService.addHoliday(acronym, date);
         return ResponseEntity.ok(Map.of("message", "Added holiday " + date + " for " + acronym));
+    }
+
+    /**
+     * R1-753: parsira ISO datum praznika iz tela; baca
+     * {@link org.springframework.web.server.ResponseStatusException} (400) sa
+     * razumljivom porukom kad je {@code date} prazan ili nevalidan, umesto
+     * NPE/genericke greske.
+     */
+    private static LocalDate parseHolidayDate(String raw) {
+        if (raw == null || raw.isBlank()) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.BAD_REQUEST,
+                    "Polje 'date' je obavezno (ISO format YYYY-MM-DD).");
+        }
+        try {
+            return LocalDate.parse(raw.trim());
+        } catch (java.time.format.DateTimeParseException e) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.BAD_REQUEST,
+                    "Nevalidan datum '" + raw + "' (ocekivan ISO format YYYY-MM-DD).");
+        }
     }
 
     /**
@@ -95,7 +124,7 @@ public class ExchangeManagementController {
      * Uklanja praznik za berzu.
      */
     @DeleteMapping("/{acronym}/holidays/{date}")
-    @PreAuthorize("hasAnyRole('ADMIN', 'EMPLOYEE')")
+    @PreAuthorize("hasAnyAuthority('ROLE_ADMIN', 'ADMIN', 'SUPERVISOR')")
     public ResponseEntity<Map<String, String>> removeHoliday(
             @PathVariable String acronym,
             @PathVariable LocalDate date) {

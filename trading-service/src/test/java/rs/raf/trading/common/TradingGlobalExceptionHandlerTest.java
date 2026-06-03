@@ -195,4 +195,25 @@ class TradingGlobalExceptionHandlerTest {
         assertThat(response.getBody()).isNotNull();
         assertThat(response.getBody().getMessage()).contains("modifikovan");
     }
+
+    // ── P2-error-contract-2 R1 409 — nedovoljno sredstava/hartija → 409 (ne 400) ──
+
+    @Test
+    @DisplayName("InsufficientFundsException → 409 CONFLICT (ne 400)")
+    void insufficientFunds_mapsTo409() {
+        ResponseEntity<MessageResponseDto> response = handler.handleInsufficient(
+                new rs.raf.trading.order.exception.InsufficientFundsException("Nedovoljno sredstava"));
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().getMessage()).isEqualTo("Nedovoljno sredstava");
+    }
+
+    @Test
+    @DisplayName("InsufficientHoldingsException → 409 CONFLICT (ne 400)")
+    void insufficientHoldings_mapsTo409() {
+        ResponseEntity<MessageResponseDto> response = handler.handleInsufficient(
+                new rs.raf.trading.order.exception.InsufficientHoldingsException("Nedovoljno hartija"));
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().getMessage()).isEqualTo("Nedovoljno hartija");
+    }
 }

@@ -69,13 +69,26 @@ class OtpEmailTemplateTest {
 
     @Test
     void buildBody_containsAttemptInfo() {
+        // Maksimalan broj pokusaja se enforce-uje u banka-core (OTP servis), ne ovde,
+        // pa email koristi genericku formulaciju kako poruka ne bi mogla da odlutava
+        // od stvarnog limita.
         String body = template.buildBody("111111", 5);
-        assertThat(body).contains("3 pokusaja");
+        assertThat(body).contains("ogranicen broj pokusaja");
+        assertThat(body).doesNotContain("3 pokusaja");
     }
 
     @Test
     void buildBody_containsAutoMessageFooter() {
         String body = template.buildBody("111111", 5);
         assertThat(body).contains("automatska poruka");
+    }
+
+    // ── [P1-notif-svc-1 / 1528] HTML injection u code ──────────────────────
+
+    @Test
+    void buildBody_escapesHtmlInCode() {
+        String body = template.buildBody("<img src=x onerror=alert(1)>", 5);
+        assertThat(body).doesNotContain("<img src=x");
+        assertThat(body).contains("&lt;img");
     }
 }

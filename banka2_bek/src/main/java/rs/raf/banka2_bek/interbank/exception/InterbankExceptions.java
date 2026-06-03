@@ -13,15 +13,35 @@ package rs.raf.banka2_bek.interbank.exception;
    │                                     malformed JSON)
    ├─ InterbankIdempotencyException    — §2.2 konflikti pri trajnom belezenju
    │                                     idempotence kljuceva
-   └─ InterbankTransactionStuckException — retry scheduler odustao posle MAX_RETRY
+   ├─ InterbankTransactionStuckException — retry scheduler odustao posle MAX_RETRY
+   │  ── OTC negotiation/exercise (NE prolaze kroz inbound advice; vidi nize) ──
+   ├─ InterbankNegotiationConflictException — §3.3 turn-violation / zatvoren
+   │                                     pregovor (409 Conflict)
+   ├─ InterbankUserNotFoundException   — §3.7 GET /user/{rn}/{id} nepostojeci (404)
+   ├─ InterbankNegotiationNotFoundException — §3.3-§3.6 nepostojeci pregovor (404)
+   └─ InterbankExerciseConflictException — §2.7.2 exercise nad ne-ACTIVE / posle
+                                          settlement / pogresna strana (409 Conflict)
 
- HTTP MAPING (u @RestControllerAdvice):
-   InterbankCommunicationException     -> 502 Bad Gateway
-   InterbankAuthException              -> 401 Unauthorized (outbound problem)
-                                       -> 401 takodje za inbound los token
-   InterbankProtocolException          -> 400 Bad Request
-   InterbankIdempotencyException       -> 500 (retry pokupi)
-   InterbankTransactionStuckException  -> 500 (manuelna intervencija)
+ HTTP MAPING — R1-684: pre-fix doc je tvrdio 502/500 mappinge koje INBOUND advice
+ (InterbankExceptionHandler, assignableTypes=InterbankInboundController) NE radi.
+ Realno stanje inbound advice-a (@RestControllerAdvice za inbound 2PC kontroler):
+   InterbankAuthException              -> 401 Unauthorized (inbound los X-Api-Key)
+   InterbankProtocolException          -> 400 Bad Request   (malformed/unbalanced envelope)
+   JsonProcessingException             -> 400 Bad Request   (malformed JSON)
+   SVE OSTALO (Communication/Idempotency/Stuck/...) -> 500 Internal Server Error
+                                          (handleGeneral catch-all)
+
+ NAPOMENA 1: cetiri OTC negotiation/exercise tipa (NegotiationConflict 409,
+ UserNotFound 404, NegotiationNotFound 404, ExerciseConflict 409) se NE mapiraju
+ kroz inbound 2PC advice — njih hvataju posebni OTC advice-i (OtcNegotiationExceptionHandler
+ za negotiation kontroler, InterbankOtcWrapperExceptionHandler za wrapper kontroler),
+ pa NE padaju u gornji 500 catch-all.
+
+ NAPOMENA 2: InterbankCommunicationException je OUTBOUND pojam (mi zovemo partnera i
+ dobijemo timeout/5xx) — ne baca se tokom inbound obrade pa ga inbound advice i ne
+ mapira posebno; outbound pozivi ga hvataju lokalno (vidi InterbankRetryScheduler /
+ InterbankClient). InterbankIdempotency/Stuck na inbound putu padaju na 500 (retry/
+ manuelna intervencija ih kasnije razresava).
 ================================================================================
 */
 public final class InterbankExceptions {

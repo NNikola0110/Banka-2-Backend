@@ -71,14 +71,14 @@ class LoanControllerCoverageTest {
                 .remainingDebt(BigDecimal.ZERO)
                 .status("PAID_OFF")
                 .build();
-        when(loanService.earlyRepayment(eq(1L), anyString(), org.mockito.ArgumentMatchers.nullable(String.class))).thenReturn(dto);
+        when(loanService.earlyRepayment(eq(1L), anyString())).thenReturn(dto);
 
         mockMvc.perform(post("/loans/1/early-repayment"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.id").value(1))
                 .andExpect(jsonPath("$.status").value("PAID_OFF"));
 
-        verify(loanService).earlyRepayment(eq(1L), eq("klijent@example.com"), org.mockito.ArgumentMatchers.nullable(String.class));
+        verify(loanService).earlyRepayment(eq(1L), eq("klijent@example.com"));
     }
 
     @Test
@@ -93,18 +93,18 @@ class LoanControllerCoverageTest {
                         null));
 
         LoanResponseDto dto = LoanResponseDto.builder().id(1L).status("PAID_OFF").build();
-        when(loanService.earlyRepayment(eq(1L), eq("ud@example.com"), org.mockito.ArgumentMatchers.nullable(String.class))).thenReturn(dto);
+        when(loanService.earlyRepayment(eq(1L), eq("ud@example.com"))).thenReturn(dto);
 
         mockMvc.perform(post("/loans/1/early-repayment"))
                 .andExpect(status().isOk());
 
-        verify(loanService).earlyRepayment(eq(1L), eq("ud@example.com"), org.mockito.ArgumentMatchers.nullable(String.class));
+        verify(loanService).earlyRepayment(eq(1L), eq("ud@example.com"));
     }
 
     @Test
     @DisplayName("POST /loans/999/early-repayment - 404 kad kredit ne postoji")
     void earlyRepayment_notFound_returns404() throws Exception {
-        when(loanService.earlyRepayment(eq(999L), anyString(), org.mockito.ArgumentMatchers.nullable(String.class)))
+        when(loanService.earlyRepayment(eq(999L), anyString()))
                 .thenThrow(new EntityNotFoundException("Kredit nije pronadjen"));
 
         mockMvc.perform(post("/loans/999/early-repayment"))
@@ -115,7 +115,7 @@ class LoanControllerCoverageTest {
     @Test
     @DisplayName("POST /loans/1/early-repayment - 400 kad je kredit vec otplacen")
     void earlyRepayment_alreadyPaid_returns400() throws Exception {
-        when(loanService.earlyRepayment(eq(1L), anyString(), org.mockito.ArgumentMatchers.nullable(String.class)))
+        when(loanService.earlyRepayment(eq(1L), anyString()))
                 .thenThrow(new IllegalArgumentException("Kredit je vec otplacen"));
 
         mockMvc.perform(post("/loans/1/early-repayment"))

@@ -38,14 +38,11 @@ public interface PriceAlertRepository extends JpaRepository<PriceAlert, Long> {
     Optional<PriceAlert> findByOwnerIdAndOwnerTypeAndListingIdAndConditionAndActiveTrue(
             Long ownerId, String ownerType, Long listingId, PriceAlertCondition condition);
 
-    /** Svi aktivni alarmi — koristi scheduler za scan. */
-    List<PriceAlert> findByActiveTrue();
-
     /** Aktivni alarmi za konkretne listinge — koristi scheduler za batch evaluaciju. */
     List<PriceAlert> findByActiveTrueAndListingIdIn(List<Long> listingIds);
 
-    /** Lookup po id-u uz ownership check (koristi se u DELETE flow-u). */
-    Optional<PriceAlert> findByIdAndOwnerIdAndOwnerType(Long id, Long ownerId, String ownerType);
+    /** [P2-input-validation-1 / R1 517] broj AKTIVNIH alarma po korisniku (DoS limit guard). */
+    long countByOwnerIdAndOwnerTypeAndActiveTrue(Long ownerId, String ownerType);
 
     /** Distinct listingId-evi sa aktivnim alarmima (efikasno scheduler scan). */
     @Query("SELECT DISTINCT a.listingId FROM PriceAlert a WHERE a.active = true")
@@ -67,4 +64,16 @@ public interface PriceAlertRepository extends JpaRepository<PriceAlert, Long> {
             + "WHERE pa.id = :id AND pa.active = true")
     int deactivateAlertIfActive(@Param("id") Long id,
                                 @Param("triggeredAt") LocalDateTime triggeredAt);
+
+    /**
+     * R2-1382 — RE-AKTIVIRA alarm i ponistava {@code triggeredAt} (kompenzacija).
+     * Koristi se kad atomicna deaktivacija uspe ali isporuka notifikacije
+     * ({@code PRICE_ALERT_TRIGGERED}) padne (npr. RabbitMQ down) — alarm se vraca
+     * u aktivno stanje da bi se ponovo okidao sledeci ciklus (at-least-once
+     * isporuka notifikacije), umesto da ostane tiho deaktiviran bez ikakve
+     * notifikacije korisniku.
+     */
+    @Modifying
+    @Query("UPDATE PriceAlert pa SET pa.active = true, pa.triggeredAt = null WHERE pa.id = :id")
+    int reactivateAlert(@Param("id") Long id);
 }

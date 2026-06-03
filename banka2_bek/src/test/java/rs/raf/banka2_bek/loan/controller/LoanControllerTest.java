@@ -195,10 +195,13 @@ class LoanControllerTest {
 
     @Test
     @DisplayName("GET /loans/my - 200 OK with loans")
-    @org.junit.jupiter.api.Disabled void getMyLoans_returnsPage() throws Exception {
+    void getMyLoans_returnsPage() throws Exception {
         setupSecurityContext("marko@banka.rs");
 
-        Page<LoanResponseDto> page = new PageImpl<>(List.of(testLoan));
+        // Page mora da nosi konkretan Pageable (kao u produkciji preko @PageableDefault),
+        // jer Spring Data Jackson PageModule (Spring Boot 4 / Jackson 3) baca gresku pri
+        // serijalizaciji Pageable.unpaged() Page-a. Produkcija uvek prosledi pravi Pageable.
+        Page<LoanResponseDto> page = new PageImpl<>(List.of(testLoan), PageRequest.of(0, 20), 1);
         when(loanService.getMyLoans(eq("marko@banka.rs"), any(Pageable.class))).thenReturn(page);
 
         mockMvc.perform(get("/loans/my"))
@@ -210,10 +213,10 @@ class LoanControllerTest {
 
     @Test
     @DisplayName("GET /loans/my - 200 OK empty")
-    @org.junit.jupiter.api.Disabled void getMyLoans_emptyPage() throws Exception {
+    void getMyLoans_emptyPage() throws Exception {
         setupSecurityContext("marko@banka.rs");
 
-        Page<LoanResponseDto> page = new PageImpl<>(List.of());
+        Page<LoanResponseDto> page = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0);
         when(loanService.getMyLoans(eq("marko@banka.rs"), any(Pageable.class))).thenReturn(page);
 
         mockMvc.perform(get("/loans/my"))
@@ -293,8 +296,8 @@ class LoanControllerTest {
 
     @Test
     @DisplayName("GET /loans/requests - 200 OK all requests")
-    @org.junit.jupiter.api.Disabled void getLoanRequests_returnsPage() throws Exception {
-        Page<LoanRequestResponseDto> page = new PageImpl<>(List.of(testLoanRequest));
+    void getLoanRequests_returnsPage() throws Exception {
+        Page<LoanRequestResponseDto> page = new PageImpl<>(List.of(testLoanRequest), PageRequest.of(0, 20), 1);
         when(loanService.getLoanRequests(any(), any(Pageable.class))).thenReturn(page);
 
         mockMvc.perform(get("/loans/requests"))
@@ -305,8 +308,8 @@ class LoanControllerTest {
 
     @Test
     @DisplayName("GET /loans/requests?status=PENDING - 200 OK filtered")
-    @org.junit.jupiter.api.Disabled void getLoanRequests_filteredByStatus() throws Exception {
-        Page<LoanRequestResponseDto> page = new PageImpl<>(List.of(testLoanRequest));
+    void getLoanRequests_filteredByStatus() throws Exception {
+        Page<LoanRequestResponseDto> page = new PageImpl<>(List.of(testLoanRequest), PageRequest.of(0, 20), 1);
         when(loanService.getLoanRequests(eq(LoanStatus.PENDING), any(Pageable.class))).thenReturn(page);
 
         mockMvc.perform(get("/loans/requests")
@@ -376,8 +379,8 @@ class LoanControllerTest {
 
     @Test
     @DisplayName("GET /loans - 200 OK all loans")
-    @org.junit.jupiter.api.Disabled void getAllLoans_returnsPage() throws Exception {
-        Page<LoanResponseDto> page = new PageImpl<>(List.of(testLoan));
+    void getAllLoans_returnsPage() throws Exception {
+        Page<LoanResponseDto> page = new PageImpl<>(List.of(testLoan), PageRequest.of(0, 20), 1);
         when(loanService.getAllLoans(any(), any(), any(), any(Pageable.class))).thenReturn(page);
 
         mockMvc.perform(get("/loans"))
@@ -388,8 +391,8 @@ class LoanControllerTest {
 
     @Test
     @DisplayName("GET /loans?loanType=CASH&status=ACTIVE - 200 OK filtered")
-    @org.junit.jupiter.api.Disabled void getAllLoans_filtered() throws Exception {
-        Page<LoanResponseDto> page = new PageImpl<>(List.of(testLoan));
+    void getAllLoans_filtered() throws Exception {
+        Page<LoanResponseDto> page = new PageImpl<>(List.of(testLoan), PageRequest.of(0, 20), 1);
         when(loanService.getAllLoans(eq(LoanType.CASH), eq(LoanStatus.ACTIVE), any(), any(Pageable.class)))
                 .thenReturn(page);
 
@@ -402,8 +405,8 @@ class LoanControllerTest {
 
     @Test
     @DisplayName("GET /loans?accountNumber=222000112345678910 - 200 OK filtered by account")
-    @org.junit.jupiter.api.Disabled void getAllLoans_filteredByAccount() throws Exception {
-        Page<LoanResponseDto> page = new PageImpl<>(List.of(testLoan));
+    void getAllLoans_filteredByAccount() throws Exception {
+        Page<LoanResponseDto> page = new PageImpl<>(List.of(testLoan), PageRequest.of(0, 20), 1);
         when(loanService.getAllLoans(any(), any(), eq("222000112345678910"), any(Pageable.class)))
                 .thenReturn(page);
 

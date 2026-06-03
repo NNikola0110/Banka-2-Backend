@@ -15,22 +15,31 @@ import rs.raf.trading.investmentfund.repository.FundValueSnapshotRepository;
 import rs.raf.trading.investmentfund.repository.InvestmentFundRepository;
 import rs.raf.trading.investmentfund.service.FundValueCalculator;
 
+import jakarta.annotation.PreDestroy;
+
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
- * NAPOMENA (copy-first ekstrakcija, faza 2c — uspavani scheduler):
- * {@code TradingServiceApplication} NEMA {@code @EnableScheduling} do cutover-a
- * (2f), pa {@code @Scheduled} metode ({@link #onPostSeedSnapshotAllFunds},
- * {@link #snapshotAllFunds}) NE okidaju — sprecava duplo izvrsavanje dok
- * monolit jos uvek vrti svoj snapshot scheduler.
+ * NAPOMENA (post-cutover 2f): dnevni {@code @Scheduled} cron {@link #snapshotAllFunds}
+ * je AKTIVAN — {@link rs.raf.trading.config.SchedulingConfig} nosi {@code @EnableScheduling}
+ * (gejtovano {@code trading.scheduling.enabled}, uspavan samo u test profilu). Monolitna
+ * kopija snapshot schedulera je ugasena cutover-om, pa trading-service jedini snima
+ * vrednosti fondova.
  *
  * {@code @EventListener(ApplicationReadyEvent)} ({@link #onStartupSnapshotAllFunds})
- * NIJE gatovan {@code @EnableScheduling}-om — okida se na startup-u
- * trading-service. To je benigno: pre cutover-a {@code trading_db} nema fond
- * podatke pa {@code findByActiveTrueOrderByNameAsc()} vrati praznu listu i
- * petlja ne pravi nijedan {@code BankaCoreClient} poziv (no-op).
+ * okida se na startup-u trading-service (nezavisno od {@code @EnableScheduling}).
+ * Ono pokriva dva slucaja: (1) odmah po ApplicationReady-u (restart na vec popunjenoj
+ * bazi), i (2) jedan odlozeni "post-seed" snapshot 90s kasnije preko jednokratnog
+ * {@link ScheduledExecutorService} task-a — dovoljno da Docker seed servis ubaci fondove
+ * pre nego sto klijent otvori FundDetailsPage. Time je uklonjen
+ * {@code @Scheduled(fixedDelay=Long.MAX_VALUE)} "run-once" hack (R2 1445).
+ * Ako {@code trading_db} nema fond podatke, {@code findByActiveTrueOrderByNameAsc()}
+ * vrati praznu listu i petlja ne pravi nijedan {@code BankaCoreClient} poziv (no-op).
  *
  * {@link #snapshotFundIfMissing} NIJE scheduler — to je idempotentni helper
  * koji {@code InvestmentFundService.invest/withdraw} zove posle uspesne
@@ -48,6 +57,16 @@ public class FundValueSnapshotScheduler {
     private final BankaCoreClient bankaCoreClient;
     private final ClientFundPositionRepository clientFundPositionRepository;
 
+    /** Jednokratni izvrsilac za odlozeni post-seed snapshot (R2 1445 — zamena za fixedDelay-hack). */
+    private final ScheduledExecutorService postSeedExecutor =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "fund-snapshot-post-seed");
+                t.setDaemon(true);
+                return t;
+            });
+
+    private static final long POST_SEED_DELAY_SECONDS = 90L;
+
     /**
      * Bag prijavljen 10.05.2026: FundDetailsPage prikazuje "Performanse fonda"
      * graf prazan dok god u {@code fund_value_snapshots} ne postoji ijedan red
@@ -56,18 +75,13 @@ public class FundValueSnapshotScheduler {
      * ali svaki novi fond i svaki podizajan stack pre tog vremena pokazuje
      * graf prazan, sto deluje kao bag iako je samo "rano".
      *
-     * Resenje sa dva sloja:
-     *  1) {@link #onStartupSnapshotAllFunds} — odmah po ApplicationReady-u.
-     *     U Docker stack-u BE startuje pre seed-a, pa u tom trenutku jos
-     *     nema fondova, ali ovo i dalje pokriva slucajeve gde se BE
-     *     restart-uje na vec popunjenoj bazi.
-     *  2) {@link #onPostSeedSnapshotAllFunds} — okida se 90s posle startupa
-     *     (jednom). To je dovoljno vremena da seed servis (depends_on:
-     *     backend healthy) zavrsi insertovanje fondova kroz psql, pa
-     *     snapshot moze sve da pokrije pre nego sto klijent otvori
-     *     FundDetailsPage.
+     * Resenje sa dva sloja (oba kroz JEDAN startup hook, R2 1445):
+     *  1) odmah po ApplicationReady-u — pokriva BE restart na vec popunjenoj bazi.
+     *  2) jednokratni odlozeni snapshot {@value #POST_SEED_DELAY_SECONDS}s kasnije —
+     *     dovoljno da Docker seed servis (depends_on: backend healthy) ubaci fondove,
+     *     pa snapshot sve pokrije pre nego sto klijent otvori FundDetailsPage.
      *
-     * Oba poziva su idempotentna preko {@code existsByFundIdAndSnapshotDate}
+     * Oba prolaza su idempotentna preko {@code existsByFundIdAndSnapshotDate}
      * guard-a — nema duplikata cak i kad se stack restartuje vise puta u
      * toku istog dana.
      */
@@ -78,15 +92,18 @@ public class FundValueSnapshotScheduler {
         } catch (Exception e) {
             log.warn("Fund snapshot init pri startup-u nije uspeo: {}", e.getMessage());
         }
+        postSeedExecutor.schedule(() -> {
+            try {
+                snapshotAllFunds();
+            } catch (Exception e) {
+                log.warn("Fund snapshot {}s post-seed nije uspeo: {}", POST_SEED_DELAY_SECONDS, e.getMessage());
+            }
+        }, POST_SEED_DELAY_SECONDS, TimeUnit.SECONDS);
     }
 
-    @Scheduled(fixedDelay = Long.MAX_VALUE, initialDelay = 90_000)
-    public void onPostSeedSnapshotAllFunds() {
-        try {
-            snapshotAllFunds();
-        } catch (Exception e) {
-            log.warn("Fund snapshot 90s post-seed nije uspeo: {}", e.getMessage());
-        }
+    @PreDestroy
+    void shutdownPostSeedExecutor() {
+        postSeedExecutor.shutdownNow();
     }
 
     /**
@@ -104,21 +121,7 @@ public class FundValueSnapshotScheduler {
             return;
         }
         try {
-            BigDecimal fundValue = fundValueCalculator.computeFundValue(fund);
-            BigDecimal profit = fundValueCalculator.computeProfit(fund);
-            BigDecimal liquidAmount = nullToZero(bankaCoreClient.getAccount(fund.getAccountId()).balance());
-            BigDecimal investedTotal = clientFundPositionRepository.findByFundId(fund.getId()).stream()
-                    .map(ClientFundPosition::getTotalInvested)
-                    .reduce(BigDecimal.ZERO, BigDecimal::add);
-
-            FundValueSnapshot snapshot = new FundValueSnapshot();
-            snapshot.setFundId(fund.getId());
-            snapshot.setSnapshotDate(today);
-            snapshot.setFundValue(fundValue);
-            snapshot.setLiquidAmount(liquidAmount);
-            snapshot.setInvestedTotal(investedTotal);
-            snapshot.setProfit(profit);
-            fundValueSnapshotRepository.save(snapshot);
+            buildAndSaveSnapshot(fund, today);
         } catch (Exception e) {
             log.warn("Inline snapshot za fond #{} nije uspeo: {}", fund.getId(), e.getMessage());
         }
@@ -135,25 +138,34 @@ public class FundValueSnapshotScheduler {
                 if (fundValueSnapshotRepository.existsByFundIdAndSnapshotDate(fund.getId(), today)) {
                     continue;
                 }
-                BigDecimal fundValue = fundValueCalculator.computeFundValue(fund);
-                BigDecimal profit = fundValueCalculator.computeProfit(fund);
-                BigDecimal liquidAmount = nullToZero(bankaCoreClient.getAccount(fund.getAccountId()).balance());
-                BigDecimal investedTotal = clientFundPositionRepository.findByFundId(fund.getId()).stream()
-                        .map(ClientFundPosition::getTotalInvested)
-                        .reduce(BigDecimal.ZERO, BigDecimal::add);
-
-                FundValueSnapshot snapshot = new FundValueSnapshot();
-                snapshot.setFundId(fund.getId());
-                snapshot.setSnapshotDate(today);
-                snapshot.setFundValue(fundValue);
-                snapshot.setLiquidAmount(liquidAmount);
-                snapshot.setInvestedTotal(investedTotal);
-                snapshot.setProfit(profit);
-                fundValueSnapshotRepository.save(snapshot);
+                buildAndSaveSnapshot(fund, today);
             } catch (Exception e) {
                 log.error("Failed to snapshot fund #{}: {}", fund.getId(), e.getMessage());
             }
         }
+    }
+
+    /**
+     * R1 790 — deljeni "build + save" snapshot blok (ranije verbatim dupliran u
+     * {@link #snapshotFundIfMissing} i {@link #snapshotAllFunds}). Caller je odgovoran
+     * za {@code existsByFundIdAndSnapshotDate} guard pre poziva (idempotentnost).
+     */
+    private void buildAndSaveSnapshot(InvestmentFund fund, LocalDate today) {
+        BigDecimal fundValue = fundValueCalculator.computeFundValue(fund);
+        BigDecimal profit = fundValueCalculator.computeProfit(fund);
+        BigDecimal liquidAmount = nullToZero(bankaCoreClient.getAccount(fund.getAccountId()).balance());
+        BigDecimal investedTotal = clientFundPositionRepository.findByFundId(fund.getId()).stream()
+                .map(ClientFundPosition::getTotalInvested)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        FundValueSnapshot snapshot = new FundValueSnapshot();
+        snapshot.setFundId(fund.getId());
+        snapshot.setSnapshotDate(today);
+        snapshot.setFundValue(fundValue);
+        snapshot.setLiquidAmount(liquidAmount);
+        snapshot.setInvestedTotal(investedTotal);
+        snapshot.setProfit(profit);
+        fundValueSnapshotRepository.save(snapshot);
     }
 
     private static BigDecimal nullToZero(BigDecimal value) {

@@ -9,6 +9,7 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import rs.raf.trading.investmentfund.controller.InvestmentFundController;
+import rs.raf.trading.investmentfund.exception.FundInactiveException;
 import rs.raf.trading.order.exception.InsufficientFundsException;
 import rs.raf.trading.order.exception.UnsupportedCurrencyException;
 
@@ -63,6 +64,18 @@ public class InvestmentFundExceptionHandler {
     public ResponseEntity<Map<String, String>> handleIllegalState(IllegalStateException ex) {
         return ResponseEntity
                 .status(HttpStatus.FORBIDDEN)
+                .body(Map.of("message", ex.getMessage()));
+    }
+
+    /**
+     * R1 485 — neaktivan fond je state-conflict (409 CONFLICT), ne 403. Specifičan
+     * tip {@link FundInactiveException} pa ne dira ostale {@code IllegalStateException}
+     * mapinge (npr. "Only supervisors can create funds" ostaje 403).
+     */
+    @ExceptionHandler(FundInactiveException.class)
+    public ResponseEntity<Map<String, String>> handleFundInactive(FundInactiveException ex) {
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
                 .body(Map.of("message", ex.getMessage()));
     }
 }

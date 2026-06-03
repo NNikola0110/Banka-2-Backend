@@ -86,13 +86,23 @@ public class JwtService {
     }
 
     private boolean isTokenExpired(String token) {
-        Date expiration = Jwts.parser()
+        return extractExpiration(token).before(new Date());
+    }
+
+    /**
+     * Vraca {@code exp} claim tokena. Koristi {@link JwtBlacklistService} da
+     * izracuna per-token TTL (blacklist drzi svaki token tacno do njegovog
+     * STVARNOG isteka — access ~15min, refresh ~7 dana — umesto fiksnog TTL-a
+     * koji bi evict-ovao refresh token mnogo pre njegovog exp-a). Baca ako
+     * potpis/format nisu validni.
+     */
+    public Date extractExpiration(String token) {
+        return Jwts.parser()
                 .verifyWith(key)
                 .build()
                 .parseSignedClaims(token)
                 .getPayload()
                 .getExpiration();
-        return expiration.before(new Date());
     }
 
     public boolean isRefreshToken(String token) {

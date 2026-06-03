@@ -103,6 +103,30 @@ class EmployeeServiceImplTest {
     }
 
     @Test
+    void createEmployeeIgnoresActiveTrueInRequest_TEST_auth_4() {
+        // TEST-auth-4: createEmployee NAMERNO ignorise request.active. Cak i kad
+        // klijent posalje active=true u POST telu (npr. da bi zaobisao aktivaciju
+        // mejlom i odmah dobio aktivan nalog sa znanom temp lozinkom), servis tvrdo
+        // postavlja active=false dok se nalog ne aktivira preko ActivationToken-a.
+        // Postojeci happy-path test ne setuje active u requestu — ovaj pokriva
+        // eksplicitan active=true → saved.active==false (anti-bypass invarijanta).
+        createRequest.setActive(true);
+
+        when(employeeRepository.existsByEmail(createRequest.getEmail())).thenReturn(false);
+        when(employeeRepository.existsByUsername(createRequest.getUsername())).thenReturn(false);
+        when(passwordEncoder.encode(any())).thenReturn("encoded");
+        when(employeeRepository.save(any(Employee.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(activationTokenRepository.save(any(ActivationToken.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        employeeService.createEmployee(createRequest);
+
+        ArgumentCaptor<Employee> employeeCaptor = ArgumentCaptor.forClass(Employee.class);
+        verify(employeeRepository).save(employeeCaptor.capture());
+        // Uprkos active=true u requestu, sacuvani zaposleni je NEAKTIVAN.
+        assertThat(employeeCaptor.getValue().getActive()).isFalse();
+    }
+
+    @Test
     void createEmployeeRejectsDuplicateEmail() {
         when(employeeRepository.existsByEmail(createRequest.getEmail())).thenReturn(true);
 
@@ -219,5 +243,34 @@ class EmployeeServiceImplTest {
         employeeService.updateEmployee(21L, request);
 
         verify(tradingServiceInternalClient, never()).reassignFundManager(any(), any());
+    }
+
+    @Test
+    void updateEmployeePermissions_auditRecordsOldPermissions_R1_391() {
+        // R1 391: pre fix-a oldValue u PERMISSIONS_CHANGED je bio uvek null. Sad nosi
+        // stare permisije pa before/after audit ima smisla.
+        Employee emp = Employee.builder()
+                .id(30L)
+                .email("e30@test.com")
+                .permissions(new HashSet<>(Set.of("VIEW_STOCKS")))
+                .active(true)
+                .build();
+        when(employeeRepository.findById(30L)).thenReturn(Optional.of(emp));
+        when(employeeRepository.save(any(Employee.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        UpdateEmployeeRequestDto request = new UpdateEmployeeRequestDto();
+        request.setPermissions(Set.of("TRADE_STOCKS"));
+
+        employeeService.updateEmployee(30L, request);
+
+        ArgumentCaptor<String> oldValue = ArgumentCaptor.forClass(String.class);
+        verify(auditLogService).record(
+                any(), eq("EMPLOYEE"),
+                eq(rs.raf.banka2_bek.audit.model.AuditActionType.PERMISSIONS_CHANGED),
+                anyString(), eq("EMPLOYEE"), eq(30L),
+                oldValue.capture(), anyString());
+        // oldValue vise nije null — sadrzi stare permisije.
+        assertThat(oldValue.getValue()).isNotNull();
+        assertThat(oldValue.getValue()).contains("VIEW_STOCKS");
     }
 }

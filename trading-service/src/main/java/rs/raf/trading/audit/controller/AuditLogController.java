@@ -36,6 +36,7 @@ public class AuditLogController {
     public ResponseEntity<Page<AuditLogDto>> getAuditLogs(
             @RequestParam(required = false) String actionType,
             @RequestParam(required = false) Long actorId,
+            @RequestParam(required = false) String actorName,
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
             @RequestParam(defaultValue = "0") int page,
@@ -55,6 +56,15 @@ public class AuditLogController {
         LocalDateTime parsedTo = to != null ? LocalDateTime.parse(to) : null;
 
         PageRequest pageable = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "createdAt"));
+
+        // Sc45 (TODO_testovi): filter po IMENU aktera (supervizora). Numericki actorId
+        // ima prednost (specificniji, postojeci FE/Mobile filter); actorName je
+        // alternativni put (scenario "When unese ime supervizora u filter") — servis
+        // razresi ime u actorId-eve preko banka-core i filtrira po njima.
+        if (actorId == null && actorName != null && !actorName.isBlank()) {
+            return ResponseEntity.ok(auditLogService.queryByActorName(
+                    parsedActionType, actorName, parsedFrom, parsedTo, pageable));
+        }
         return ResponseEntity.ok(auditLogService.query(parsedActionType, actorId, parsedFrom, parsedTo, pageable));
     }
 

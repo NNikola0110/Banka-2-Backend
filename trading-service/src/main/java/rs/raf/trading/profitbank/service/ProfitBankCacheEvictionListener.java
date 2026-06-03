@@ -18,6 +18,11 @@ import rs.raf.trading.order.event.OrderCompletedEvent;
  * vec ignorise CLIENT i FUND), izbegavajuci nepotrebne evict-e za klijentske
  * trgovine. <code>allEntries=true</code> jer cache trenutno ima jedan key.</p>
  *
+ * <p>R1 803: {@code OrderCompletedEvent.userRole()} dolazi iz
+ * {@code order.getUserRole()} koji nosi domenski string (EMPLOYEE/CLIENT/FUND),
+ * NIKAD Spring-prefiks {@code ROLE_EMPLOYEE} — pa je ranija
+ * {@code || == 'ROLE_EMPLOYEE'} grana bila mrtva i uklonjena.</p>
+ *
  * <p>NAPOMENA (copy-first ekstrakcija, faza 2d-E): {@link OrderCompletedEvent}
  * je {@code rs.raf.trading.order.event.OrderCompletedEvent} — emit-uje ga
  * lokalni {@code OrderExecutionService}. Veza event -&gt; listener je u
@@ -33,7 +38,7 @@ public class ProfitBankCacheEvictionListener {
     @CacheEvict(
             value = ProfitBankCacheConfig.ACTUARY_PROFIT_CACHE,
             allEntries = true,
-            condition = "#event.userRole() == 'EMPLOYEE' || #event.userRole() == 'ROLE_EMPLOYEE'"
+            condition = "#event.userRole() == 'EMPLOYEE'"
     )
     public void onOrderCompleted(OrderCompletedEvent event) {
         log.debug("Evicting actuary-profit cache after order #{} ({} #{}) completed",

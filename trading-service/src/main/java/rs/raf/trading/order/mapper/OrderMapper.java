@@ -49,7 +49,7 @@ public final class OrderMapper {
         dto.setMargin(order.isMargin());
         dto.setCreatedAt(order.getCreatedAt());
         dto.setAccountId(order.getAccountId());
-        dto.setApproximatePrice(calculateApproximatePrice(order));
+        dto.setApproximatePrice(resolveApproximatePrice(order));
         dto.setListingSettlementDate(order.getListing() != null ? order.getListing().getSettlementDate() : null);
         dto.setFxCommission(order.getFxCommission());
         dto.setExchangeRate(order.getExchangeRate());
@@ -77,9 +77,32 @@ public final class OrderMapper {
         return order;
     }
 
+    /**
+     * R1-720: vraca PERSISTOVANU {@code approximatePrice} (vrednost koja je
+     * stvarno rezervisana/koriscena u order-flow-u — {@code OrderServiceImpl}
+     * je upisuje pri kreiranju). Rekalkulacija iz {@code pricePerUnit×qty×cs}
+     * moze da DIVERGIRA od persistovane vrednosti (npr. ako se {@code pricePerUnit}
+     * naknadno azurira fill-om), pa je DTO prikazivao drugaciji iznos od onog
+     * koji je rezervisan. Fallback na rekalkulaciju samo za legacy ordere bez
+     * persistovane vrednosti (stari seed pre uvodjenja kolone).
+     */
+    private static BigDecimal resolveApproximatePrice(Order order) {
+        if (order.getApproximatePrice() != null) {
+            return order.getApproximatePrice();
+        }
+        return calculateApproximatePrice(order);
+    }
+
     private static BigDecimal calculateApproximatePrice(Order order) {
         if (order.getPricePerUnit() == null || order.getQuantity() == null) return null;
-        int cs = order.getContractSize() != null ? order.getContractSize() : 1;
+        // OT-1048: default contractSize po tipu hartije (FOREX → 1000 per spec §162),
+        // ne slepo 1 — uskladjeno sa OrderServiceImpl rezervacijom i ListingMapper
+        // display-em. Produkcioni order uvek nosi persistovani contractSize (postavlja
+        // ga OrderServiceImpl iz listinga), pa je ovo fallback samo za legacy order-e
+        // bez te kolone; tip se uzima sa order.listing kad postoji.
+        rs.raf.trading.stock.model.ListingType type =
+                order.getListing() != null ? order.getListing().getListingType() : null;
+        int cs = rs.raf.trading.stock.model.ContractSize.resolve(order.getContractSize(), type);
         return BigDecimal.valueOf(cs)
                 .multiply(order.getPricePerUnit())
                 .multiply(BigDecimal.valueOf(order.getQuantity()))

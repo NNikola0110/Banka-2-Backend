@@ -70,7 +70,13 @@ class ActuaryServiceImplTest {
 
     @BeforeEach
     void setUp() {
-        // Bez globalnih stub-ova — svaki test stubuje sta mu treba.
+        // R2-1357: updateAgentLimit sada koristi saveAndFlush (da OLE iskoci
+        // sinhrono za retry). Globalni lenient stub vraca prosledjeni entitet —
+        // success-path testovi verifikuju saveAndFlush, validation-fail testovi
+        // verifikuju never().save()/saveAndFlush().
+        org.mockito.Mockito.lenient()
+                .when(actuaryInfoRepository.saveAndFlush(any(ActuaryInfo.class)))
+                .thenAnswer(inv -> inv.getArgument(0));
     }
 
     private InternalUserDto employee(Long id, String firstName, String lastName, String email) {
@@ -204,11 +210,12 @@ class ActuaryServiceImplTest {
         }
 
         @Test
-        @DisplayName("baca izuzetak ako zapis ne postoji")
+        @DisplayName("R1-186: baca EntityNotFound (404) ako zapis ne postoji")
         void notFound() {
             when(actuaryInfoRepository.findByEmployeeId(999L)).thenReturn(Optional.empty());
 
-            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+            jakarta.persistence.EntityNotFoundException ex = assertThrows(
+                    jakarta.persistence.EntityNotFoundException.class,
                     () -> actuaryService.getActuaryInfo(999L));
 
             assertTrue(ex.getMessage().contains("999"));
@@ -259,7 +266,7 @@ class ActuaryServiceImplTest {
             assertEquals(new BigDecimal("250000"), result.getDailyLimit());
             assertTrue(result.isNeedApproval());
             assertEquals(new BigDecimal("15000"), result.getUsedLimit());
-            verify(actuaryInfoRepository).save(agentInfo);
+            verify(actuaryInfoRepository).saveAndFlush(agentInfo);
         }
 
         @Test
@@ -284,7 +291,7 @@ class ActuaryServiceImplTest {
 
             assertEquals(new BigDecimal("100000"), result.getDailyLimit());
             assertTrue(result.isNeedApproval());
-            verify(actuaryInfoRepository).save(agentInfo);
+            verify(actuaryInfoRepository).saveAndFlush(agentInfo);
         }
 
         @Test
@@ -308,7 +315,7 @@ class ActuaryServiceImplTest {
         }
 
         @Test
-        @DisplayName("nije dozvoljeno menjati supervizora")
+        @DisplayName("R1-744: cilj nije agent (supervizor) → IllegalArgumentException (400), ne bare RuntimeException (500)")
         void cannotUpdateSupervisor() {
             setAuthenticatedEmployee(20L);
 
@@ -321,7 +328,10 @@ class ActuaryServiceImplTest {
             when(actuaryInfoRepository.findByEmployeeId(20L)).thenReturn(Optional.of(supervisorInfo));
             when(actuaryInfoRepository.findByEmployeeId(30L)).thenReturn(Optional.of(targetSupervisorInfo));
 
-            RuntimeException ex = assertThrows(RuntimeException.class,
+            // R1-744: domenski tip je IllegalArgumentException (mapira na 400 u
+            // ActuaryExceptionHandler), a NE goli RuntimeException (koji bi pao na
+            // globalni handler → 500). assertThrows na konkretan tip pinuje to.
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
                     () -> actuaryService.updateAgentLimit(30L, dto));
 
             assertTrue(ex.getMessage().contains("only be updated for agents"));
@@ -341,6 +351,167 @@ class ActuaryServiceImplTest {
                     () -> actuaryService.updateAgentLimit(10L, dto));
 
             assertTrue(ex.getMessage().contains("autentifikovanog korisnika"));
+        }
+
+        // ── P2-9 (Celina 3 S3): novi limit ne sme biti ispod usedLimit ─────
+
+        @Test
+        @DisplayName("P2-9 S3: odbija novi dailyLimit ispod vec potrosenog usedLimit-a (400)")
+        void rejectsNewLimitBelowUsedLimit() {
+            setAuthenticatedEmployee(20L);
+
+            ActuaryInfo supervisorInfo = createSupervisorInfo(5L, 20L);
+            // agent je vec potrosio 15000 od limita
+            ActuaryInfo agentInfo = createAgentInfo(1L, 10L,
+                    new BigDecimal("100000"), new BigDecimal("15000"), false);
+
+            UpdateActuaryLimitDto dto = new UpdateActuaryLimitDto();
+            dto.setDailyLimit(new BigDecimal("10000")); // ispod usedLimit=15000
+
+            when(actuaryInfoRepository.findByEmployeeId(20L)).thenReturn(Optional.of(supervisorInfo));
+            when(actuaryInfoRepository.findByEmployeeId(10L)).thenReturn(Optional.of(agentInfo));
+
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                    () -> actuaryService.updateAgentLimit(10L, dto));
+
+            assertTrue(ex.getMessage().contains("below already used limit"));
+            verify(actuaryInfoRepository, never()).save(any());
+        }
+
+        @Test
+        @DisplayName("P2-9 S3: prihvata novi dailyLimit tacno jednak usedLimit-u")
+        void acceptsNewLimitEqualToUsedLimit() {
+            setAuthenticatedEmployee(20L);
+
+            ActuaryInfo supervisorInfo = createSupervisorInfo(5L, 20L);
+            ActuaryInfo agentInfo = createAgentInfo(1L, 10L,
+                    new BigDecimal("100000"), new BigDecimal("15000"), false);
+
+            UpdateActuaryLimitDto dto = new UpdateActuaryLimitDto();
+            dto.setDailyLimit(new BigDecimal("15000")); // == usedLimit
+
+            when(actuaryInfoRepository.findByEmployeeId(20L)).thenReturn(Optional.of(supervisorInfo));
+            when(actuaryInfoRepository.findByEmployeeId(10L)).thenReturn(Optional.of(agentInfo));
+            when(actuaryInfoRepository.save(any(ActuaryInfo.class))).thenAnswer(inv -> inv.getArgument(0));
+            when(bankaCoreClient.getUserById("EMPLOYEE", 10L))
+                    .thenReturn(employee(10L, "Marko", "Markovic", "marko@banka.rs"));
+
+            ActuaryInfoDto result = actuaryService.updateAgentLimit(10L, dto);
+
+            assertEquals(new BigDecimal("15000"), result.getDailyLimit());
+            verify(actuaryInfoRepository).saveAndFlush(agentInfo);
+        }
+
+        @Test
+        @DisplayName("P2-9 S3: prihvata novi dailyLimit iznad usedLimit-a")
+        void acceptsNewLimitAboveUsedLimit() {
+            setAuthenticatedEmployee(20L);
+
+            ActuaryInfo supervisorInfo = createSupervisorInfo(5L, 20L);
+            ActuaryInfo agentInfo = createAgentInfo(1L, 10L,
+                    new BigDecimal("100000"), new BigDecimal("15000"), false);
+
+            UpdateActuaryLimitDto dto = new UpdateActuaryLimitDto();
+            dto.setDailyLimit(new BigDecimal("20000")); // iznad usedLimit
+
+            when(actuaryInfoRepository.findByEmployeeId(20L)).thenReturn(Optional.of(supervisorInfo));
+            when(actuaryInfoRepository.findByEmployeeId(10L)).thenReturn(Optional.of(agentInfo));
+            when(actuaryInfoRepository.save(any(ActuaryInfo.class))).thenAnswer(inv -> inv.getArgument(0));
+            when(bankaCoreClient.getUserById("EMPLOYEE", 10L))
+                    .thenReturn(employee(10L, "Marko", "Markovic", "marko@banka.rs"));
+
+            ActuaryInfoDto result = actuaryService.updateAgentLimit(10L, dto);
+
+            assertEquals(new BigDecimal("20000"), result.getDailyLimit());
+            verify(actuaryInfoRepository).saveAndFlush(agentInfo);
+        }
+
+        @Test
+        @DisplayName("R2-1357: optimistic-lock konflikt → retry sa svezim usedLimit-om")
+        void retriesOnOptimisticLockConflict() {
+            setAuthenticatedEmployee(20L);
+
+            ActuaryInfo supervisorInfo = createSupervisorInfo(5L, 20L);
+            // prvi read: usedLimit=15000
+            ActuaryInfo firstRead = createAgentInfo(1L, 10L,
+                    new BigDecimal("100000"), new BigDecimal("15000"), false);
+            // posle konkurentnog increment-a: usedLimit=18000 (svez red)
+            ActuaryInfo secondRead = createAgentInfo(1L, 10L,
+                    new BigDecimal("100000"), new BigDecimal("18000"), false);
+
+            UpdateActuaryLimitDto dto = new UpdateActuaryLimitDto();
+            dto.setDailyLimit(new BigDecimal("250000"));
+
+            when(actuaryInfoRepository.findByEmployeeId(20L)).thenReturn(Optional.of(supervisorInfo));
+            // initial lookup (u updateAgentLimit) → firstRead; retry re-read → secondRead
+            when(actuaryInfoRepository.findByEmployeeId(10L))
+                    .thenReturn(Optional.of(firstRead))
+                    .thenReturn(Optional.of(secondRead));
+            // prvi saveAndFlush puca OLE, drugi prolazi
+            when(actuaryInfoRepository.saveAndFlush(any(ActuaryInfo.class)))
+                    .thenThrow(new org.springframework.orm.ObjectOptimisticLockingFailureException(ActuaryInfo.class, 10L))
+                    .thenAnswer(inv -> inv.getArgument(0));
+            when(bankaCoreClient.getUserById("EMPLOYEE", 10L))
+                    .thenReturn(employee(10L, "Marko", "Markovic", "marko@banka.rs"));
+
+            ActuaryInfoDto result = actuaryService.updateAgentLimit(10L, dto);
+
+            assertEquals(new BigDecimal("250000"), result.getDailyLimit());
+            // posle retry-ja persistovan je svez red (usedLimit=18000 ocuvan).
+            assertEquals(new BigDecimal("18000"), result.getUsedLimit());
+            verify(actuaryInfoRepository, times(2)).saveAndFlush(any(ActuaryInfo.class));
+        }
+
+        @Test
+        @DisplayName("R2-1357: konkurentni increment digao usedLimit iznad novog limita → 400 na retry-u")
+        void retryRevalidatesBelowUsedLimit() {
+            setAuthenticatedEmployee(20L);
+
+            ActuaryInfo supervisorInfo = createSupervisorInfo(5L, 20L);
+            // prvi read: usedLimit=15000 (novi limit 20000 je iznad → prosao bi)
+            ActuaryInfo firstRead = createAgentInfo(1L, 10L,
+                    new BigDecimal("100000"), new BigDecimal("15000"), false);
+            // svez red posle konkurentnog increment-a: usedLimit=25000 (iznad novog limita)
+            ActuaryInfo secondRead = createAgentInfo(1L, 10L,
+                    new BigDecimal("100000"), new BigDecimal("25000"), false);
+
+            UpdateActuaryLimitDto dto = new UpdateActuaryLimitDto();
+            dto.setDailyLimit(new BigDecimal("20000"));
+
+            when(actuaryInfoRepository.findByEmployeeId(20L)).thenReturn(Optional.of(supervisorInfo));
+            when(actuaryInfoRepository.findByEmployeeId(10L))
+                    .thenReturn(Optional.of(firstRead))
+                    .thenReturn(Optional.of(secondRead));
+            when(actuaryInfoRepository.saveAndFlush(any(ActuaryInfo.class)))
+                    .thenThrow(new org.springframework.orm.ObjectOptimisticLockingFailureException(ActuaryInfo.class, 10L));
+
+            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                    () -> actuaryService.updateAgentLimit(10L, dto));
+
+            assertTrue(ex.getMessage().contains("below already used limit"));
+        }
+
+        @Test
+        @DisplayName("P2-9 S3: tretira null usedLimit kao 0 (bilo koji pozitivan limit prolazi)")
+        void treatsNullUsedLimitAsZero() {
+            setAuthenticatedEmployee(20L);
+
+            ActuaryInfo supervisorInfo = createSupervisorInfo(5L, 20L);
+            ActuaryInfo agentInfo = createAgentInfo(1L, 10L,
+                    new BigDecimal("100000"), null, false);
+
+            UpdateActuaryLimitDto dto = new UpdateActuaryLimitDto();
+            dto.setDailyLimit(new BigDecimal("1"));
+
+            when(actuaryInfoRepository.findByEmployeeId(20L)).thenReturn(Optional.of(supervisorInfo));
+            when(actuaryInfoRepository.findByEmployeeId(10L)).thenReturn(Optional.of(agentInfo));
+            when(actuaryInfoRepository.save(any(ActuaryInfo.class))).thenAnswer(inv -> inv.getArgument(0));
+            when(bankaCoreClient.getUserById("EMPLOYEE", 10L))
+                    .thenReturn(employee(10L, "Marko", "Markovic", "marko@banka.rs"));
+
+            ActuaryInfoDto result = actuaryService.updateAgentLimit(10L, dto);
+
+            assertEquals(new BigDecimal("1"), result.getDailyLimit());
         }
     }
 
@@ -495,7 +666,7 @@ class ActuaryServiceImplTest {
             assertEquals(new BigDecimal("250000.00"), result.getDailyLimit());
             assertTrue(result.isNeedApproval());
             assertEquals("AGENT", result.getActuaryType());
-            verify(actuaryInfoRepository).save(agentInfo);
+            verify(actuaryInfoRepository).saveAndFlush(agentInfo);
         }
 
         @Test
@@ -619,7 +790,9 @@ class ActuaryServiceImplTest {
             when(actuaryInfoRepository.findByEmployeeId(1L)).thenReturn(Optional.of(supervisorInfo));
             when(actuaryInfoRepository.findByEmployeeId(5L)).thenReturn(Optional.empty());
 
-            IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+            // R1-186: ciljani ne postoji → EntityNotFound (404), ne IAE.
+            jakarta.persistence.EntityNotFoundException ex = assertThrows(
+                    jakarta.persistence.EntityNotFoundException.class,
                     () -> actuaryService.updateAgentLimit(5L, dto));
 
             assertTrue(ex.getMessage().contains("isn't an actuary"));

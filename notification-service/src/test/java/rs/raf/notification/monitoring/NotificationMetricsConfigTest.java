@@ -24,11 +24,4 @@ class NotificationMetricsConfigTest {
         Counter c = config.emailsSentCounter(registry);
         assertThat(c.getId().getName()).isEqualTo("banka2_emails_sent_total");
     }
-
-    @Test
-    void emailsFailedCounter_acceptsReasonTag() {
-        Counter c = config.emailsFailedCounter(registry, "smtp_error");
-        assertThat(c.getId().getName()).isEqualTo("banka2_emails_failed_total");
-        assertThat(c.getId().getTag("reason")).isEqualTo("smtp_error");
-    }
 }

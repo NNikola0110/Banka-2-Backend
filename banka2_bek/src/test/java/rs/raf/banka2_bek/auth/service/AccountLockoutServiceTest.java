@@ -59,8 +59,12 @@ class AccountLockoutServiceTest {
         user.setFailedLoginAttempts(0);
         user.setAccountLockedUntil(null);
 
-        when(employeeRepository.findByEmail(any())).thenReturn(Optional.empty());
-        when(userRepository.findByEmail("alice@example.com")).thenReturn(Optional.of(user));
+        when(employeeRepository.findByEmailIgnoreCase(any())).thenReturn(Optional.empty());
+        when(employeeRepository.findByEmailIgnoreCaseForUpdate(any())).thenReturn(Optional.empty());
+        when(userRepository.findByEmailIgnoreCase("alice@example.com")).thenReturn(Optional.of(user));
+        // R1-618: mutirajuce putanje (recordFailure/recordSuccess/assertNotLocked) sad
+        // koriste locking finder (PESSIMISTIC_WRITE) — mockuje se na isti entitet.
+        when(userRepository.findByEmailIgnoreCaseForUpdate("alice@example.com")).thenReturn(Optional.of(user));
         when(userRepository.save(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
     }
 
@@ -150,7 +154,7 @@ class AccountLockoutServiceTest {
     @Test
     @DisplayName("Ne postojeci email — no-op")
     void unknownEmail_noOp() {
-        when(userRepository.findByEmail(any())).thenReturn(Optional.empty());
+        when(userRepository.findByEmailIgnoreCase(any())).thenReturn(Optional.empty());
 
         service.recordFailure("unknown@example.com");
         service.recordSuccess("unknown@example.com");
@@ -158,6 +162,29 @@ class AccountLockoutServiceTest {
 
         assertThat(service.getFailureCount("unknown@example.com")).isZero();
         verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("R1-618: mutirajuce putanje koriste locking (PESSIMISTIC_WRITE) read")
+    void mutatingPaths_usePessimisticLockingFinder() {
+        service.recordFailure("alice@example.com");
+        service.recordSuccess("alice@example.com");
+        service.assertNotLocked("alice@example.com");
+
+        // Sve 3 mutirajuce putanje moraju da idu kroz locking finder, ne plain read.
+        verify(userRepository, org.mockito.Mockito.times(3))
+                .findByEmailIgnoreCaseForUpdate("alice@example.com");
+    }
+
+    @Test
+    @DisplayName("R1-618: read-only helperi NE koriste locking finder")
+    void readOnlyHelpers_useNonLockingFinder() {
+        service.getFailureCount("alice@example.com");
+        service.isLocked("alice@example.com");
+
+        verify(userRepository, org.mockito.Mockito.times(2))
+                .findByEmailIgnoreCase("alice@example.com");
+        verify(userRepository, never()).findByEmailIgnoreCaseForUpdate("alice@example.com");
     }
 
     @Test
@@ -182,7 +209,8 @@ class AccountLockoutServiceTest {
                 .permissions(Set.of("ADMIN"))
                 .build();
 
-        when(employeeRepository.findByEmail("emp@banka.rs")).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByEmailIgnoreCase("emp@banka.rs")).thenReturn(Optional.of(employee));
+        when(employeeRepository.findByEmailIgnoreCaseForUpdate("emp@banka.rs")).thenReturn(Optional.of(employee));
         when(employeeRepository.save(any(Employee.class))).thenAnswer(inv -> inv.getArgument(0));
 
         for (int i = 0; i < 5; i++) {

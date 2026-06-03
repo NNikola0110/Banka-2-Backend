@@ -315,13 +315,15 @@ class PaymentServiceBranchCoverageTest {
         Method m = PaymentServiceImpl.class.getDeclaredMethod("getAuthenticatedUsername");
         m.setAccessible(true);
 
+        // R1-521: nedostatak autentikacije je sada NotAuthenticatedException (→ HTTP 401),
+        // ne IllegalArgumentException (→ 400).
         assertThatThrownBy(() -> {
             try {
                 m.invoke(paymentService);
             } catch (InvocationTargetException e) {
                 throw e.getCause();
             }
-        }).isInstanceOf(IllegalArgumentException.class)
+        }).isInstanceOf(rs.raf.banka2_bek.payment.exception.NotAuthenticatedException.class)
           .hasMessageContaining("Niste prijavljeni");
     }
 }

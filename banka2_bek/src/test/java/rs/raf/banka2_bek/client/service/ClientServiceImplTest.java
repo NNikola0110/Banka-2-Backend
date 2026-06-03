@@ -69,8 +69,10 @@ class ClientServiceImplTest {
         verify(userRepository).save(any(User.class));
     }
 
+    // R5 1884 — duplikat emaila baca EmailAlreadyExistsException (→409), ne bare
+    // RuntimeException (→400). EmailAlreadyExistsException extends RuntimeException.
     @Test
-    @DisplayName("createClient - duplikat emaila baca RuntimeException")
+    @DisplayName("createClient - duplikat emaila (clients tabela) baca EmailAlreadyExistsException")
     void createClientDuplicateEmail() {
         var dto = new CreateClientRequestDto();
         dto.setEmail("existing@test.com");
@@ -78,7 +80,24 @@ class ClientServiceImplTest {
         when(clientRepository.findByEmail("existing@test.com"))
                 .thenReturn(Optional.of(Client.builder().id(1L).build()));
 
-        assertThrows(RuntimeException.class, () -> clientService.createClient(dto));
+        assertThrows(rs.raf.banka2_bek.auth.exception.EmailAlreadyExistsException.class,
+                () -> clientService.createClient(dto));
+        verify(clientRepository, never()).save(any());
+    }
+
+    // R5 1884 — email koji postoji SAMO u users tabeli (registrovan korisnik bez
+    // client zapisa) takodje 409 (TOCTOU pre-check pokriva i taj izvor).
+    @Test
+    @DisplayName("createClient - duplikat emaila (users tabela) baca EmailAlreadyExistsException")
+    void createClientDuplicateEmailInUsers() {
+        var dto = new CreateClientRequestDto();
+        dto.setEmail("registered@test.com");
+
+        when(clientRepository.findByEmail("registered@test.com")).thenReturn(Optional.empty());
+        when(userRepository.existsByEmail("registered@test.com")).thenReturn(true);
+
+        assertThrows(rs.raf.banka2_bek.auth.exception.EmailAlreadyExistsException.class,
+                () -> clientService.createClient(dto));
         verify(clientRepository, never()).save(any());
     }
 
@@ -350,6 +369,105 @@ class ClientServiceImplTest {
         assertEquals("M", result.getGender());
         assertEquals(LocalDate.of(1985, 7, 20), result.getDateOfBirth());
         assertTrue(result.getActive());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  C2 Sc40 (§433) — izmena emaila klijenta + provera jedinstvenosti
+    // ══════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("updateClient Sc40 - menja email i sinhronizuje sa User tabelom (unique OK)")
+    void updateClientChangesEmail() {
+        Client existing = Client.builder().id(1L).firstName("Stefan").lastName("Jovanovic")
+                .email("stefan@test.com").active(true).build();
+
+        var dto = new UpdateClientRequestDto();
+        dto.setEmail("stefan.novi@test.com");
+
+        when(clientRepository.findById(1L)).thenReturn(Optional.of(existing));
+        // Nov email nije zauzet ni u clients ni u users.
+        when(clientRepository.findByEmail("stefan.novi@test.com")).thenReturn(Optional.empty());
+        when(userRepository.findByEmail("stefan.novi@test.com")).thenReturn(Optional.empty());
+        when(clientRepository.save(any(Client.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        User user = new User();
+        user.setEmail("stefan@test.com");
+        when(userRepository.findByEmail("stefan@test.com")).thenReturn(Optional.of(user));
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        ClientResponseDto result = clientService.updateClient(1L, dto);
+
+        assertEquals("stefan.novi@test.com", result.getEmail());
+        // User.email mora biti sinhronizovan (login single source of truth).
+        verify(userRepository).save(argThat(u -> "stefan.novi@test.com".equals(u.getEmail())));
+    }
+
+    @Test
+    @DisplayName("updateClient Sc40 - duplikat emaila u clients tabeli baca EmailAlreadyExistsException (409)")
+    void updateClientDuplicateEmailInClients() {
+        Client existing = Client.builder().id(1L).firstName("Stefan").lastName("Jovanovic")
+                .email("stefan@test.com").active(true).build();
+
+        var dto = new UpdateClientRequestDto();
+        dto.setEmail("milica@test.com");
+
+        when(clientRepository.findById(1L)).thenReturn(Optional.of(existing));
+        // Nov email vec pripada DRUGOM klijentu (#2).
+        when(clientRepository.findByEmail("milica@test.com"))
+                .thenReturn(Optional.of(Client.builder().id(2L).email("milica@test.com").build()));
+
+        assertThrows(rs.raf.banka2_bek.auth.exception.EmailAlreadyExistsException.class,
+                () -> clientService.updateClient(1L, dto));
+        // Promena se NE cuva.
+        verify(clientRepository, never()).save(any(Client.class));
+        verify(userRepository, never()).save(any(User.class));
+    }
+
+    @Test
+    @DisplayName("updateClient Sc40 - duplikat emaila u users tabeli baca EmailAlreadyExistsException (409)")
+    void updateClientDuplicateEmailInUsers() {
+        Client existing = Client.builder().id(1L).firstName("Stefan").lastName("Jovanovic")
+                .email("stefan@test.com").active(true).build();
+
+        var dto = new UpdateClientRequestDto();
+        dto.setEmail("zaposleni@banka.rs");
+
+        when(clientRepository.findById(1L)).thenReturn(Optional.of(existing));
+        when(clientRepository.findByEmail("zaposleni@banka.rs")).thenReturn(Optional.empty());
+        // Email zauzet od strane DRUGOG user-a (npr. zaposleni) — ne sme da se preuzme.
+        User other = new User();
+        other.setEmail("zaposleni@banka.rs");
+        when(userRepository.findByEmail("zaposleni@banka.rs")).thenReturn(Optional.of(other));
+
+        assertThrows(rs.raf.banka2_bek.auth.exception.EmailAlreadyExistsException.class,
+                () -> clientService.updateClient(1L, dto));
+        verify(clientRepository, never()).save(any(Client.class));
+    }
+
+    @Test
+    @DisplayName("updateClient Sc40 - isti email (case-insensitive) ne triggeruje uniqueness check")
+    void updateClientSameEmailNoUniquenessCheck() {
+        Client existing = Client.builder().id(1L).firstName("Stefan").lastName("Jovanovic")
+                .email("stefan@test.com").phone("+381601111111").active(true).build();
+
+        var dto = new UpdateClientRequestDto();
+        // Isti email (samo drugaciji case) + promena telefona.
+        dto.setEmail("STEFAN@test.com");
+        dto.setPhone("+381609999999");
+
+        when(clientRepository.findById(1L)).thenReturn(Optional.of(existing));
+        when(clientRepository.save(any(Client.class))).thenAnswer(inv -> inv.getArgument(0));
+        User user = new User();
+        user.setEmail("stefan@test.com");
+        when(userRepository.findByEmail("stefan@test.com")).thenReturn(Optional.of(user));
+        when(userRepository.save(any(User.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        ClientResponseDto result = clientService.updateClient(1L, dto);
+
+        assertEquals("stefan@test.com", result.getEmail()); // nepromenjen
+        assertEquals("+381609999999", result.getPhone());
+        // Uniqueness lookup za nov email se NE poziva (email se nije stvarno promenio).
+        verify(clientRepository, never()).findByEmail("STEFAN@test.com");
     }
 
     @Test

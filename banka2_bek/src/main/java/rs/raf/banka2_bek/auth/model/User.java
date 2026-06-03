@@ -49,6 +49,15 @@ public class User implements UserDetails {
     @Column(length = 10)
     private String gender;
 
+    /**
+     * R1-615: DEPRECATED — {@code User} login NE koristi salt. {@code AuthService.login}
+     * za CLIENT/User racune poziva {@code passwordEncoder.matches(rawPassword, user.getPassword())}
+     * BEZ konkatenacije salt-a (samo Employee login konkatenira
+     * {@code Employee.saltPassword}). Ovo polje je nullable i nikad se ne cita pri
+     * autentifikaciji — popunjava ga samo bootstrap/test kod (placeholder "auto").
+     * Zadrzano radi sheme; buduca migracija moze DROP COLUMN + ukloniti getter/setter.
+     */
+    @Deprecated
     @Column(length = 255)
     private String saltPassword;
 

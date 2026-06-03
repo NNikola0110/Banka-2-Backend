@@ -67,9 +67,24 @@ public class RabbitConfig {
         return new DirectExchange(DLX_EXCHANGE, true, false);
     }
 
+    /** DLQ TTL — 14 dana ({@link #DLQ_TTL_MILLIS}); poruka koja ostane u DLQ duze
+     *  od ovoga se sama brise (sprecava trajno nakupljanje poison-poruka). */
+    public static final long DLQ_TTL_MILLIS = java.time.Duration.ofDays(14).toMillis();
+
+    /** DLQ max-length — gornja granica broja poruka; preko nje broker odbacuje
+     *  najstarije (sprecava neograniceni rast DLQ-a). */
+    public static final int DLQ_MAX_LENGTH = 10_000;
+
     @Bean
     public Queue emailDeadLetterQueue() {
-        return QueueBuilder.durable(DLQ_NAME).build();
+        // [P1-notif-svc-1 / 1529] DLQ TTL + max-length → poison poruke ne ostaju
+        // zauvek i DLQ ne raste neograniceno (+ depth gauge metrika u
+        // DlqMonitoringConfig za vidljivost/alerting).
+        return QueueBuilder.durable(DLQ_NAME)
+                .withArgument("x-message-ttl", DLQ_TTL_MILLIS)
+                .withArgument("x-max-length", DLQ_MAX_LENGTH)
+                .withArgument("x-overflow", "drop-head")
+                .build();
     }
 
     @Bean
@@ -79,7 +94,13 @@ public class RabbitConfig {
 
     @Bean
     public MessageConverter jsonMessageConverter() {
-        return new JacksonJsonMessageConverter();
+        // R4 1818 (defense-in-depth): ogranici deserijalizaciju na nase contracts
+        // pakete. Trenutni listener prima samo {@code NotificationMessage} (fiksan
+        // tip), ali __TypeId__ header-driven polimorfna deserijalizacija je vektor
+        // ako se ikada uvede {@code Object} param ili nested tip — whitelist sprecava
+        // instanciranje proizvoljnih klasa iz neproverene poruke. (Spring AMQP 4:
+        // trusted-packages se zadaje kroz konstruktor, nema setter-a.)
+        return new JacksonJsonMessageConverter("rs.raf.banka2.contracts");
     }
 
     /**

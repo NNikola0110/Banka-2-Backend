@@ -26,7 +26,12 @@ data:
   BANKA2_INFLUX_ENABLED: "true"
 
   # ── Stock API (Alpha Vantage) — base URL non-sensitive, keys u Secret-u ──
-  STOCK_API_URL: "https://www.alphavantage.co"
+  # P2-config-2 (R2 1414): MORA ukljuciti `/query` — ListingServiceImpl gradi
+  # URL kao `stockApiUrl + "?function=GLOBAL_QUOTE&..."`. Bez `/query` poziv ide
+  # na koren domena (`https://www.alphavantage.co?function=...`) → HTML/error
+  # umesto JSON-a → refresh cena tiho otkaze. Paritet sa application.properties
+  # default-om (`https://www.alphavantage.co/query`).
+  STOCK_API_URL: "https://www.alphavantage.co/query"
 
   # ── Spring Boot Actuator probes ──────────────────────────────────────────
   MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"

@@ -35,7 +35,6 @@ import rs.raf.banka2_bek.employee.model.Employee;
 import rs.raf.banka2_bek.employee.repository.ActivationTokenRepository;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.exchange.ExchangeService;
-import rs.raf.banka2_bek.exchange.dto.CalculateExchangeResponseDto;
 import rs.raf.banka2_bek.loan.repository.LoanInstallmentRepository;
 import rs.raf.banka2_bek.loan.repository.LoanRepository;
 import rs.raf.banka2_bek.loan.repository.LoanRequestRepository;
@@ -171,8 +170,8 @@ class TransferControllerIntegrationTest {
         createAccount(fromNum, client, employee, eur, new BigDecimal("2000.00"));
         createAccount(toNum, client, employee, usd, new BigDecimal("500.00"));
 
-        when(exchangeService.calculateCross(300.0, "EUR", "USD"))
-                .thenReturn(new CalculateExchangeResponseDto(324.0, 1.08, "EUR", "USD"));
+        when(exchangeService.calculateCrossExact(new BigDecimal("300.00"), "EUR", "USD"))
+                .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("324.00"), new BigDecimal("1.08")));
 
         String payload = """
                 {
@@ -225,8 +224,8 @@ class TransferControllerIntegrationTest {
         createAccount(fromNum, client, employee, eur, new BigDecimal("1000.00"));
         createAccount(toNum, client, employee, usd, new BigDecimal("100.00"));
 
-        when(exchangeService.calculateCross(100.0, "EUR", "USD"))
-                .thenReturn(new CalculateExchangeResponseDto(108.0, 1.08, "EUR", "USD"));
+        when(exchangeService.calculateCrossExact(new BigDecimal("100.00"), "EUR", "USD"))
+                .thenReturn(new ExchangeService.FxConversionResult(new BigDecimal("108.00"), new BigDecimal("1.08")));
 
         // Use /transfers/internal with cross-currency accounts
         String payload = """

@@ -53,7 +53,7 @@ class SavingsSchedulerTest {
 
     @Test
     void runSavingsCycle_processesNoDeposits() {
-        when(depositRepo.findByStatusAndNextInterestPaymentDateLessThanEqual(
+        when(depositRepo.findDueForInterest(
                 any(SavingsDepositStatus.class), any(LocalDate.class)))
                 .thenReturn(List.of());
         when(depositRepo.findByStatusAndMaturityDateLessThanEqual(
@@ -69,7 +69,7 @@ class SavingsSchedulerTest {
 
     @Test
     void runSavingsCycle_invokesPayMonthlyInterestForDueDeposits() {
-        when(depositRepo.findByStatusAndNextInterestPaymentDateLessThanEqual(
+        when(depositRepo.findDueForInterest(
                 eq(SavingsDepositStatus.ACTIVE), any(LocalDate.class)))
                 .thenReturn(List.of(deposit));
         when(depositRepo.findByStatusAndMaturityDateLessThanEqual(
@@ -86,7 +86,7 @@ class SavingsSchedulerTest {
     @Test
     void runSavingsCycle_autoRenew_callsRenewOnProcessor() {
         deposit.setAutoRenew(true);
-        when(depositRepo.findByStatusAndNextInterestPaymentDateLessThanEqual(
+        when(depositRepo.findDueForInterest(
                 any(SavingsDepositStatus.class), any(LocalDate.class)))
                 .thenReturn(List.of());
         when(depositRepo.findByStatusAndMaturityDateLessThanEqual(
@@ -102,7 +102,7 @@ class SavingsSchedulerTest {
     @Test
     void runSavingsCycle_notAutoRenew_callsReturnPrincipalOnProcessor() {
         deposit.setAutoRenew(false);
-        when(depositRepo.findByStatusAndNextInterestPaymentDateLessThanEqual(
+        when(depositRepo.findDueForInterest(
                 any(SavingsDepositStatus.class), any(LocalDate.class)))
                 .thenReturn(List.of());
         when(depositRepo.findByStatusAndMaturityDateLessThanEqual(
@@ -117,7 +117,7 @@ class SavingsSchedulerTest {
 
     @Test
     void runSavingsCycle_swallowsProcessorExceptions() {
-        when(depositRepo.findByStatusAndNextInterestPaymentDateLessThanEqual(
+        when(depositRepo.findDueForInterest(
                 any(SavingsDepositStatus.class), any(LocalDate.class)))
                 .thenReturn(List.of(deposit));
         when(depositRepo.findByStatusAndMaturityDateLessThanEqual(

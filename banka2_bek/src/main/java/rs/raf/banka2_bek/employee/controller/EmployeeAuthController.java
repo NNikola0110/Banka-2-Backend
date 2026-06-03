@@ -15,6 +15,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import rs.raf.banka2_bek.employee.dto.ActivateAccountRequestDto;
 import rs.raf.banka2_bek.employee.dto.ActivationTokenStatusDto;
+import rs.raf.banka2_bek.employee.dto.ResendActivationRequestDto;
 import rs.raf.banka2_bek.employee.service.EmployeeAuthService;
 
 import java.util.Map;
@@ -51,5 +52,27 @@ public class EmployeeAuthController {
     @GetMapping("/activation-token/{token}/status")
     public ResponseEntity<ActivationTokenStatusDto> tokenStatus(@PathVariable("token") String token) {
         return ResponseEntity.ok(employeeAuthService.getTokenStatus(token));
+    }
+
+    /**
+     * Spec Celina 1 Sc 9: kad je aktivacioni token istekao, sistem omogucava
+     * slanje novog aktivacionog linka. Klijent prosledjuje stari (istekli)
+     * aktivacioni token koji jednoznacno identifikuje zaposlenog.
+     *
+     * <p>Anti-enumeration (mirror {@code POST /auth/password_reset/request}):
+     * endpoint UVEK vraca 200 sa istom generic porukom, bez obzira da li token
+     * postoji ili je nalog vec aktivan — odgovor ne otkriva stanje naloga.
+     */
+    @Operation(summary = "Resend activation link",
+            description = "Sends a fresh activation email for an employee whose activation token has expired. "
+                    + "Always returns a generic 200 response (does not reveal whether the account exists or is already active).")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Generic acknowledgement (always)")
+    })
+    @PostMapping("/resend-activation")
+    public ResponseEntity<Map<String, String>> resendActivation(@Valid @RequestBody ResendActivationRequestDto request) {
+        employeeAuthService.resendActivation(request.getToken());
+        return ResponseEntity.ok(Map.of(
+                "message", "If the account exists and is not yet active, a new activation link has been sent."));
     }
 }

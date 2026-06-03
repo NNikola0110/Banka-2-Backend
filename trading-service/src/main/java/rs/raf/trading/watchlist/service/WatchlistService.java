@@ -25,6 +25,10 @@ import java.util.stream.Collectors;
 @Slf4j
 public class WatchlistService {
 
+    /** [P2-input-validation-1 / R1 517] gornje granice za DoS guard. */
+    public static final int MAX_WATCHLISTS_PER_USER = 20;
+    public static final int MAX_ITEMS_PER_WATCHLIST = 100;
+
     private final WatchlistRepository watchlistRepo;
     private final WatchlistItemRepository itemRepo;
     private final TradingUserResolver userResolver;
@@ -34,6 +38,11 @@ public class WatchlistService {
     public WatchlistDto createWatchlist(CreateWatchlistDto dto) {
         UserContext me = userResolver.resolveCurrent();
         WatchlistOwnerType ownerType = resolveOwnerType(me);
+        // [P2-input-validation-1 / R1 517] limit broja listi po korisniku (DoS guard).
+        if (watchlistRepo.countByOwnerIdAndOwnerType(me.userId(), ownerType) >= MAX_WATCHLISTS_PER_USER) {
+            throw new IllegalArgumentException(
+                    "Dostigli ste maksimalan broj lista (" + MAX_WATCHLISTS_PER_USER + ").");
+        }
         if (watchlistRepo.existsByOwnerIdAndOwnerTypeAndName(me.userId(), ownerType, dto.getName())) {
             throw new IllegalArgumentException("Lista sa imenom vec postoji: " + dto.getName());
         }
@@ -58,14 +67,17 @@ public class WatchlistService {
         UserContext me = userResolver.resolveCurrent();
         WatchlistOwnerType ownerType = resolveOwnerType(me);
         List<Watchlist> lists = watchlistRepo.findByOwnerIdAndOwnerTypeOrderByCreatedAtAsc(me.userId(), ownerType);
+        // P2-perf-nplus1-1 (R1 514): broj stavki preko COUNT upita (itemRepo.countByWatchlistId)
+        // umesto da ucitavamo CELU listu stavki samo da bismo je prebrojali (.size()).
+        // COUNT je laksi na DB + ne materijalizuje entitete koji se odmah bacaju.
         return lists.stream().map(w -> {
-            int count = itemRepo.findByWatchlistIdOrderByAddedAtAsc(w.getId()).size();
+            long count = itemRepo.countByWatchlistId(w.getId());
             return WatchlistDto.builder()
                     .id(w.getId())
                     .ownerId(w.getOwnerId())
                     .ownerType(w.getOwnerType().name())
                     .name(w.getName())
-                    .itemCount(count)
+                    .itemCount((int) count)
                     .createdAt(w.getCreatedAt())
                     .build();
         }).collect(Collectors.toList());
@@ -82,7 +94,8 @@ public class WatchlistService {
         }
         wl.setName(dto.getName());
         Watchlist saved = watchlistRepo.save(wl);
-        int count = itemRepo.findByWatchlistIdOrderByAddedAtAsc(saved.getId()).size();
+        // P2-perf-nplus1-1 (R1 514): COUNT umesto load-full-list-then-.size().
+        int count = (int) itemRepo.countByWatchlistId(saved.getId());
         return WatchlistDto.builder()
                 .id(saved.getId())
                 .ownerId(saved.getOwnerId())
@@ -111,6 +124,11 @@ public class WatchlistService {
                 .orElseThrow(() -> new IllegalArgumentException("Lista ne postoji ili nije vasa."));
         if (itemRepo.existsByWatchlistIdAndListingId(wl.getId(), listingId)) {
             throw new IllegalArgumentException("Hartija je vec na listi.");
+        }
+        // [P2-input-validation-1 / R1 517] limit broja stavki po listi (DoS guard).
+        if (itemRepo.countByWatchlistId(wl.getId()) >= MAX_ITEMS_PER_WATCHLIST) {
+            throw new IllegalArgumentException(
+                    "Lista je dostigla maksimalan broj stavki (" + MAX_ITEMS_PER_WATCHLIST + ").");
         }
         // validate listing exists and fetch live data
         ListingDto listing = listingService.getListingById(listingId);
@@ -141,10 +159,17 @@ public class WatchlistService {
         Watchlist wl = watchlistRepo.findByIdAndOwnerIdAndOwnerType(watchlistId, me.userId(), ownerType)
                 .orElseThrow(() -> new IllegalArgumentException("Lista ne postoji ili nije vasa."));
         List<WatchlistItem> items = itemRepo.findByWatchlistIdOrderByAddedAtAsc(wl.getId());
-        return items.stream().map(item -> {
-                    ListingDto listing = listingService.getListingById(item.getListingId());
-                    return toItemDto(item, listing);
-                }).filter(dto -> securityTypeFilter == null || securityTypeFilter.isBlank() || securityTypeFilter.equalsIgnoreCase(dto.getSecurityType()))
+        // P2-perf-nplus1-1 (R1 515): batch-resolve svih listinga jednim pozivom
+        // (getListingsByIds) umesto per-item getListingById (DB N+1).
+        java.util.Map<Long, ListingDto> listingsById = listingService.getListingsByIds(
+                items.stream().map(WatchlistItem::getListingId).collect(Collectors.toList()));
+        return items.stream()
+                .map(item -> {
+                    ListingDto listing = listingsById.get(item.getListingId());
+                    return listing == null ? null : toItemDto(item, listing);
+                })
+                .filter(java.util.Objects::nonNull)
+                .filter(dto -> securityTypeFilter == null || securityTypeFilter.isBlank() || securityTypeFilter.equalsIgnoreCase(dto.getSecurityType()))
                 .collect(Collectors.toList());
     }
 

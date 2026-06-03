@@ -38,12 +38,15 @@ public class InvestmentFundController {
             @RequestParam(required = false) java.math.BigDecimal minFundValue,
             @RequestParam(required = false) java.math.BigDecimal maxFundValue,
             @RequestParam(required = false) java.math.BigDecimal minProfit,
-            @RequestParam(required = false) java.math.BigDecimal maxProfit) {
+            @RequestParam(required = false) java.math.BigDecimal maxProfit,
+            // P2-perf-nplus1-1 (R1 492): BE-side manager filter — zamenjuje FE
+            // klijentsko filtriranje cele liste fondova po manageru.
+            @RequestParam(required = false) Long managerEmployeeId) {
         return ResponseEntity.ok(investmentFundService.listDiscovery(
                 search, sort, direction,
                 minContribution, maxContribution,
                 minFundValue, maxFundValue,
-                minProfit, maxProfit));
+                minProfit, maxProfit, managerEmployeeId));
     }
 
     @GetMapping("/{id}")

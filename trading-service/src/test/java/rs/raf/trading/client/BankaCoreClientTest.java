@@ -187,6 +187,30 @@ class BankaCoreClientTest {
         mockServer.verify();
     }
 
+    @Test
+    void getSupervisorIds_happyPath_returnsIds_andSendsInternalKeyHeader_OT1061() throws Exception {
+        mockServer.expect(requestTo(BASE_URL + "/internal/users/supervisors"))
+                .andExpect(method(HttpMethod.GET))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andRespond(withSuccess("[3,7]", MediaType.APPLICATION_JSON));
+
+        List<Long> result = bankaCoreClient.getSupervisorIds();
+
+        assertThat(result).containsExactly(3L, 7L);
+        mockServer.verify();
+    }
+
+    @Test
+    void getSupervisorIds_serverError_throwsBankaCoreClientException_OT1061() {
+        mockServer.expect(requestTo(BASE_URL + "/internal/users/supervisors"))
+                .andRespond(withServerError());
+
+        assertThatThrownBy(() -> bankaCoreClient.getSupervisorIds())
+                .isInstanceOf(BankaCoreClientException.class);
+
+        mockServer.verify();
+    }
+
     // ── Identitet (faza 2c) ──────────────────────────────────────────────────
 
     @Test
@@ -544,6 +568,48 @@ class BankaCoreClientTest {
         assertThat(result.payerClientId()).isEqualTo(7L);
         assertThat(result.collectedAmount()).isEqualByComparingTo(new BigDecimal("120.00"));
         assertThat(result.collected()).isTrue();
+
+        mockServer.verify();
+    }
+
+    // ── TEST-branches-8: postNotification je BEST-EFFORT (cross-DB in-app notif).
+    // Happy path salje POST /internal/notifications; bilo koja greska (5xx, broker)
+    // se loguje na WARN i NE rusi pozivni business flow (trading-service nezavisno
+    // publishuje email RabbitMQ event). ───────────────────────────────────────────
+
+    @Test
+    void postNotification_happyPath_sendsToInternalNotifications_TEST_branches_8() {
+        mockServer.expect(requestTo(BASE_URL + "/internal/notifications"))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(header("X-Internal-Key", INTERNAL_API_KEY))
+                .andRespond(withStatus(org.springframework.http.HttpStatus.CREATED));
+
+        rs.raf.banka2.contracts.internal.InternalNotificationRequest req =
+                new rs.raf.banka2.contracts.internal.InternalNotificationRequest(
+                        7L, "CLIENT", "ORDER_EXECUTED", "Order izvrsen",
+                        "Body", "ORDER", 42L, "notif-idem-1");
+
+        bankaCoreClient.postNotification(req);
+
+        mockServer.verify();
+    }
+
+    @Test
+    void postNotification_serverError_isSwallowed_doesNotThrow_TEST_branches_8() {
+        // banka-core vraca 500 → onStatus baca BankaCoreClientException, ali
+        // postNotification je hvata (best-effort) i NE propagira.
+        mockServer.expect(requestTo(BASE_URL + "/internal/notifications"))
+                .andExpect(method(HttpMethod.POST))
+                .andRespond(withServerError());
+
+        rs.raf.banka2.contracts.internal.InternalNotificationRequest req =
+                new rs.raf.banka2.contracts.internal.InternalNotificationRequest(
+                        7L, "CLIENT", "ORDER_EXECUTED", "Order izvrsen",
+                        "Body", "ORDER", 42L, "notif-idem-2");
+
+        // KLJUCNA invarijanta: ne baca (business flow se ne rusi zbog notif fail-a).
+        org.junit.jupiter.api.Assertions.assertDoesNotThrow(
+                () -> bankaCoreClient.postNotification(req));
 
         mockServer.verify();
     }

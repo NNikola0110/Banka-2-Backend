@@ -219,4 +219,81 @@ class GlobalExceptionHandlerTest {
         assertThat(response.getBody()).isNotNull();
         assertThat(response.getBody().getMessage()).contains("modifikovan");
     }
+
+    // ── QuickApproveSettlementNotWiredException → 501 (defensive guard) ──────
+    // Money-safety: quickApprove ne sme lazno completirati ne-settle-ovan payment.
+    // Mapira u 501 Not Implemented dok Phase-2 FCM ne wire-uje pravi settlement.
+
+    @Test
+    void handleQuickApproveNotWired_returns501NotImplemented() {
+        rs.raf.banka2_bek.payment.exception.QuickApproveSettlementNotWiredException ex =
+                new rs.raf.banka2_bek.payment.exception.QuickApproveSettlementNotWiredException(
+                        "Settlement nije wired (Phase-2 FCM).");
+
+        ResponseEntity<MessageResponseDto> response = handler.handleQuickApproveNotWired(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_IMPLEMENTED);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().getMessage()).contains("Phase-2 FCM");
+    }
+
+    // ── P2-error-contract-2 ──────────────────────────────────────────────
+
+    // R5 1884 / R1 296: duplikat email = 409 (ne bare RuntimeException→400).
+    @Test
+    void handleEmailAlreadyExists_returns409Conflict_withMessage() {
+        rs.raf.banka2_bek.auth.exception.EmailAlreadyExistsException ex =
+                new rs.raf.banka2_bek.auth.exception.EmailAlreadyExistsException(
+                        "User with this email already exists");
+
+        ResponseEntity<MessageResponseDto> response = handler.handleEmailAlreadyExists(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().getMessage()).isEqualTo("User with this email already exists");
+    }
+
+    // R1 296: nevalidan/revoke-ovan refresh token = 401 (ne 400).
+    @Test
+    void handleInvalidRefreshToken_returns401Unauthorized_withMessage() {
+        rs.raf.banka2_bek.auth.exception.InvalidRefreshTokenException ex =
+                new rs.raf.banka2_bek.auth.exception.InvalidRefreshTokenException("Invalid refresh token");
+
+        ResponseEntity<MessageResponseDto> response = handler.handleInvalidRefreshToken(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().getMessage()).isEqualTo("Invalid refresh token");
+    }
+
+    // R5 1884 (TOCTOU): DataIntegrityViolation = 409, STATICNA poruka (bez SQL leak-a).
+    @Test
+    void handleDataIntegrityViolation_returns409_staticMessage_noLeak() {
+        org.springframework.dao.DataIntegrityViolationException ex =
+                new org.springframework.dao.DataIntegrityViolationException(
+                        "could not execute statement; SQL [insert into users ...]; "
+                                + "constraint [uk_users_email]");
+
+        ResponseEntity<MessageResponseDto> response = handler.handleDataIntegrityViolation(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody()).isNotNull();
+        // Telo NE sme da curi SQL/constraint detalje.
+        assertThat(response.getBody().getMessage()).doesNotContain("SQL").doesNotContain("constraint");
+        assertThat(response.getBody().getMessage()).isEqualTo("Zahtev je u konfliktu sa postojecim podacima.");
+    }
+
+    @Test
+    void handleTransactionSystemException_dataIntegrityCause_returns409() {
+        org.springframework.dao.DataIntegrityViolationException root =
+                new org.springframework.dao.DataIntegrityViolationException("unique constraint violated");
+        org.springframework.transaction.TransactionSystemException tx =
+                new org.springframework.transaction.TransactionSystemException("Could not commit JPA transaction", root);
+
+        ResponseEntity<MessageResponseDto> response = handler.handleTransactionSystemException(tx);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().getMessage()).doesNotContain("constraint");
+    }
 }

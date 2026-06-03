@@ -13,16 +13,21 @@ import rs.raf.banka2.contracts.internal.InternalAccountDto;
 import rs.raf.banka2.contracts.internal.TransferFundsRequest;
 import rs.raf.trading.client.BankaCoreClient;
 import rs.raf.trading.common.UserRole;
+import rs.raf.trading.client.BankaCoreClientException;
 import rs.raf.trading.investmentfund.dto.FundDividendHistoryDto;
 import rs.raf.trading.investmentfund.model.ClientFundPosition;
 import rs.raf.trading.investmentfund.model.ClientFundTransaction;
 import rs.raf.trading.investmentfund.model.ClientFundTransactionStatus;
+import rs.raf.trading.investmentfund.model.FundDividendDistributionLedger;
 import rs.raf.trading.investmentfund.model.InvestmentFund;
 import rs.raf.trading.investmentfund.repository.ClientFundPositionRepository;
 import rs.raf.trading.investmentfund.repository.ClientFundTransactionRepository;
+import rs.raf.trading.investmentfund.repository.FundDividendDistributionLedgerRepository;
 import rs.raf.trading.investmentfund.repository.InvestmentFundRepository;
 import rs.raf.trading.investmentfund.scheduler.FundValueSnapshotScheduler;
+import rs.raf.trading.investmentfund.service.FundDividendLedgerWriter;
 import rs.raf.trading.investmentfund.service.FundDividendService;
+import rs.raf.trading.order.exception.InsufficientFundsException;
 import rs.raf.trading.order.model.Order;
 import rs.raf.trading.order.model.OrderDirection;
 import rs.raf.trading.order.model.OrderStatus;
@@ -92,8 +97,21 @@ class FundDividendServiceTest {
     @Mock
     private BankaCoreClient bankaCoreClient;
 
+    @Mock
+    private FundDividendDistributionLedgerRepository distributionLedgerRepository;
+
+    @Mock
+    private FundDividendLedgerWriter ledgerWriter;
+
     @InjectMocks
     private FundDividendService service;
+
+    /** P1-2: prati per-acct idempotency kljuceve transfera kroz oba run-a. */
+    private final java.util.Map<Long, java.util.List<String>> transferKeysByAccount =
+            new java.util.HashMap<>();
+    /** P1-2: simulira nestabilan IDENTITY id (raste kroz oba run-a). */
+    private final java.util.concurrent.atomic.AtomicLong rerunIdCounter =
+            new java.util.concurrent.atomic.AtomicLong(900L);
 
     @Test
     @DisplayName("creditDividendToFund credits fund account and saves DIVIDEND_INFLOW transaction")
@@ -136,9 +154,13 @@ class FundDividendServiceTest {
 
         assertSame(saved, result);
 
+        // P1-funds-1 (1552): stabilan idempotency kljuc izveden iz
+        // (fundId, listingId, paymentDate=danas), NE iz IDENTITY id-a.
         ArgumentCaptor<CreditFundsRequest> creditCaptor =
                 ArgumentCaptor.forClass(CreditFundsRequest.class);
-        verify(bankaCoreClient).creditFunds(eq("fund-dividend-inflow-501"), creditCaptor.capture());
+        verify(bankaCoreClient).creditFunds(
+                eq("fund-dividend-inflow-1-10-" + java.time.LocalDate.now()),
+                creditCaptor.capture());
         CreditFundsRequest credited = creditCaptor.getValue();
         assertEquals(100L, credited.accountId());
         assertBigDecimalEquals("250.0000", credited.amount());
@@ -246,8 +268,12 @@ class FundDividendServiceTest {
     }
 
     @Test
-    @DisplayName("reinvestDividends does not create order when cash is below one share price")
-    void reinvestDividends_insufficientCash_noOrderPlaced() {
+    @DisplayName("R2 1422: reinvest rezidual (cash < cena jedne hartije) markira TERMINALNO (FAILED), ne ostaje DIVIDEND_INFLOW")
+    void reinvestDividends_residualBelowOneShare_markedTerminalNotEternalRetry() {
+        // Fund cash 100, dividenda 100, cena hartije 200 → quantity = floor(100/200) = 0.
+        // R2 1422 FIX: ranije je prazan `continue` ostavljao status DIVIDEND_INFLOW →
+        // dnevni scheduler ga vecno ponovo pokusava. Sada se markira FAILED (terminalno)
+        // pa ga listPendingDividends (samo DIVIDEND_INFLOW) vise ne pokupi.
         InvestmentFund fund = activeFund(1L, 100L);
         InternalAccountDto fundAccount = fundAccountDto(100L, "100.0000", "100.0000");
 
@@ -267,15 +293,20 @@ class FundDividendServiceTest {
                 ClientFundTransactionStatus.DIVIDEND_INFLOW
         )).thenReturn(List.of(pendingDividend));
         when(listingRepository.findById(10L)).thenReturn(Optional.of(listing));
+        when(clientFundTransactionRepository.save(any(ClientFundTransaction.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
 
         List<Order> result = service.reinvestDividends(1L);
 
         assertTrue(result.isEmpty());
-        assertEquals(ClientFundTransactionStatus.DIVIDEND_INFLOW, pendingDividend.getStatus());
+        // Terminalno markiran — vise NIJE DIVIDEND_INFLOW (eternal retry sprecen).
+        assertEquals(ClientFundTransactionStatus.FAILED, pendingDividend.getStatus());
+        assertNotNull(pendingDividend.getCompletedAt());
+        assertTrue(pendingDividend.getFailureReason().toLowerCase().contains("rezidual"));
 
         verifyNoInteractions(orderRepository);
         verifyNoInteractions(fundReservationService);
-        verify(clientFundTransactionRepository, never()).save(any(ClientFundTransaction.class));
+        verify(clientFundTransactionRepository).save(pendingDividend);
         verify(fundValueSnapshotScheduler).snapshotFundIfMissing(fund);
     }
 
@@ -493,6 +524,124 @@ class FundDividendServiceTest {
                 .getPreferredAccount(eq(UserRole.CLIENT), eq(22L), anyString());
 
         verify(fundValueSnapshotScheduler).snapshotFundIfMissing(fund);
+    }
+
+    /**
+     * P1-2 double-pay regression: prvi run isplati klijenta A, zatim padne na
+     * klijentu B (banka-core 409) → outer {@code @Transactional} radi rollback
+     * (svi {@code ClientFundTransaction} redovi se ponistavaju u trading_db).
+     * ALI banka-core transfer klijentu A je VEC commit-ovan out-of-process, a
+     * trajni ledger marker (zapisan {@code REQUIRES_NEW}) prezivi rollback.
+     *
+     * <p>Drugi run (simulacija dnevnog cron retry-a) za ISTI dividendni priliv
+     * MORA preskociti klijenta A (vec placen po trajnom ledger marker-u) i NE sme
+     * ga platiti drugi put. Konzervacija: ukupno prebaceno A-u = tacno njegov
+     * udeo, jednom.
+     */
+    @Test
+    @DisplayName("partialThenRerun_doesNotDoublePay")
+    void partialThenRerun_doesNotDoublePay() {
+        InvestmentFund fund = activeFund(1L, 100L);
+        InternalAccountDto fundAccount = fundAccountDto(100L, "2000.0000", "2000.0000");
+
+        InternalAccountDto clientOneAccount = clientAccountDto(201L, 11L);
+        InternalAccountDto clientTwoAccount = clientAccountDto(202L, 22L);
+
+        // Jedan dividendni priliv (stabilna kotva — id=310 preko dividendTx helpera).
+        ClientFundTransaction pendingDividend = dividendTx(
+                1L, 10L, "1000.0000", ClientFundTransactionStatus.DIVIDEND_INFLOW);
+
+        ClientFundPosition positionOne = position(1L, 1L, 11L, "700.0000");
+        ClientFundPosition positionTwo = position(2L, 1L, 22L, "300.0000");
+
+        when(investmentFundRepository.findById(1L)).thenReturn(Optional.of(fund));
+        when(bankaCoreClient.getAccount(100L)).thenReturn(fundAccount);
+        when(clientFundTransactionRepository.findByFundIdAndStatusOrderByCreatedAtAsc(
+                1L, ClientFundTransactionStatus.DIVIDEND_INFLOW))
+                .thenReturn(List.of(pendingDividend));
+        when(clientFundPositionRepository.findByFundId(1L))
+                .thenReturn(List.of(positionOne, positionTwo));
+        when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 11L, "RSD"))
+                .thenReturn(clientOneAccount);
+        when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 22L, "RSD"))
+                .thenReturn(clientTwoAccount);
+
+        when(clientFundTransactionRepository.save(any(ClientFundTransaction.class)))
+                .thenAnswer(invocation -> {
+                    ClientFundTransaction tx = invocation.getArgument(0);
+                    if (tx.getId() == null) {
+                        // IDENTITY id NIJE stabilan kroz rollback/re-run — namerno
+                        // dodeljujemo razlicit id u drugom run-u da dokazemo da se
+                        // idempotency kljuc NE sme izvoditi iz njega.
+                        tx.setId(rerunIdCounter.getAndIncrement());
+                    }
+                    return tx;
+                });
+
+        // Trajni ledger marker: prezivi outer-tx rollback (writer ga upisuje u
+        // REQUIRES_NEW). Modeliramo ga stateful Set-om kljuceva.
+        java.util.Set<String> committedLedgerKeys = new java.util.HashSet<>();
+        org.mockito.Mockito.lenient()
+                .when(distributionLedgerRepository.existsByIdempotencyKey(anyString()))
+                .thenAnswer(inv -> committedLedgerKeys.contains(inv.getArgument(0)));
+        org.mockito.Mockito.lenient().doAnswer(inv -> {
+            FundDividendDistributionLedger ledger = inv.getArgument(0);
+            committedLedgerKeys.add(ledger.getIdempotencyKey());
+            return null;
+        }).when(ledgerWriter).recordPaid(any(FundDividendDistributionLedger.class));
+
+        // Stateful banka-core transfer: belezi SAMO USPESNE (commit-ovane) transfere
+        // po odredisnom racunu. Prvi run: klijent A (acct 201) prolazi, klijent B
+        // (acct 202) baca 409 PRE knjizenja (ne broji se kao isplata).
+        org.mockito.Mockito.doAnswer(inv -> {
+            String key = inv.getArgument(0);
+            TransferFundsRequest req = inv.getArgument(1);
+            if (req.toAccountId() == 202L) {
+                throw new BankaCoreClientException(409, "Nedovoljno sredstava (concurrent withdrawal).");
+            }
+            transferKeysByAccount.computeIfAbsent(req.toAccountId(), k -> new java.util.ArrayList<>()).add(key);
+            return null;
+        }).when(bankaCoreClient).transferFunds(anyString(), any(TransferFundsRequest.class));
+
+        // ── RUN 1: parcijalna isplata, pada na klijentu B → rollback. ──
+        assertThrows(InsufficientFundsException.class,
+                () -> service.distributeDividendsToClients(1L));
+
+        // Klijent A je placen tacno jednom u run-u 1.
+        assertEquals(1, transferKeysByAccount.getOrDefault(201L, List.of()).size(),
+                "Klijent A mora biti placen tacno jednom u prvom run-u");
+
+        // ── RUN 2: cron retry. Klijent B sad ima sredstva (uspeva). ──
+        // Klijent A je VEC u trajnom ledgeru → mora biti preskocen (NIJE placen drugi put).
+        org.mockito.Mockito.doAnswer(inv -> {
+            String key = inv.getArgument(0);
+            TransferFundsRequest req = inv.getArgument(1);
+            transferKeysByAccount.computeIfAbsent(req.toAccountId(), k -> new java.util.ArrayList<>()).add(key);
+            return null;
+        }).when(bankaCoreClient).transferFunds(anyString(), any(TransferFundsRequest.class));
+
+        service.distributeDividendsToClients(1L);
+
+        // KRITICNO: klijent A NIJE placen drugi put — i dalje tacno 1 uspesan transfer ka acct 201.
+        assertEquals(1, transferKeysByAccount.getOrDefault(201L, List.of()).size(),
+                "Klijent A NE sme biti placen dvaput nakon parcijalnog run-a + cron re-run-a");
+
+        // Klijent B je sad uspesno placen (tacno jednom).
+        assertEquals(1, transferKeysByAccount.getOrDefault(202L, List.of()).size(),
+                "Klijent B mora biti placen tacno jednom (drugi run)");
+
+        // Stabilan kljuc: id NIJE izveden iz IDENTITY id-a (koji se menja kroz run-ove
+        // preko rerunIdCounter); kotva je pending inflow id (310), a ne tx id.
+        String aKey = transferKeysByAccount.get(201L).get(0);
+        assertTrue(aKey.contains("-11-310-"),
+                "Idempotency kljuc klijenta A mora biti stabilan (anchor=inflow 310), bio: " + aKey);
+        assertTrue(aKey.startsWith("fund-dividend-distribution-1-11-"),
+                "Idempotency kljuc klijenta A mora pratiti stabilan format, bio: " + aKey);
+
+        // Konzervacija: tacno 2 USPESNA transfera ukupno (A 700 + B 300 = 1000 = priliv).
+        assertEquals(2, transferKeysByAccount.values().stream()
+                .mapToInt(List::size).sum(),
+                "Ukupno tacno 2 uspesna transfera ka klijentskim racunima nakon obe runde (konzervacija)");
     }
 
     @Test

@@ -27,6 +27,30 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-annotations</artifactId>
         </dependency>
+
+        <!-- TEST-notif-contracts-1 (OT-CONTRACTS-DTO): wire-DTO/enum kontrakt testovi.
+             Modul ranije NIJE imao test source dir; ovi testovi pinuju serialize
+             round-trip + enum-exhaustiveness + field-shape za RabbitMQ notif DTO-e
+             tako da promena oblika (preimenovanje polja / brisanje enum konstante)
+             pukne build umesto da tiho razbije inter-servisnu deserijalizaciju.
+             spring-boot-starter-test donosi JUnit5 + AssertJ + jackson-databind
+             (sve test-scope, nula uticaja na main artefakt). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Jackson 3 (tools.jackson) databind — ISTI databind koji Spring AMQP 4
+             koristi u JacksonJsonMessageConverter-u. spring-boot-starter-test ne
+             povlaci databind tranzitivno (nema starter-json ovde), pa ga eksplicitno
+             dodajemo u test scope za reprezentativan wire round-trip. Verzija je
+             managed od spring-boot-starter-parent (Boot 4 BOM). -->
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
 </project>

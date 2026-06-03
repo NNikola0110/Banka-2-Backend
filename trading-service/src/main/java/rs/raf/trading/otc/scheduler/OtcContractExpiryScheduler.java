@@ -19,11 +19,10 @@ import java.util.List;
  *
  * Takodje salje notifikacije 3 dana pre isteka (B4 zahtev).
  *
- * NAPOMENA (copy-first ekstrakcija, faza 2d): {@code @Scheduled} je u
- * trading-service-u DORMANTAN — {@code TradingServiceApplication} namerno
- * nema {@code @EnableScheduling} do cutover-a 2f. Bean se i dalje registruje
- * (drzi kontract metode), ali se {@code expireContracts} ne okida automatski.
- * Posle 2f cutover-a monolitni OTC scheduler se gasi i ovaj preuzima.
+ * NAPOMENA (post-cutover 2f): {@code @Scheduled} je AKTIVAN — {@link rs.raf.trading.config.SchedulingConfig}
+ * nosi {@code @EnableScheduling} (gejtovano {@code trading.scheduling.enabled},
+ * uspavan samo u test profilu). Monolitni OTC scheduler je ugasen cutover-om, pa
+ * trading-service jedini okida {@code expireContracts}.
  */
 @Slf4j
 @Component

@@ -153,6 +153,9 @@ class PaymentServiceImplCoverageTest {
                 .build();
 
         when(paymentRepository.findById(99L)).thenReturn(Optional.of(p));
+        // P2-1: klijent je primalac (toAccount "BBB" mu pripada) — sme da vidi placanje.
+        Account recipient = Account.builder().id(5L).accountNumber("BBB").client(client).build();
+        when(accountRepository.findByAccountNumber("BBB")).thenReturn(Optional.of(recipient));
 
         authAs("c@x");
 
@@ -190,9 +193,9 @@ class PaymentServiceImplCoverageTest {
     @Test
     void getPaymentById_throwsWhenNotAuthenticated() {
         SecurityContextHolder.clearContext();
-        // getOptionalClient catches the "Niste prijavljeni" IAE and returns null,
-        // then getAuthenticatedClient rethrows "Klijent nije pronadjen" — this still
-        // exercises lines 283 (auth-null check) and 291 (null rethrow).
+        // getOptionalClient catches the "Niste prijavljeni" NotAuthenticatedException
+        // (R1-521) and returns null, then getAuthenticatedClient rethrows
+        // "Klijent nije pronadjen" (IAE) — this still exercises the auth-null branch.
         assertThatThrownBy(() -> paymentService.getPaymentById(1L))
                 .isInstanceOf(IllegalArgumentException.class);
     }

@@ -56,9 +56,13 @@ data:
   ARBITRO_API_KEY: "ollama"
   ARBITRO_MAX_TOKENS: "8192"
   ARBITRO_TEMPERATURE: "1.0"
-  ARBITRO_WIKI_URL: "http://wikipedia-service-svc:8090"
-  ARBITRO_RAG_URL: "http://rag-service-svc:8091"
-  ARBITRO_KOKORO_URL: "http://kokoro-tts-svc:8092"
+  # R2 1392 config-drift fix: Spring binduje ARBITRO_TOOLS_WIKIPEDIA_URL / _RAG_URL /
+  # _TTS_URL (vidi application.properties:143/145/150). Stara imena (ARBITRO_WIKI_URL /
+  # ARBITRO_RAG_URL / ARBITRO_KOKORO_URL) bila su mrtva → Arbitro tool URL-ovi padali
+  # na host.docker.internal default u K8s-u.
+  ARBITRO_TOOLS_WIKIPEDIA_URL: "http://wikipedia-service-svc:8090"
+  ARBITRO_TOOLS_RAG_URL: "http://rag-service-svc:8091"
+  ARBITRO_TOOLS_TTS_URL: "http://kokoro-tts-svc:8092"
   ARBITRO_WHISPER_URL: "http://whisper-stt-svc:8093"
   ARBITRO_WHISPER_ENABLED: "true"
   ARBITRO_WHISPER_TIMEOUT_MS: "30000"

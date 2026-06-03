@@ -32,11 +32,13 @@ public class CurrencyConversionService {
      * Menjacnica marza (spread + provizija) koja se naplacuje kada klijent
      * trguje sa racuna u valuti razlicitoj od valute hartije. Zaposleni
      * ne placaju menjacnicu jer trguju sa bankinih racuna (Celina 3 spec).
-     * Vrednost 1% je konzervativan match za Celina 2 menjacnicu (+2% spread +
-     * 0.5% komisija tamo dolazi na ~2.5%, ali ovde kombinujemo u jedan fee
-     * da bi obracun bio citljiv korisniku).
+     *
+     * <p>P2-profit-fx-fee-1 (R5 1877): vrednost (1%) dolazi iz jedinstvenog
+     * {@link rs.raf.trading.common.FxFeePolicy#FX_FEE_RATE} izvora istine
+     * (ranije je ista konstanta bila nezavisno duplirana na 4 mesta).
+     * Primena ostaje multiplikativna na kurs (vidi {@link #convertForPurchase}).</p>
      */
-    private static final BigDecimal FX_MARGIN = new BigDecimal("0.01");
+    private static final BigDecimal FX_MARGIN = rs.raf.trading.common.FxFeePolicy.FX_FEE_RATE;
 
     private final BankaCoreClient bankaCoreClient;
 

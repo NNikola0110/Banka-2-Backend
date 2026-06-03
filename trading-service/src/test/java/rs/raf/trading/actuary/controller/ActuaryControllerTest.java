@@ -147,8 +147,9 @@ class ActuaryControllerTest {
     @Test
     @DisplayName("GET /actuaries/{employeeId} - 404 kada zapis ne postoji")
     void getActuaryInfoNotFoundReturns404() throws Exception {
+        // R1-186: genuini "ne postoji" → EntityNotFoundException → 404.
         when(actuaryService.getActuaryInfo(999L))
-                .thenThrow(new IllegalArgumentException("Actuary info for employee with ID 999 not found."));
+                .thenThrow(new jakarta.persistence.EntityNotFoundException("Actuary info for employee with ID 999 not found."));
 
         mockMvc.perform(get("/actuaries/999"))
                 .andExpect(status().isNotFound())
@@ -221,8 +222,10 @@ class ActuaryControllerTest {
     @Test
     @DisplayName("PATCH /actuaries/{employeeId}/reset-limit - 404 kada zapis ne postoji")
     void resetUsedLimitNotFoundReturns404() throws Exception {
+        // R1-186: resetUsedLimit vec baca EntityNotFoundException za nepostojeceg
+        // → 404 (handler EntityNotFound → 404).
         when(actuaryService.resetUsedLimit(999L))
-                .thenThrow(new IllegalArgumentException("Actuary info for employee with ID 999 not found."));
+                .thenThrow(new jakarta.persistence.EntityNotFoundException("Actuary info for employee with ID 999 not found."));
 
         mockMvc.perform(patch("/actuaries/999/reset-limit"))
                 .andExpect(status().isNotFound())
@@ -261,14 +264,30 @@ class ActuaryControllerTest {
     @Test
     @DisplayName("PATCH /actuaries/{employeeId}/limit - 404 kada cilj ne postoji")
     void updateAgentLimit_notFound_returns404() throws Exception {
+        // R1-186: ciljani aktuar ne postoji → EntityNotFoundException → 404.
         when(actuaryService.updateAgentLimit(eq(999L), any(UpdateActuaryLimitDto.class)))
-                .thenThrow(new IllegalArgumentException("User does not exist or isn't an actuary."));
+                .thenThrow(new jakarta.persistence.EntityNotFoundException("User does not exist or isn't an actuary."));
 
         mockMvc.perform(patch("/actuaries/999/limit")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"dailyLimit\":12345}"))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.error").value("User does not exist or isn't an actuary."));
+    }
+
+    @Test
+    @DisplayName("R1-186: PATCH /actuaries/{employeeId}/limit - 400 kada je novi limit ispod usedLimit-a (validacija)")
+    void updateAgentLimit_belowUsedLimit_returns400() throws Exception {
+        when(actuaryService.updateAgentLimit(eq(10L), any(UpdateActuaryLimitDto.class)))
+                .thenThrow(new IllegalArgumentException(
+                        "New daily limit (10000) cannot be below already used limit (15000)."));
+
+        mockMvc.perform(patch("/actuaries/10/limit")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"dailyLimit\":10000}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value(
+                        "New daily limit (10000) cannot be below already used limit (15000)."));
     }
 
     @Test
@@ -282,5 +301,30 @@ class ActuaryControllerTest {
                         .content("{\"needApproval\":true}"))
                 .andExpect(status().isForbidden())
                 .andExpect(jsonPath("$.error").value("Only supervisors can update agent limits."));
+    }
+
+    @Test
+    @DisplayName("R1 442 (P2-authz-method-1): updateAgentLimit nosi @PreAuthorize "
+            + "konzistentno sa resetUsedLimit (method-level guard na state-mutaciju)")
+    void updateAgentLimit_hasPreAuthorizeConsistentWithResetLimit() throws Exception {
+        // Standalone MockMvc ne primenjuje @PreAuthorize (nema security filtera), pa
+        // garanciju cementiramo refleksijom: updateAgentLimit MORA nositi isti
+        // method-level guard kao resetUsedLimit. Pre fix-a je samo reset-limit imao
+        // @PreAuthorize, a updateAgentLimit (koji menja dailyLimit/needApproval) je
+        // zavisio iskljucivo od HTTP matcher-a (/actuaries/** → ADMIN/SUPERVISOR).
+        var updateAnn = ActuaryController.class
+                .getMethod("updateAgentLimit", Long.class, UpdateActuaryLimitDto.class)
+                .getAnnotation(org.springframework.security.access.prepost.PreAuthorize.class);
+        var resetAnn = ActuaryController.class
+                .getMethod("resetUsedLimit", Long.class)
+                .getAnnotation(org.springframework.security.access.prepost.PreAuthorize.class);
+
+        assertThat(updateAnn).as("updateAgentLimit mora imati @PreAuthorize").isNotNull();
+        assertThat(resetAnn).as("resetUsedLimit referentni @PreAuthorize").isNotNull();
+        assertThat(updateAnn.value())
+                .as("isti supervizorski/admin guard kao reset-limit")
+                .isEqualTo(resetAnn.value())
+                .contains("SUPERVISOR")
+                .contains("ADMIN");
     }
 }

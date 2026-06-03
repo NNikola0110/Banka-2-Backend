@@ -81,6 +81,7 @@ public class MarginAccountBlockedEmailTemplate {
                         </table>
                     </td>
                 </tr>
-                """.formatted(label, value != null ? value : "-");
+                """.formatted(EmailHtml.escape(label),
+                        EmailHtml.escape(value != null ? value : "-"));
     }
 }

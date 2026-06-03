@@ -73,9 +73,19 @@ public class OptionController {
             @ApiResponse(responseCode = "404", description = "Opcija ne postoji",
                     content = @Content(schema = @Schema(implementation = MessageResponseDto.class)))
     })
+    // P2-authz-method-1 (R1 462): opcije su sistemski-generisani, bankarski
+    // instrumenti — NEMAJU per-red vlasnika (Option entitet nema userId/ownerId;
+    // exercise UVEK operise nad bankinim EMPLOYEE portfoliom u ime banke). "Ownership"
+    // u smislu per-opcija-vlasnika ne postoji u modelu; jedina smislena autorizacija
+    // je da li je akter ovlascen aktuar/admin. Ranije je metoda bila SAMO
+    // authenticated() na HTTP nivou (svaki ulogovan korisnik, ukljucujuci klijenta,
+    // je mogao da pogodi servis — koji onda baca AccessDenied). Sad: eksplicitan
+    // method-level guard na role zaposlenog (ADMIN/EMPLOYEE — oba tipa aktuara nose
+    // EMPLOYEE rolu) PRE poziva servisa (defense-in-depth: klijent NIKAD ne ulazi u
+    // servis). Fino-granularni aktuar/aktivan-nalog check ostaje u
+    // OptionService.ensureUserCanExerciseOptions.
     @PostMapping("/{id}/exercise")
-    // Fine-grained check u OptionService.ensureUserCanExerciseOptions
-    // (admin ILI aktuar). Security config zahteva authenticated().
+    @PreAuthorize("hasRole('ADMIN') or hasRole('EMPLOYEE')")
     public ResponseEntity<MessageResponseDto> exerciseOption(
             @PathVariable Long id,
             Authentication authentication

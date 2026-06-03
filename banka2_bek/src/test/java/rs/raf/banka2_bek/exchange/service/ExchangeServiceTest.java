@@ -199,7 +199,9 @@ class ExchangeServiceTest {
     @Test
     void calculate_unsupportedCurrency_throwsException() {
         mockRates();
-        RuntimeException ex = assertThrows(RuntimeException.class,
+        // R1 446: nepostojeca valuta je NOT_FOUND (EntityNotFoundException → 404), ne 400.
+        jakarta.persistence.EntityNotFoundException ex = assertThrows(
+                jakarta.persistence.EntityNotFoundException.class,
                 () -> exchangeService.calculate(100.0, "XYZ"));
         assertEquals("Currency not supported: XYZ", ex.getMessage());
     }
@@ -259,5 +261,75 @@ class ExchangeServiceTest {
         mockRates();
         assertThrows(RuntimeException.class,
                 () -> exchangeService.calculateCross(100.0, "EUR", "XYZ"));
+    }
+
+    // ===================== R1-654: access_key masking u log-u =====================
+
+    @Test
+    void maskApiKey_replacesAccessKeyValueInTheMiddle_keepsRestOfUrl() {
+        String url = "https://data.fixer.io/api/latest?access_key=super-secret-123"
+                + "&symbols=RSD,EUR";
+        String masked = ExchangeService.maskApiKey(url);
+        assertEquals("https://data.fixer.io/api/latest?access_key=***&symbols=RSD,EUR", masked);
+        assertFalse(masked.contains("super-secret-123"), "kljuc ne sme procuriti u log-u");
+    }
+
+    @Test
+    void maskApiKey_replacesAccessKeyValueAtEnd() {
+        String url = "https://data.fixer.io/api/latest?symbols=RSD&access_key=tail-secret";
+        String masked = ExchangeService.maskApiKey(url);
+        assertEquals("https://data.fixer.io/api/latest?symbols=RSD&access_key=***", masked);
+        assertFalse(masked.contains("tail-secret"));
+    }
+
+    @Test
+    void maskApiKey_nullSafe_andNoOpWhenNoKey() {
+        assertEquals(null, ExchangeService.maskApiKey(null));
+        assertEquals("https://example.com/latest?symbols=RSD",
+                ExchangeService.maskApiKey("https://example.com/latest?symbols=RSD"));
+    }
+
+    @Test
+    void r1_672_mapsFixerDateOntoRates() {
+        Map<String, Object> rates = new HashMap<>();
+        rates.put("RSD", 117.35);
+        rates.put("EUR", 1.0);
+        rates.put("USD", 1.15);
+        Map<String, Object> body = new HashMap<>();
+        body.put("rates", rates);
+        body.put("date", "2026-05-30"); // R1-672: pravi Fixer datum vazenja kursa
+
+        String expectedUrl =
+                "https://data.fixer.io/api/latest?access_key=test-key&symbols=RSD,EUR,CHF,USD,GBP,JPY,CAD,AUD";
+        when(restTemplate.getForEntity(expectedUrl, Map.class)).thenReturn(ResponseEntity.ok(body));
+
+        List<ExchangeRateDto> result = exchangeService.getAllRates();
+
+        // svaki DTO nosi PRAVI Fixer datum, ne LocalDate.now() ctor default
+        assertTrue(result.stream().allMatch(r -> "2026-05-30".equals(r.getDate())),
+                "R1-672: svi kursevi moraju nositi Fixer 'date' polje");
+    }
+
+    @Test
+    void r1_674_negativeCache_fallsBackGracefullyOnApiFailure() {
+        // API odmah pada (nema prethodnog kesa) — negativni kes kesira NBS fallback
+        // sa svezim timestamp-om, pa naredni poziv NE udara opet u API (thundering-herd
+        // zastita). Verifikujemo: vraca neprazan fallback, i drugi poziv ne pravi novi
+        // API poziv (cache hit).
+        when(restTemplate.getForEntity(
+                org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.eq(Map.class)))
+                .thenThrow(new org.springframework.web.client.ResourceAccessException("down"));
+
+        List<ExchangeRateDto> firstCall = exchangeService.getAllRates();
+        assertNotNull(firstCall);
+        assertFalse(firstCall.isEmpty(), "na padu API-ja vraca NBS fallback, ne praznu listu");
+
+        // Drugi poziv: negativni kes je svez → ne sme ponovo zvati API.
+        List<ExchangeRateDto> secondCall = exchangeService.getAllRates();
+        assertEquals(firstCall.size(), secondCall.size());
+        org.mockito.Mockito.verify(restTemplate, org.mockito.Mockito.times(1))
+                .getForEntity(org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.eq(Map.class));
     }
 }

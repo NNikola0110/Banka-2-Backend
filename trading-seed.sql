@@ -1027,59 +1027,59 @@ WHERE NOT EXISTS (SELECT 1 FROM actuary_info WHERE employee_id = 4);
 -- ---------- STEFAN (client_id=1) ----------
 -- AAPL 50 @ 145 (solid profit), MSFT 30 @ 380.5 (public 10 za OTC demo),
 -- TSLA 20 @ 265 (u gubitku), CLM26 futures 5
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 1, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 50, 145.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 1, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 50, 145.0000, 0, NOW(), 0
 FROM listings l WHERE l.ticker = 'AAPL'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 1 AND p.user_role = 'CLIENT' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 1, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 30, 380.5000, 10, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 1, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 30, 380.5000, 10, NOW(), 0
 FROM listings l WHERE l.ticker = 'MSFT'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 1 AND p.user_role = 'CLIENT' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 1, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 20, 265.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 1, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 20, 265.0000, 0, NOW(), 0
 FROM listings l WHERE l.ticker = 'TSLA'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 1 AND p.user_role = 'CLIENT' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 1, 'CLIENT', l.id, l.ticker, l.name, 'FUTURES', 5, 65.2000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 1, 'CLIENT', l.id, l.ticker, l.name, 'FUTURES', 5, 65.2000, 0, NOW(), 0
 FROM listings l WHERE l.ticker = 'CLM26'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 1 AND p.user_role = 'CLIENT' AND p.listing_id = l.id);
 
 -- ---------- MILICA (client_id=2) ----------
 -- GOOG 100 @ 155 (public 30 — glavni OTC izlog), AMZN 15 @ 172.8 (public 5)
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 2, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 100, 155.0000, 30, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 2, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 100, 155.0000, 30, NOW(), 0
 FROM listings l WHERE l.ticker = 'GOOG'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 2 AND p.user_role = 'CLIENT' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 2, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 15, 172.8000, 5, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 2, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 15, 172.8000, 5, NOW(), 0
 FROM listings l WHERE l.ticker = 'AMZN'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 2 AND p.user_role = 'CLIENT' AND p.listing_id = l.id);
 
 -- ---------- LAZAR (client_id=3) ----------
 -- TSLA 15 @ 255 (public 8 — OTC TSLA izlog), GOOG 30 @ 160 (public 0)
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 3, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 15, 255.0000, 8, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 3, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 15, 255.0000, 8, NOW(), 0
 FROM listings l WHERE l.ticker = 'TSLA'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 3 AND p.user_role = 'CLIENT' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 3, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 30, 160.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 3, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 30, 160.0000, 0, NOW(), 0
 FROM listings l WHERE l.ticker = 'GOOG'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 3 AND p.user_role = 'CLIENT' AND p.listing_id = l.id);
 
 -- ---------- ANA (client_id=4) ----------
 -- NVDA 5 @ 810 (public 3), AAPL 10 @ 175 (public 5 — AAPL OTC izlog)
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 4, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 5, 810.0000, 3, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 4, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 5, 810.0000, 3, NOW(), 0
 FROM listings l WHERE l.ticker = 'NVDA'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 4 AND p.user_role = 'CLIENT' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 4, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 10, 175.0000, 5, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 4, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 10, 175.0000, 5, NOW(), 0
 FROM listings l WHERE l.ticker = 'AAPL'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 4 AND p.user_role = 'CLIENT' AND p.listing_id = l.id);
 
@@ -1124,7 +1124,8 @@ WHERE l.ticker = 'AAPL'
     SELECT 1 FROM options o WHERE o.ticker = 'AAPL_TEST_CALL_ITM'
     );
 
--- 2) CALL OTM - treba da vrati 400 (nije in-the-money)
+-- 2) CALL OTM - exercise DOZVOLJEN (BE-STK-02): kupac ima PRAVO da iskoristi opciju
+--    cak i kad nije in-the-money (ekonomski gubitak je njegova odluka). Vise NE vraca 400.
 INSERT INTO options (
     stock_listing_id,
     option_type,
@@ -1268,7 +1269,8 @@ WHERE l.ticker = 'MSFT'
     SELECT 1 FROM options o WHERE o.ticker = 'MSFT_TEST_PUT_ITM'
     );
 
--- 6) PUT OTM - treba da vrati 400
+-- 6) PUT OTM - exercise DOZVOLJEN (BE-STK-02): kupac ima PRAVO da iskoristi opciju
+--    i kad nije in-the-money. Vise NE vraca 400.
 INSERT INTO options (
     stock_listing_id,
     option_type,
@@ -1645,42 +1647,42 @@ VALUES
 -- ============================================================
 -- ---------- TAMARA (agent, employee_id=4) ----------
 -- MSFT 15 @ 395, TSLA 10 @ 248
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 4, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 15, 395.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 4, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 15, 395.0000, 0, NOW(), 0
 FROM listings l WHERE l.ticker = 'MSFT'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 4 AND p.user_role = 'EMPLOYEE' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 4, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 10, 248.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 4, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 10, 248.0000, 0, NOW(), 0
 FROM listings l WHERE l.ticker = 'TSLA'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 4 AND p.user_role = 'EMPLOYEE' AND p.listing_id = l.id);
 
 -- ---------- DJORDJE (agent, employee_id=5) ----------
 -- CLM26 futures 5, AMZN 20 @ 178.5 (public 4 — bankin OTC izlog)
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 5, 'EMPLOYEE', l.id, l.ticker, l.name, 'FUTURES', 5, 65.2000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 5, 'EMPLOYEE', l.id, l.ticker, l.name, 'FUTURES', 5, 65.2000, 0, NOW(), 0
 FROM listings l WHERE l.ticker = 'CLM26'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 5 AND p.user_role = 'EMPLOYEE' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 5, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 20, 178.5000, 4, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 5, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 20, 178.5000, 4, NOW(), 0
 FROM listings l WHERE l.ticker = 'AMZN'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 5 AND p.user_role = 'EMPLOYEE' AND p.listing_id = l.id);
 
 -- ---------- MAJA (agent, employee_id=6) ----------
 -- AAPL 20 @ 180, MSFT 10 @ 390, NVDA 8 @ 820 (public 2 — NVDA OTC od banke)
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 6, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 20, 180.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 6, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 20, 180.0000, 0, NOW(), 0
 FROM listings l WHERE l.ticker = 'AAPL'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 6 AND p.user_role = 'EMPLOYEE' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 6, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 10, 390.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 6, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 10, 390.0000, 0, NOW(), 0
 FROM listings l WHERE l.ticker = 'MSFT'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 6 AND p.user_role = 'EMPLOYEE' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT 6, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 8, 820.0000, 2, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 6, 'EMPLOYEE', l.id, l.ticker, l.name, 'STOCK', 8, 820.0000, 2, NOW(), 0
 FROM listings l WHERE l.ticker = 'NVDA'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = 6 AND p.user_role = 'EMPLOYEE' AND p.listing_id = l.id);
 
@@ -1988,45 +1990,45 @@ WHERE f.name = 'Banka 2 Tech Growth'
 --    da bi vratio holdings tabelu na FE Detaljnom prikazu fonda.
 
 -- "Banka 2 Stable Income" — konzervativan: blue-chip akcije
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 100, 180.5000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 100, 180.5000, 0, NOW(), 0
 FROM investment_funds f, listings l
 WHERE f.name = 'Banka 2 Stable Income' AND l.ticker = 'AAPL'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = f.id AND p.user_role = 'FUND' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 50, 370.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 50, 370.0000, 0, NOW(), 0
 FROM investment_funds f, listings l
 WHERE f.name = 'Banka 2 Stable Income' AND l.ticker = 'MSFT'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = f.id AND p.user_role = 'FUND' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 40, 155.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 40, 155.0000, 0, NOW(), 0
 FROM investment_funds f, listings l
 WHERE f.name = 'Banka 2 Stable Income' AND l.ticker = 'GOOG'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = f.id AND p.user_role = 'FUND' AND p.listing_id = l.id);
 
 -- "Banka 2 Tech Growth" — agresivan: tech-heavy
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 200, 185.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 200, 185.0000, 0, NOW(), 0
 FROM investment_funds f, listings l
 WHERE f.name = 'Banka 2 Tech Growth' AND l.ticker = 'AAPL'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = f.id AND p.user_role = 'FUND' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 50, 450.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 50, 450.0000, 0, NOW(), 0
 FROM investment_funds f, listings l
 WHERE f.name = 'Banka 2 Tech Growth' AND l.ticker = 'NVDA'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = f.id AND p.user_role = 'FUND' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 25, 310.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 25, 310.0000, 0, NOW(), 0
 FROM investment_funds f, listings l
 WHERE f.name = 'Banka 2 Tech Growth' AND l.ticker = 'META'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = f.id AND p.user_role = 'FUND' AND p.listing_id = l.id);
 
-INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified)
-SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 40, 200.0000, 0, NOW()
+INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type, quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT f.id, 'FUND', l.id, l.ticker, l.name, 'STOCK', 40, 200.0000, 0, NOW(), 0
 FROM investment_funds f, listings l
 WHERE f.name = 'Banka 2 Tech Growth' AND l.ticker = 'TSLA'
 AND NOT EXISTS (SELECT 1 FROM portfolios p WHERE p.user_id = f.id AND p.user_role = 'FUND' AND p.listing_id = l.id);
@@ -2074,8 +2076,8 @@ WHERE f.name = 'Banka 2 Tech Growth'
 --    sa svojim postojecim ugovorima).
 -- user_id=6 -> klijent 'mile.interbank@banka.rs' (banka-core)
 INSERT INTO portfolios (user_id, user_role, listing_id, listing_ticker, listing_name, listing_type,
-                        quantity, average_buy_price, public_quantity, last_modified)
-SELECT 6, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 100, 175.0000, 25, NOW()
+                        quantity, average_buy_price, public_quantity, last_modified, version)
+SELECT 6, 'CLIENT', l.id, l.ticker, l.name, 'STOCK', 100, 175.0000, 25, NOW(), 0
 FROM listings l
 WHERE l.ticker = 'AAPL'
   AND NOT EXISTS (

@@ -17,6 +17,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Random;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -567,6 +568,58 @@ class OptionGeneratorServiceTest {
         captor.getValue().forEach(o ->
                 assertThat(o.getMaintenanceMargin()).isEqualByComparingTo(expectedMargin)
         );
+    }
+
+    // ============================================================
+    // R1 760: seedovani RNG → reproducibilan IV/volume
+    // ============================================================
+
+    @Test
+    void seededRandom_makesIvAndVolumeReproducible() {
+        Listing stock = createListing(1L, "AAPL", ListingType.STOCK, new BigDecimal("100.00"));
+        when(optionRepository.existsByStockListingIdAndSettlementDate(anyLong(), any(LocalDate.class)))
+                .thenReturn(false);
+        when(blackScholesService.calculateCallPrice(anyDouble(), anyDouble(), anyDouble(), anyDouble()))
+                .thenReturn(new BigDecimal("5.0000"));
+        when(blackScholesService.calculatePutPrice(anyDouble(), anyDouble(), anyDouble(), anyDouble()))
+                .thenReturn(new BigDecimal("3.0000"));
+
+        // Prvi run sa seed-om 42.
+        optionGeneratorService.setRandom(new Random(42L));
+        optionGeneratorService.generateOptionsForListing(stock);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<Option>> captor1 = ArgumentCaptor.forClass(List.class);
+        verify(optionRepository).saveAll(captor1.capture());
+        List<Long> volumes1 = captor1.getValue().stream().map(Option::getVolume).toList();
+        List<Double> ivs1 = captor1.getValue().stream().map(Option::getImpliedVolatility).toList();
+
+        // Drugi run sa ISTIM seed-om → identicni IV/volume nizovi (reproducibilno).
+        reset(optionRepository);
+        when(optionRepository.existsByStockListingIdAndSettlementDate(anyLong(), any(LocalDate.class)))
+                .thenReturn(false);
+        optionGeneratorService.setRandom(new Random(42L));
+        optionGeneratorService.generateOptionsForListing(stock);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<Option>> captor2 = ArgumentCaptor.forClass(List.class);
+        verify(optionRepository).saveAll(captor2.capture());
+        List<Long> volumes2 = captor2.getValue().stream().map(Option::getVolume).toList();
+        List<Double> ivs2 = captor2.getValue().stream().map(Option::getImpliedVolatility).toList();
+
+        assertThat(volumes2).isEqualTo(volumes1);
+        assertThat(ivs2).isEqualTo(ivs1);
+        // Volume i IV su u ocekivanom rasponu.
+        volumes1.forEach(v -> assertThat(v).isBetween(100L, 10000L));
+        ivs1.forEach(iv -> assertThat(iv).isBetween(0.15, 0.60));
+    }
+
+    @Test
+    void askBidSpread_usesSharedConstants() {
+        // R1 761: ask/bid helperi koriste centralizovane ±5% konstante.
+        BigDecimal price = new BigDecimal("10.0000");
+        assertThat(OptionGeneratorService.askFrom(price))
+                .isEqualByComparingTo(new BigDecimal("10.5000"));
+        assertThat(OptionGeneratorService.bidFrom(price))
+                .isEqualByComparingTo(new BigDecimal("9.5000"));
     }
 
     // ============================================================

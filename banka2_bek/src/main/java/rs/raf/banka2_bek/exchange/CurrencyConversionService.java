@@ -14,6 +14,15 @@ import java.util.List;
  *
  * Kurs u {@link ExchangeRateDto#getRate()} je "koliko jedinica target valute za 1 RSD".
  * Zato se konverzija iz A u B racuna kao: amount * (rateB / rateA).
+ *
+ * <p><b>R1-670 (DUPLIKACIJA PO ARHITEKTURI):</b> trading-service ima skoro identican
+ * {@code rs.raf.trading.order.service.CurrencyConversionService}. Razlika je u izvoru
+ * kurseva: ova (banka-core) verzija cita IN-PROCESS {@link ExchangeService} (banka-core
+ * poseduje FX domen), a trading verzija ide preko HTTP seam-a (BankaCoreClient.getFxRates).
+ * Posle 2f cutover-a FX zivi samo u banka-core-u, pa deljenje u banka2-contracts nije
+ * trivijalno (razliciti rate izvori / DTO-ovi). Algoritam (cross = rateB/rateA, scale 6,
+ * FX_MARGIN 1%) i {@code FX_MARGIN} vrednost MORAJU ostati sinhronizovani izmedju ove
+ * dve klase — trading verzija vec deli vrednost preko {@code FxFeePolicy.FX_FEE_RATE}.
  */
 @Service
 @RequiredArgsConstructor
@@ -25,9 +34,12 @@ public class CurrencyConversionService {
      * Menjacnica marza (spread + provizija) koja se naplacuje kada klijent
      * trguje sa racuna u valuti razlicitoj od valute hartije. Zaposleni
      * ne placaju menjacnicu jer trguju sa bankinih racuna (Celina 3 spec).
-     * Vrednost 1% je konzervativan match za Celina 2 menjacnicu (+2% spread +
-     * 0.5% komisija tamo dolazi na ~2.5%, ali ovde kombinujemo u jedan fee
-     * da bi obracun bio citljiv korisniku).
+     *
+     * <p>R1-675: vrednost je <b>1%</b> — jedinstvena, citljiva menjacnicka marza za
+     * order-flow FX (pojednostavljenje Celina 2 menjacnice koja ima +2% spread + 0.5%
+     * komisiju). Ne mesati sa inter-bank settlement fee-em (0.5%,
+     * {@code InterbankFxService.INTERBANK_SETTLEMENT_FEE}) — to je razlicita stavka.
+     * Mora ostati sinhrono sa trading {@code FxFeePolicy.FX_FEE_RATE} (R1-670).
      */
     private static final BigDecimal FX_MARGIN = new BigDecimal("0.01");
 

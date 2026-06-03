@@ -33,7 +33,9 @@ public class InterbankAuthFilter extends OncePerRequestFilter {
      */
     private static boolean isInterbankPath(String uri) {
         // FE wrapper rute — preskoci, JwtAuthenticationFilter ce ih obraditi.
-        if (uri.startsWith("/interbank/otc")) {
+        // P1-9: /interbank/payments/** je FE polling ruta za 2PC/OTC SAGA progres
+        // (browser JWT, NE X-Api-Key) — exempt-uj je kao /interbank/otc.
+        if (uri.startsWith("/interbank/otc") || uri.startsWith("/interbank/payments")) {
             return false;
         }
         return uri.startsWith("/interbank")
@@ -55,7 +57,11 @@ public class InterbankAuthFilter extends OncePerRequestFilter {
 
         if (match.isEmpty())
         {
-            response.setStatus(401); return;
+            // P1-error-contract-1: JSON {"message":...} telo umesto praznog 401 —
+            // konzistentan error shape (partner/Mobile/FE parser dobija poruku).
+            SecurityErrorResponder.writeJson(response, org.springframework.http.HttpStatus.UNAUTHORIZED,
+                    "Nevalidan ili nedostajuci X-Api-Key.");
+            return;
         }
         var auth = new UsernamePasswordAuthenticationToken(match.get().getRoutingNumber(), null, List.of(new SimpleGrantedAuthority("ROLE_INTERBANK")));
         SecurityContextHolder.getContext().setAuthentication(auth);

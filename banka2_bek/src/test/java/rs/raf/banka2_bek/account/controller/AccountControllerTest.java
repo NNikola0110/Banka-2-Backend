@@ -40,6 +40,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -400,6 +401,8 @@ class AccountControllerTest {
                 .id(1L).name("Tekuci racun").accountNumber("222000112345678910")
                 .dailyLimit(new BigDecimal("300000")).monthlyLimit(new BigDecimal("1500000"))
                 .accountType("CHECKING").status("ACTIVE").build();
+        // ACCEPTED-DEVIATION (user-directed 03.06): limit-change vise NIJE OTP-gated —
+        // kontroler prosledjuje servisu 3-arg potpis (bez otpCode). Service je mock.
         when(accountService.updateAccountLimits(eq(1L), any(), any())).thenReturn(updated);
 
         String payload = """
@@ -420,7 +423,7 @@ class AccountControllerTest {
 
     @Test
     @DisplayName("PATCH /accounts/1/limits - 400 when negative limit")
-    @org.junit.jupiter.api.Disabled void updateAccountLimits_negativeLimit_returnsBadRequest() throws Exception {
+    void updateAccountLimits_negativeLimit_returnsBadRequest() throws Exception {
         String payload = """
                 {
                   "dailyLimit": -100
@@ -458,8 +461,11 @@ class AccountControllerTest {
 
     @Test
     @DisplayName("GET /accounts/all - 200 OK paginated")
-    @org.junit.jupiter.api.Disabled void getAllAccounts_returnsPage() throws Exception {
-        Page<AccountResponseDto> page = new PageImpl<>(List.of(testAccountDto));
+    void getAllAccounts_returnsPage() throws Exception {
+        // Page mora da nosi konkretan Pageable (kao u produkciji preko PageRequest.of),
+        // jer Spring Data Jackson PageModule (Spring Boot 4 / Jackson 3) baca gresku pri
+        // serijalizaciji Pageable.unpaged() Page-a. Produkcija uvek prosledi pravi Pageable.
+        Page<AccountResponseDto> page = new PageImpl<>(List.of(testAccountDto), PageRequest.of(0, 10), 1);
         when(accountService.getAllAccounts(0, 10, null)).thenReturn(page);
 
         mockMvc.perform(get("/accounts/all")
@@ -472,8 +478,8 @@ class AccountControllerTest {
 
     @Test
     @DisplayName("GET /accounts/all?ownerName=Marko - 200 OK filtered")
-    @org.junit.jupiter.api.Disabled void getAllAccounts_filteredByOwner() throws Exception {
-        Page<AccountResponseDto> page = new PageImpl<>(List.of(testAccountDto));
+    void getAllAccounts_filteredByOwner() throws Exception {
+        Page<AccountResponseDto> page = new PageImpl<>(List.of(testAccountDto), PageRequest.of(0, 10), 1);
         when(accountService.getAllAccounts(0, 10, "Marko")).thenReturn(page);
 
         mockMvc.perform(get("/accounts/all")
@@ -486,8 +492,8 @@ class AccountControllerTest {
 
     @Test
     @DisplayName("GET /accounts/all - 200 OK empty page")
-    @org.junit.jupiter.api.Disabled void getAllAccounts_emptyPage() throws Exception {
-        Page<AccountResponseDto> page = new PageImpl<>(List.of());
+    void getAllAccounts_emptyPage() throws Exception {
+        Page<AccountResponseDto> page = new PageImpl<>(List.of(), PageRequest.of(0, 10), 0);
         when(accountService.getAllAccounts(0, 10, null)).thenReturn(page);
 
         mockMvc.perform(get("/accounts/all")
@@ -880,6 +886,44 @@ class AccountControllerTest {
 
         mockMvc.perform(patch("/accounts/requests/1/approve"))
                 .andExpect(status().isForbidden());
+    }
+
+    @Test
+    @DisplayName("TEST-accounts-8: approve kad createAccount padne → zahtev NE postaje APPROVED (ostaje PENDING)")
+    void approveAccountRequest_createAccountFails_requestNotMarkedApproved() throws Exception {
+        // TEST-accounts-8: approveAccountRequest prvo kreira racun (accountService.
+        // createAccount), pa TEK ONDA setuje status=APPROVED i snima zahtev. Ako
+        // createAccount baci (npr. vlasnik ne postoji), kontroler nikad ne stigne do
+        // req.setStatus("APPROVED") + save → zahtev ostaje PENDING (nema pola-odobrenog
+        // stanja). Pinujemo: (a) error response, (b) zahtev NIKAD nije sacuvan sa
+        // statusom APPROVED.
+        setupSecurityContext("employee@banka.rs");
+
+        Currency rsd = Currency.builder().id(1L).code("RSD").build();
+        AccountRequest req = AccountRequest.builder()
+                .id(1L)
+                .accountType(AccountType.CHECKING)
+                .currency(rsd)
+                .initialDeposit(new BigDecimal("10000"))
+                .createCard(false)
+                .clientEmail("nepostojeci@banka.rs")
+                .clientName("Nepostojeci Klijent")
+                .status("PENDING")
+                .createdAt(LocalDateTime.of(2025, 3, 20, 12, 0))
+                .build();
+
+        when(accountRequestRepository.findById(1L)).thenReturn(Optional.of(req));
+        // createAccount pada (npr. vlasnik za licni racun ne postoji).
+        when(accountService.createAccount(any()))
+                .thenThrow(new RuntimeException("Vlasnik nije pronadjen"));
+
+        mockMvc.perform(patch("/accounts/requests/1/approve"))
+                .andExpect(status().isBadRequest());
+
+        // Zahtev ostaje PENDING — nikad nije sacuvan sa APPROVED.
+        assertThat(req.getStatus()).isEqualTo("PENDING");
+        verify(accountRequestRepository, never()).save(argThat(
+                r -> "APPROVED".equals(r.getStatus())));
     }
 
     // ══════════════════════════════════════════════════════════════════

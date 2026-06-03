@@ -240,6 +240,30 @@ class InternalPortfolioServiceTest {
                 eq(200), any());
     }
 
+    @Test
+    @DisplayName("TEST-branches-5: kesiran responseBody je KORUMPIRAN → deserijalizacija padne "
+            + "→ operacija se RE-IZVRSAVA (graceful, ne baca)")
+    void reserveStockIdempotent_corruptCachedBody_reExecutesOperation_TEST_branches_5() {
+        // Cache POSTOJI, ali responseBody nije validan JSON za ReserveStockResponse.
+        InternalRequest corrupt = new InternalRequest();
+        corrupt.setResponseBody("{ this-is-not-valid-json ");
+        when(idempotencyService.findCached("idem-corrupt")).thenReturn(Optional.of(corrupt));
+        // Re-izvrsavanje treba da nadje listing + portfolio i da prodje.
+        when(listingRepository.findByTicker("AAPL")).thenReturn(Optional.of(listing(7L, "AAPL")));
+        when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(42L, "CLIENT", 7L))
+                .thenReturn(Optional.of(portfolio(7L, "AAPL", 20, 0)));
+
+        ReserveStockResponse resp = service.reserveStockIdempotent("idem-corrupt",
+                new ReserveStockRequest(42L, "CLIENT", "AAPL", 10));
+
+        // Operacija JESTE re-izvrsena (portfolio sacuvan, rezultat vracen), a NIJE bacila
+        // na korumpiranom cache-u — i idempotency je prepisan svezim odgovorom.
+        assertThat(resp.reservedQuantity()).isEqualTo(10);
+        verify(portfolioRepository).save(any());
+        verify(idempotencyService).store(eq("idem-corrupt"), eq("/internal/portfolio/reserve-stock"),
+                eq(200), any());
+    }
+
     // ─── read-side ────────────────────────────────────────────────────────────
 
     @Test
@@ -293,7 +317,9 @@ class InternalPortfolioServiceTest {
     @Test
     @DisplayName("findAllPublicStock: vraca samo pozicije sa publicQuantity > 0")
     void findAllPublicStock_filtersZero() {
-        when(portfolioRepository.findAll()).thenReturn(List.of(
+        // P2-perf-nplus1-1 (R5 1900): DB-side filter (findAllWithPublicQuantity) umesto
+        // findAll(). publicQty=0 unos je tu da dokaze i in-memory defense-in-depth guard.
+        when(portfolioRepository.findAllWithPublicQuantity()).thenReturn(List.of(
                 portfolioWithPublic(42L, "CLIENT", "AAPL", 7),
                 portfolioWithPublic(43L, "CLIENT", "MSFT", 0))); // publicQty 0 → preskocen
 
@@ -302,6 +328,8 @@ class InternalPortfolioServiceTest {
         assertThat(result).hasSize(1);
         assertThat(result.get(0).ticker()).isEqualTo("AAPL");
         assertThat(result.get(0).publicQuantity()).isEqualTo(7);
+        // Strukturalno: ne sme vise zvati findAll() (pun-table-scan).
+        verify(portfolioRepository, never()).findAll();
     }
 
     @Test

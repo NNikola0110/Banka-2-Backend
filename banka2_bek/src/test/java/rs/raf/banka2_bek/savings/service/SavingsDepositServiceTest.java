@@ -171,6 +171,13 @@ class SavingsDepositServiceTest {
         when(otpService.verify(anyString(), eq("123456"))).thenReturn(Map.of("verified", true));
         when(accountRepo.findById(10L)).thenReturn(Optional.of(source));
 
+        Account bankAccount = new Account();
+        bankAccount.setId(100L);
+        bankAccount.setBalance(new BigDecimal("1000000"));
+        bankAccount.setAvailableBalance(new BigDecimal("1000000"));
+        bankAccount.setCurrency(rsd);
+        when(accountRepo.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankAccount));
+
         SavingsInterestRate rate = SavingsInterestRate.builder()
                 .id(1L).currency(rsd).termMonths(12).annualRate(new BigDecimal("4.00"))
                 .active(true).effectiveFrom(LocalDate.now()).build();
@@ -199,6 +206,11 @@ class SavingsDepositServiceTest {
         assertThat(source.getAvailableBalance()).isEqualByComparingTo("400000");
         verify(accountRepo).save(source);
 
+        // Double-entry: bankin liability racun kreditiran za glavnicu (custody)
+        assertThat(bankAccount.getBalance()).isEqualByComparingTo("1100000");
+        assertThat(bankAccount.getAvailableBalance()).isEqualByComparingTo("1100000");
+        verify(accountRepo).save(bankAccount);
+
         // Deposit zapisan + audit transaction kreirana
         verify(depositRepo).save(any(SavingsDeposit.class));
         verify(txRepo).save(any(SavingsTransaction.class));
@@ -206,6 +218,73 @@ class SavingsDepositServiceTest {
         // Vraca DTO sa id-em
         assertThat(result.getId()).isEqualTo(99L);
         assertThat(result.getPrincipalAmount()).isEqualByComparingTo("100000");
+    }
+
+    /**
+     * P0-B1 konzervacija: open mora biti net-zero u sistemu.
+     * Klijentov source -principal, bankin liability +principal. Suma = 0.
+     */
+    @Test
+    void openDeposit_conservation_systemMoneyUnchanged() {
+        when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+        when(otpService.verify(anyString(), eq("123456"))).thenReturn(Map.of("verified", true));
+        when(accountRepo.findById(10L)).thenReturn(Optional.of(source));
+
+        Account bankAccount = new Account();
+        bankAccount.setId(100L);
+        bankAccount.setBalance(new BigDecimal("1000000"));
+        bankAccount.setAvailableBalance(new BigDecimal("1000000"));
+        bankAccount.setCurrency(rsd);
+        when(accountRepo.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankAccount));
+
+        SavingsInterestRate rate = SavingsInterestRate.builder()
+                .id(1L).currency(rsd).termMonths(12).annualRate(new BigDecimal("4.00"))
+                .active(true).effectiveFrom(LocalDate.now()).build();
+        when(rateService.findActive(1L, 12)).thenReturn(Optional.of(rate));
+        when(depositRepo.save(any(SavingsDeposit.class))).thenAnswer(inv -> {
+            SavingsDeposit d = inv.getArgument(0);
+            d.setId(99L);
+            return d;
+        });
+        when(mapper.toDepositDto(any(SavingsDeposit.class)))
+                .thenReturn(SavingsDepositDto.builder().id(99L).build());
+
+        BigDecimal before = source.getBalance().add(bankAccount.getBalance());
+
+        OpenDepositDto dto = OpenDepositDto.builder()
+                .sourceAccountId(10L).linkedAccountId(10L)
+                .principalAmount(new BigDecimal("100000"))
+                .termMonths(12)
+                .autoRenew(false).otpCode("123456")
+                .build();
+        service.openDeposit(dto);
+
+        BigDecimal after = source.getBalance().add(bankAccount.getBalance());
+        assertThat(after).isEqualByComparingTo(before);
+    }
+
+    @Test
+    void openDeposit_bankAccountMissing_throws() {
+        when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+        when(otpService.verify(anyString(), eq("123456"))).thenReturn(Map.of("verified", true));
+        when(accountRepo.findById(10L)).thenReturn(Optional.of(source));
+        when(accountRepo.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.empty());
+
+        SavingsInterestRate rate = SavingsInterestRate.builder()
+                .id(1L).currency(rsd).termMonths(12).annualRate(new BigDecimal("4.00"))
+                .active(true).effectiveFrom(LocalDate.now()).build();
+        when(rateService.findActive(1L, 12)).thenReturn(Optional.of(rate));
+
+        OpenDepositDto dto = OpenDepositDto.builder()
+                .sourceAccountId(10L).linkedAccountId(10L)
+                .principalAmount(new BigDecimal("100000"))
+                .termMonths(12)
+                .autoRenew(false).otpCode("123456")
+                .build();
+
+        assertThatThrownBy(() -> service.openDeposit(dto))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Banka nema racun");
     }
 
     @Test
@@ -231,6 +310,180 @@ class SavingsDepositServiceTest {
         assertThatThrownBy(() -> service.openDeposit(dto))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Nedovoljno");
+    }
+
+    // -----------------------------------------------------------------------
+    // TEST-savings-5: openDeposit source != linked (ista valuta) + razlicite-valute grana
+    // -----------------------------------------------------------------------
+
+    /**
+     * TEST-savings-5: source i linked su DVA RAZLICITA racuna ali ISTE valute (RSD).
+     * To je dozvoljena grana (provera u kodu je po currency.id, ne po account.id) —
+     * depozit se otvara, source se debituje, linked se NE dira na otvaranju
+     * (linked dobija kamatu/glavnicu tek scheduler-om).
+     */
+    @Test
+    void openDeposit_sourceDifferentFromLinked_sameCurrency_succeeds() {
+        when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+        when(otpService.verify(anyString(), eq("123456"))).thenReturn(Map.of("verified", true));
+
+        Account linked = new Account();
+        linked.setId(20L);
+        linked.setAccountNumber("222000132199251399");
+        linked.setBalance(new BigDecimal("100"));
+        linked.setAvailableBalance(new BigDecimal("100"));
+        linked.setCurrency(rsd); // ista valuta kao source
+        linked.setStatus(AccountStatus.ACTIVE);
+        linked.setClient(client);
+
+        when(accountRepo.findById(10L)).thenReturn(Optional.of(source));
+        when(accountRepo.findById(20L)).thenReturn(Optional.of(linked));
+
+        Account bankAccount = new Account();
+        bankAccount.setId(100L);
+        bankAccount.setBalance(new BigDecimal("1000000"));
+        bankAccount.setAvailableBalance(new BigDecimal("1000000"));
+        bankAccount.setCurrency(rsd);
+        when(accountRepo.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankAccount));
+
+        SavingsInterestRate rate = SavingsInterestRate.builder()
+                .id(1L).currency(rsd).termMonths(12).annualRate(new BigDecimal("4.00"))
+                .active(true).effectiveFrom(LocalDate.now()).build();
+        when(rateService.findActive(1L, 12)).thenReturn(Optional.of(rate));
+        when(depositRepo.save(any(SavingsDeposit.class))).thenAnswer(inv -> {
+            SavingsDeposit d = inv.getArgument(0);
+            d.setId(77L);
+            return d;
+        });
+        when(mapper.toDepositDto(any(SavingsDeposit.class)))
+                .thenReturn(SavingsDepositDto.builder().id(77L).build());
+
+        OpenDepositDto dto = OpenDepositDto.builder()
+                .sourceAccountId(10L).linkedAccountId(20L)
+                .principalAmount(new BigDecimal("100000"))
+                .termMonths(12).autoRenew(false).otpCode("123456")
+                .build();
+
+        SavingsDepositDto result = service.openDeposit(dto);
+
+        assertThat(result.getId()).isEqualTo(77L);
+        // source debitovan
+        assertThat(source.getBalance()).isEqualByComparingTo("400000");
+        // linked NE dira na otvaranju (samo kasnije scheduler-om)
+        assertThat(linked.getBalance()).isEqualByComparingTo("100");
+        verify(accountRepo, never()).save(linked);
+        // deposit nosi linkedAccountId=20
+        org.mockito.ArgumentCaptor<SavingsDeposit> saved = org.mockito.ArgumentCaptor.forClass(SavingsDeposit.class);
+        verify(depositRepo).save(saved.capture());
+        assertThat(saved.getValue().getLinkedAccountId()).isEqualTo(20L);
+    }
+
+    /**
+     * TEST-savings-5: source i linked u RAZLICITIM valutama -> odbijeno
+     * ("moraju biti u istoj valuti"). Pinujemo da je depozit single-currency.
+     */
+    @Test
+    void openDeposit_sourceAndLinkedDifferentCurrency_throws() {
+        when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+        when(otpService.verify(anyString(), eq("123456"))).thenReturn(Map.of("verified", true));
+
+        Currency eur = new Currency();
+        eur.setId(2L);
+        eur.setCode("EUR");
+
+        Account linked = new Account();
+        linked.setId(20L);
+        linked.setAccountNumber("222000132199251399");
+        linked.setBalance(new BigDecimal("100"));
+        linked.setAvailableBalance(new BigDecimal("100"));
+        linked.setCurrency(eur); // RAZLICITA valuta
+        linked.setStatus(AccountStatus.ACTIVE);
+        linked.setClient(client);
+
+        when(accountRepo.findById(10L)).thenReturn(Optional.of(source));
+        when(accountRepo.findById(20L)).thenReturn(Optional.of(linked));
+
+        OpenDepositDto dto = OpenDepositDto.builder()
+                .sourceAccountId(10L).linkedAccountId(20L)
+                .principalAmount(new BigDecimal("100000"))
+                .termMonths(12).autoRenew(false).otpCode("123456")
+                .build();
+
+        assertThatThrownBy(() -> service.openDeposit(dto))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("istoj valuti");
+        // novac se ne pomera
+        assertThat(source.getBalance()).isEqualByComparingTo("500000");
+        verify(depositRepo, never()).save(any(SavingsDeposit.class));
+    }
+
+    // -----------------------------------------------------------------------
+    // TEST-savings-4: withdrawEarly kad banka NEMA racun u valuti -> IllegalState (500-path)
+    // -----------------------------------------------------------------------
+
+    /**
+     * TEST-savings-4: withdrawEarly nadje povezani racun i kreditira ga, ali kad
+     * banka NEMA liability racun u valuti depozita, kontra-noga (debit banke) puca
+     * sa IllegalStateException ("Banka nema racun..."). @Transactional rollback bi
+     * ponistio kredit linked racuna — ovde (unit, bez tx) pinujemo da exception
+     * propagira sa porukom (500-path), tj. da double-entry kontra-noga JESTE
+     * obavezna (ne smemo tiho zavrsiti bez nje).
+     */
+    @Test
+    void withdrawEarly_bankHasNoAccountInCurrency_throwsIllegalState() {
+        SavingsDeposit d = SavingsDeposit.builder()
+                .id(1L).clientId(1L).linkedAccountId(10L)
+                .principalAmount(new BigDecimal("100000"))
+                .currency(rsd).termMonths(12)
+                .annualInterestRate(new BigDecimal("4.00"))
+                .startDate(LocalDate.now()).maturityDate(LocalDate.now().plusMonths(12))
+                .nextInterestPaymentDate(LocalDate.now().plusMonths(1))
+                .totalInterestPaid(BigDecimal.ZERO)
+                .autoRenew(false).status(SavingsDepositStatus.ACTIVE).build();
+        when(depositRepo.findById(1L)).thenReturn(Optional.of(d));
+        when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+        when(otpService.verify(anyString(), eq("123456"))).thenReturn(Map.of("verified", true));
+
+        Account linked = new Account();
+        linked.setId(10L);
+        linked.setBalance(new BigDecimal("5000"));
+        linked.setAvailableBalance(new BigDecimal("5000"));
+        linked.setCurrency(rsd);
+        when(accountRepo.findForUpdateById(10L)).thenReturn(Optional.of(linked));
+
+        // Banka NEMA racun u RSD -> debit kontra-noga puca.
+        when(accountRepo.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.empty());
+
+        WithdrawEarlyDto dto = new WithdrawEarlyDto();
+        dto.setOtpCode("123456");
+
+        assertThatThrownBy(() -> service.withdrawEarly(1L, dto))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Banka nema racun");
+        // depozit ostaje ACTIVE (status se postavlja TEK posle debita banke)
+        assertThat(d.getStatus()).isEqualTo(SavingsDepositStatus.ACTIVE);
+        verify(depositRepo, never()).save(d);
+    }
+
+    @Test
+    void withdrawEarly_otpFailed_throws() {
+        SavingsDeposit d = SavingsDeposit.builder()
+                .id(1L).clientId(1L).linkedAccountId(10L)
+                .principalAmount(new BigDecimal("100000"))
+                .currency(rsd).status(SavingsDepositStatus.ACTIVE).build();
+        when(depositRepo.findById(1L)).thenReturn(Optional.of(d));
+        when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+        when(otpService.verify(anyString(), eq("000000"))).thenReturn(Map.of("verified", false));
+
+        WithdrawEarlyDto dto = new WithdrawEarlyDto();
+        dto.setOtpCode("000000");
+
+        assertThatThrownBy(() -> service.withdrawEarly(1L, dto))
+                .isInstanceOf(AccessDeniedException.class)
+                .hasMessageContaining("OTP");
+        // novac se ne pomera, status nepromenjen
+        assertThat(d.getStatus()).isEqualTo(SavingsDepositStatus.ACTIVE);
+        verify(accountRepo, never()).findForUpdateById(anyLong());
     }
 
     // -----------------------------------------------------------------------
@@ -326,7 +579,7 @@ class SavingsDepositServiceTest {
         bankAccount.setBalance(new BigDecimal("1000000"));
         bankAccount.setAvailableBalance(new BigDecimal("1000000"));
         bankAccount.setCurrency(rsd);
-        when(accountRepo.findBankAccountByCurrencyId("22200022", 1L)).thenReturn(Optional.of(bankAccount));
+        when(accountRepo.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankAccount));
 
         when(depositRepo.save(d)).thenReturn(d);
         SavingsDepositDto outDto = SavingsDepositDto.builder().id(1L).status("WITHDRAWN_EARLY").build();
@@ -343,8 +596,10 @@ class SavingsDepositServiceTest {
         assertThat(linked.getBalance()).isEqualByComparingTo("104000");
         assertThat(linked.getAvailableBalance()).isEqualByComparingTo("104000");
 
-        // Bankin racun: 1000000 + 1000 = 1001000
-        assertThat(bankAccount.getBalance()).isEqualByComparingTo("1001000");
+        // Double-entry: banka oslobadja custody glavnice (-100000), penal ostaje banci (+1000).
+        // Neto na banci = -100000 + 1000 = -99000 → 1000000 - 99000 = 901000.
+        assertThat(bankAccount.getBalance()).isEqualByComparingTo("901000");
+        assertThat(bankAccount.getAvailableBalance()).isEqualByComparingTo("901000");
 
         assertThat(d.getStatus()).isEqualTo(SavingsDepositStatus.WITHDRAWN_EARLY);
         verify(txRepo, times(2)).save(any(SavingsTransaction.class)); // PRINCIPAL + PENALTY
@@ -352,6 +607,51 @@ class SavingsDepositServiceTest {
         verify(accountRepo).save(bankAccount);
 
         assertThat(result.getStatus()).isEqualTo("WITHDRAWN_EARLY");
+    }
+
+    /**
+     * P0-B1 konzervacija: early withdrawal mora biti net-zero.
+     * Klijent +returned, banka -returned (oslobodjena custody glavnice minus zadrzan penal). Suma = 0.
+     */
+    @Test
+    void withdrawEarly_conservation_systemMoneyUnchanged() {
+        SavingsDeposit d = SavingsDeposit.builder()
+                .id(1L).clientId(1L).linkedAccountId(10L)
+                .principalAmount(new BigDecimal("100000"))
+                .currency(rsd).termMonths(12)
+                .annualInterestRate(new BigDecimal("4.00"))
+                .startDate(LocalDate.now()).maturityDate(LocalDate.now().plusMonths(12))
+                .nextInterestPaymentDate(LocalDate.now().plusMonths(1))
+                .totalInterestPaid(BigDecimal.ZERO)
+                .autoRenew(false).status(SavingsDepositStatus.ACTIVE).build();
+        when(depositRepo.findById(1L)).thenReturn(Optional.of(d));
+        when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+        when(otpService.verify(anyString(), eq("123456"))).thenReturn(Map.of("verified", true));
+
+        Account linked = new Account();
+        linked.setId(10L);
+        linked.setBalance(new BigDecimal("5000"));
+        linked.setAvailableBalance(new BigDecimal("5000"));
+        linked.setCurrency(rsd);
+        when(accountRepo.findForUpdateById(10L)).thenReturn(Optional.of(linked));
+
+        Account bankAccount = new Account();
+        bankAccount.setId(100L);
+        bankAccount.setBalance(new BigDecimal("1000000"));
+        bankAccount.setAvailableBalance(new BigDecimal("1000000"));
+        bankAccount.setCurrency(rsd);
+        when(accountRepo.findBankAccountForUpdateByCurrency("22200022", "RSD")).thenReturn(Optional.of(bankAccount));
+        when(depositRepo.save(d)).thenReturn(d);
+        when(mapper.toDepositDto(d)).thenReturn(SavingsDepositDto.builder().id(1L).build());
+
+        BigDecimal before = linked.getBalance().add(bankAccount.getBalance());
+
+        WithdrawEarlyDto dto = new WithdrawEarlyDto();
+        dto.setOtpCode("123456");
+        service.withdrawEarly(1L, dto);
+
+        BigDecimal after = linked.getBalance().add(bankAccount.getBalance());
+        assertThat(after).isEqualByComparingTo(before);
     }
 
     @Test
