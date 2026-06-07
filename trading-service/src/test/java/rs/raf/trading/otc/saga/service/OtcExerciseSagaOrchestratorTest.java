@@ -595,6 +595,115 @@ class OtcExerciseSagaOrchestratorTest {
     }
 
     /**
+     * <b>SG-07 (SAGA_test.pdf) — F5 forsiran fail → kompenzacija C4, C3, C2, C1.</b>
+     *
+     * <p>F1–F4 prolaze (rezervacija, akcije, prenos sredstava, prenos vlasnistva), pa
+     * F5 (status-flip ACTIVE→EXERCISED) padne. Orkestrator kompenzuje obrnutim redom
+     * od koraka 5: <b>C5</b> (restore statusa na ACTIVE — no-op jer F5 pao "before" pa
+     * flip nije ni primenjen), <b>C4</b> (hartije vracene prodavcu), <b>C3</b> (reverzni
+     * transfer prodavac→kupac — sredstva vracena kupcu), <b>C2/C1</b> (accept-time
+     * rezervacije ocuvane). Terminalni status COMPENSATED, current_step=5, ugovor ostaje
+     * ACTIVE — "stanje identicno prethodnom".
+     *
+     * <p>PDF SG-07 navodi log F1–F4 ok / F5 err / C4 / C3 / C2 / C1 (5 ok kompenzatora bi
+     * bilo C4..C1 = 4). Nasa impl je <b>loop-inclusive</b> (kao SGT-05/06): petlja ukljucuje
+     * i failed step 5, pa se dodatno izvrsi <b>C5 no-op</b> (restore na ACTIVE) PRE C4 — log je
+     * SUPERSET PDF-a (svi PDF kompenzatori C4/C3/C2/C1 prisutni + C5 no-op), pa je ovo
+     * dokumentovana benigna deviacija (C5 ne menja stanje jer F5 nije primenio flip).
+     */
+    @Test
+    @DisplayName("SG-07 forsiran fail u F5 (before) -> COMPENSATED, currentStep=5, C4 vraca hartije "
+            + "prodavcu / C3 reverzni transfer vraca novac kupcu (I1/I2), ugovor ACTIVE")
+    void f5ForcedFail_compensatesC4ReturnsSharesC3RefundsBuyer_step5() {
+        Listing listing = stockListing(100L, "AAPL", "USD");
+        OtcContract contract = reservedActiveContract(7L, 1L, 2L, listing, 10, "160.00", "RES-77");
+
+        OtcExerciseSagaOrchestrator orch = new OtcExerciseSagaOrchestrator(contractRepository,
+                portfolioRepository, sagaLogRepository, new SagaLogWriter(sagaLogRepository),
+                bankaCoreClient, currencyConversionService,
+                userResolver, new ForceForwardFailInjector(SagaPhase.F5, "before"));
+
+        when(userResolver.resolveCurrent()).thenReturn(new UserContext(1L, UserRole.CLIENT));
+        when(contractRepository.findByIdForUpdate(7L)).thenReturn(Optional.of(contract));
+        when(bankaCoreClient.getAccount(10L)).thenReturn(account(10L, "111", "Buyer", "USD", 1L));
+        when(bankaCoreClient.getPreferredAccount(UserRole.CLIENT, 2L, "USD"))
+                .thenReturn(account(88L, "222", "Seller", "USD", 2L));
+        // Seller portfolio sa accept-time rezervacijom (qty 20, reserved 10): F2 no-op,
+        // F4 prenos vlasnistva (qty 20->10, reserved 10->0), C4 vraca (qty 10->20, reserved 0->10).
+        Portfolio sellerPf = sellerPortfolio(5L, 2L, UserRole.CLIENT, 100L, 20, 10, 10);
+        when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
+                2L, UserRole.CLIENT, 100L)).thenReturn(Optional.of(sellerPf));
+        // Buyer portfolio odsutan -> F4 ga kreira, C4 (preF4BuyerExisted=false) ga brise (mock vraca
+        // empty pa je delete no-op nad praznim Optional-om — bez NPE).
+        when(portfolioRepository.findByUserIdAndUserRoleAndListingIdForUpdate(
+                1L, UserRole.CLIENT, 100L)).thenReturn(Optional.empty());
+        // F3 uspeva u potpunosti (commit + credit prodavcu) PRE nego sto F5 padne.
+        when(bankaCoreClient.commitFunds(anyString(), anyString(), any(CommitFundsRequest.class)))
+                .thenReturn(new CommitFundsResponse("RES-77", new BigDecimal("1600.00"),
+                        BigDecimal.ZERO, BigDecimal.ZERO));
+        when(bankaCoreClient.creditFunds(anyString(), any(CreditFundsRequest.class)))
+                .thenReturn(new CreditFundsResponse(88L, new BigDecimal("1600.00"),
+                        new BigDecimal("101600.00")));
+        // C3 reverzni transfer prodavac(88)->kupac(10) (f3CreditDone=true grana).
+        when(bankaCoreClient.transferFunds(anyString(), any(TransferFundsRequest.class)))
+                .thenReturn(new TransferFundsResponse(88L, 10L, new BigDecimal("1600.00"),
+                        BigDecimal.ZERO, BigDecimal.ZERO));
+        when(sagaLogRepository.saveAndFlush(any(SagaLog.class)))
+                .thenAnswer(inv -> inv.getArgument(0));
+
+        SagaResult result = orch.exercise(7L, 10L);
+
+        assertThat(result.status()).isEqualTo(SagaStatus.COMPENSATED);
+        assertThat(result.currentStep()).isEqualTo(5);
+
+        ArgumentCaptor<SagaLog> captor = ArgumentCaptor.forClass(SagaLog.class);
+        verify(sagaLogRepository, atLeastOnce()).saveAndFlush(captor.capture());
+        List<SagaLogEntry> entries = captor.getValue().getEntries();
+        // Loop-inclusive log: [F1 ok, F2 ok, F3 ok, F4 ok, F5 err, C5 ok (no-op), C4 ok, C3 ok, C2 ok, C1 ok]
+        assertThat(entries).hasSize(10);
+        // F1..F4 forward ok
+        for (int i = 0; i < 4; i++) {
+            assertThat(entries.get(i).phase()).isEqualTo(i + 1);
+            assertThat(entries.get(i).kind()).isEqualTo(SagaStepKind.FORWARD);
+            assertThat(entries.get(i).outcome()).isEqualTo("ok");
+        }
+        // F5 forward err
+        assertThat(entries.get(4).phase()).isEqualTo(5);
+        assertThat(entries.get(4).kind()).isEqualTo(SagaStepKind.FORWARD);
+        assertThat(entries.get(4).outcome()).isEqualTo("err");
+        // Kompenzatori obrnutim redom C5,C4,C3,C2,C1 — svi ok
+        int[] compPhases = {5, 4, 3, 2, 1};
+        for (int i = 0; i < 5; i++) {
+            assertThat(entries.get(5 + i).phase()).isEqualTo(compPhases[i]);
+            assertThat(entries.get(5 + i).kind()).isEqualTo(SagaStepKind.COMPENSATE);
+            assertThat(entries.get(5 + i).outcome()).isEqualTo("ok");
+        }
+
+        // C4 — hartije vracene prodavcu: F4 je preneo (qty 20->10, reserved 10->0),
+        // C4 vratio (qty 10->20, reserved 0->10) => I2 ocuvan.
+        assertThat(sellerPf.getQuantity()).as("SG-07 C4: prodavcu vracena kolicina").isEqualTo(20);
+        assertThat(sellerPf.getReservedQuantity()).as("SG-07 C4: vracena rezervacija").isEqualTo(10);
+
+        // C3 — sredstva vracena kupcu: reverzni transfer prodavac(88)->kupac(10), obe noge 1600 (I1).
+        verify(bankaCoreClient, atLeastOnce())
+                .commitFunds(anyString(), anyString(), any(CommitFundsRequest.class));
+        ArgumentCaptor<TransferFundsRequest> tcap = ArgumentCaptor.forClass(TransferFundsRequest.class);
+        verify(bankaCoreClient).transferFunds(anyString(), tcap.capture());
+        TransferFundsRequest tr = tcap.getValue();
+        assertThat(tr.fromAccountId()).isEqualTo(88L);
+        assertThat(tr.toAccountId()).isEqualTo(10L);
+        assertThat(tr.debitAmount()).isEqualByComparingTo(new BigDecimal("1600.00"));
+        assertThat(tr.creditAmount()).isEqualByComparingTo(new BigDecimal("1600.00"));
+
+        // I6 — ugovor ostaje ACTIVE (F5 flip nije primenjen / C5 restore), exercisedAt null.
+        assertThat(contract.getStatus()).isEqualTo(OtcContractStatus.ACTIVE);
+        assertThat(contract.getExercisedAt()).isNull();
+        // C1: accept-time hold -> releaseFunds NIJE pozvan (rezervacija ocuvana na ACTIVE ugovoru).
+        verify(bankaCoreClient, never())
+                .releaseFunds(anyString(), anyString(), any(ReleaseFundsRequest.class));
+    }
+
+    /**
      * <b>SGT-07 (P0-1, Bug A) — F3 commit OK, credit FAIL → C3 commit-only grana.</b>
      * F3 {@code commitFunds} uspe (kupac debitovan, rezervacija zatvorena), pa
      * {@code creditFunds} ka prodavcu baci → saga pada U KORAKU 3 sa
