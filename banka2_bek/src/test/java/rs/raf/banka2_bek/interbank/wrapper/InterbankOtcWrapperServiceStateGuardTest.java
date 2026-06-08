@@ -86,6 +86,8 @@ class InterbankOtcWrapperServiceStateGuardTest {
                 interbankTransactionRepository, paymentRepository,
                 reservationApplier);
         org.springframework.test.util.ReflectionTestUtils.setField(service, "self", service);
+        // bagovi-fix-2: @Value reg-broj NASE banke (za bankin racun supervizor-trgovine).
+        org.springframework.test.util.ReflectionTestUtils.setField(service, "bankRegistrationNumber", "22200022");
 
         // Default: klijent 7L sme da trguje.
         Client c = new Client();
@@ -230,14 +232,15 @@ class InterbankOtcWrapperServiceStateGuardTest {
     // → premium debit tiho no-op → NOVAC SE STVARA. Fix: reject PRE outbound-a.
 
     @Test
-    @DisplayName("P0: EMPLOYEE kupac bez settlement racuna (buyerAccountId=null) → 400, NEMA outbound accept, NEMA pomeranja novca")
-    void acceptOffer_employeeBuyerNoSettlementAccount_rejectedBeforeOutbound() {
-        // Pregovor gde smo MI buyer, ali lokalna strana je zaposleni (EMPLOYEE).
+    @DisplayName("bagovi-fix-2: EMPLOYEE/supervizor kupac koristi BANKIN racun (findBankAccountByCurrency) → accept prolazi, settlement = bankin racun")
+    void acceptOffer_employeeBuyer_usesBankAccount_proceeds() {
+        // Pregovor gde smo MI buyer, lokalna strana je zaposleni (supervizor).
         InterbankOtcNegotiation neg = buildBuyerSideNegotiation(InterbankOtcNegotiationStatus.ACTIVE);
         neg.setLocalPartyRole("EMPLOYEE");
         neg.setLocalPartyId(50L);
         when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
                 eq(SELLER_RN), eq("neg-1"))).thenReturn(Optional.of(neg));
+        when(negotiationRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
         // 209 access gate: supervizor (EMPLOYEE sa SUPERVISOR) sme da prihvati OTC.
         Employee supervisor = new Employee();
@@ -245,21 +248,18 @@ class InterbankOtcWrapperServiceStateGuardTest {
         supervisor.setPermissions(new HashSet<>(Set.of("SUPERVISOR")));
         when(employeeRepository.findById(50L)).thenReturn(Optional.of(supervisor));
 
-        // Zaposleni nema klijentske racune → deterministicka resolucija vraca prazno.
-        lenient().when(accountRepository.findByClientIdAndStatusOrderByAvailableBalanceDesc(50L, AccountStatus.ACTIVE))
-                .thenReturn(java.util.List.of());
+        // Bankin ACTIVE USD racun (valuta premije) — server ga razresava preko
+        // findBankAccountByCurrency (zaposleni nema licne racune; trguje na bankinom).
+        Account bankAcc = buildOwnedAccount(OUR_RN + "000140", 999L, AccountStatus.ACTIVE, "USD");
+        bankAcc.setAvailableBalance(new java.math.BigDecimal("1000000"));
+        when(accountRepository.findBankAccountByCurrency("22200022", "USD")).thenReturn(Optional.of(bankAcc));
 
-        // buyerAccountId = null (nije prosledjen) → settlementAccount ostaje null →
-        // mandatory gate mora odbiti PRE outbound-a.
-        assertThatThrownBy(() -> service.acceptOffer(OFFER_ID, null, 50L, "EMPLOYEE"))
-                .isInstanceOf(InterbankExceptions.InterbankProtocolException.class)
-                .hasMessageContaining("nedostaje nalog kupca");
+        // buyerAccountId=null se IGNORISE za zaposlenog (server bira bankin racun, anti-IDOR).
+        service.acceptOffer(OFFER_ID, null, 50L, "EMPLOYEE");
 
-        // KRITICNO (money conservation): nista nije islo napolje, nista nije rezervisano,
-        // nikakav settlement racun nije zapamcen → premium debit kod partnera nikad pokrenut.
-        verify(negotiationService, never()).acceptOffer(any());
-        verify(reservationApplier, never()).reserveMonas(any(), any());
-        assertThat(neg.getBuyerSettlementAccountNumber()).isNull();
+        // Bankin racun zapamcen kao settlement; outbound accept (premium s bankinog racuna) pokrenut.
+        assertThat(neg.getBuyerSettlementAccountNumber()).isEqualTo(OUR_RN + "000140");
+        verify(negotiationService).acceptOffer(any());
     }
 
     @Test

@@ -110,6 +110,14 @@ public class InterbankOtcWrapperService {
     @Autowired
     InterbankOtcWrapperService self;
 
+    /**
+     * bagovi-fix-2: registracioni broj NASE banke — za razresavanje BANKINOG racuna
+     * kad supervizor/zaposleni trguje OTC-om (nema licne racune, koristi bankin —
+     * isto kao intra-bank OtcService.getPreferredAccount).
+     */
+    @org.springframework.beans.factory.annotation.Value("${bank.registration-number}")
+    private String bankRegistrationNumber;
+
     /** Cache imena partner banaka po routing number-u (resolveUserName izlaz). */
     private final Map<String, UserInformation> userInfoCache = new ConcurrentHashMap<>();
 
@@ -459,7 +467,21 @@ public class InterbankOtcWrapperService {
         // biraju isti deterministicki racun (vidi buyerSettlementAccountNumber javadoc).
         // Samo kad smo BUYER (vec provereno gore) i kad je racun prosledjen sa FE-a.
         Account settlementAccount = null;
-        if (buyerAccountId != null) {
+        if ("EMPLOYEE".equalsIgnoreCase(userRole)) {
+            // bagovi-fix-2: supervizor/zaposleni kupac trguje na BANKINOM racunu (nema
+            // licne racune). Server razresava bankin ACTIVE racun u valuti premije i
+            // IGNORISE FE buyerAccountId — sprecava IDOR (zaposleni ne moze izabrati tudji
+            // racun). Inbound premium debit gadja BAS ovaj racun preko uskladistenog
+            // buyerSettlementAccountNumber (resolveBuyerSettlementAccount), pa je novac
+            // ocuvan. Mirror intra-bank OtcService (zaposleni → getPreferredAccount = bankin).
+            settlementAccount = accountRepository
+                    .findBankAccountByCurrency(bankRegistrationNumber, entity.getPremiumCurrency())
+                    .orElseThrow(() -> new InterbankExceptions.InterbankExerciseConflictException(
+                            "Banka nema ACTIVE racun u valuti premije (" + entity.getPremiumCurrency()
+                                    + ") za supervizorsko prihvatanje ponude."));
+            entity.setBuyerSettlementAccountNumber(settlementAccount.getAccountNumber());
+            negotiationRepository.save(entity);
+        } else if (buyerAccountId != null) {
             settlementAccount = accountRepository.findById(buyerAccountId)
                     .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
                             "Racun " + buyerAccountId + " ne postoji"));
@@ -789,28 +811,39 @@ public class InterbankOtcWrapperService {
                     "Ugovor je istekao (settlement: " + contract.getSettlementDate() + ")");
         }
 
-        if (buyerAccountId == null) {
-            throw new IllegalArgumentException("buyerAccountId je obavezan za exercise");
-        }
-        Account buyerAccount = accountRepository.findById(buyerAccountId)
-                .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
-                        "Racun " + buyerAccountId + " ne postoji"));
-        if (buyerAccount.getStatus() != AccountStatus.ACTIVE) {
-            throw new InterbankExceptions.InterbankExerciseConflictException(
-                    "Racun " + buyerAccount.getAccountNumber() + " nije aktivan");
-        }
-        if (buyerAccount.getClient() == null
-                || !buyerAccount.getClient().getId().equals(userId)
-                || !"CLIENT".equalsIgnoreCase(userRole)) {
-            // Note: u trenutnoj wrapperu samo CLIENT kao buyer ima Account vlasnistvo
-            // (EMPLOYEE/ADMIN buyer-i nisu jos podrzani — vidi resolveLocalAccount).
-            throw new InterbankExceptions.InterbankExerciseConflictException(
-                    "Racun " + buyerAccount.getAccountNumber() + " ne pripada korisniku");
-        }
-        if (!buyerAccount.getCurrency().getCode().equalsIgnoreCase(contract.getStrikeCurrency())) {
-            throw new InterbankExceptions.InterbankExerciseConflictException(
-                    "Racun " + buyerAccount.getAccountNumber() + " nije u valuti "
-                            + contract.getStrikeCurrency());
+        Account buyerAccount;
+        if ("EMPLOYEE".equalsIgnoreCase(userRole)) {
+            // bagovi-fix-2: supervizor/zaposleni kupac koristi BANKIN racun za strike
+            // (§2.7.2). Server razresava bankin ACTIVE racun u strike valuti (query garantuje
+            // ACTIVE + valutu), ignorise buyerAccountId. claimForExercise + commitMonas
+            // gadjaju bas ovaj racun po broju → strike se naplacuje s bankinog racuna (novac ocuvan).
+            buyerAccount = accountRepository
+                    .findBankAccountByCurrency(bankRegistrationNumber, contract.getStrikeCurrency())
+                    .orElseThrow(() -> new InterbankExceptions.InterbankExerciseConflictException(
+                            "Banka nema ACTIVE racun u valuti " + contract.getStrikeCurrency()
+                                    + " za supervizorski exercise."));
+        } else {
+            if (buyerAccountId == null) {
+                throw new IllegalArgumentException("buyerAccountId je obavezan za exercise");
+            }
+            buyerAccount = accountRepository.findById(buyerAccountId)
+                    .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
+                            "Racun " + buyerAccountId + " ne postoji"));
+            if (buyerAccount.getStatus() != AccountStatus.ACTIVE) {
+                throw new InterbankExceptions.InterbankExerciseConflictException(
+                        "Racun " + buyerAccount.getAccountNumber() + " nije aktivan");
+            }
+            if (buyerAccount.getClient() == null
+                    || !buyerAccount.getClient().getId().equals(userId)
+                    || !"CLIENT".equalsIgnoreCase(userRole)) {
+                throw new InterbankExceptions.InterbankExerciseConflictException(
+                        "Racun " + buyerAccount.getAccountNumber() + " ne pripada korisniku");
+            }
+            if (!buyerAccount.getCurrency().getCode().equalsIgnoreCase(contract.getStrikeCurrency())) {
+                throw new InterbankExceptions.InterbankExerciseConflictException(
+                        "Racun " + buyerAccount.getAccountNumber() + " nije u valuti "
+                                + contract.getStrikeCurrency());
+            }
         }
 
         BigDecimal totalCost = contract.getStrikePrice().multiply(contract.getQuantity());
