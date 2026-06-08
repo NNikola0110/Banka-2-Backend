@@ -321,8 +321,15 @@ class InterbankClientTest {
                 .andExpect(header("X-Api-Key", OUT_TOKEN))
                 .andRespond(withStatus(HttpStatus.NOT_FOUND));
 
+        // bagovi-fix-2 follow-up: partner (npr. EXBanka 2) vrati 404 jer nema mirror
+        // pregovora. Korisnik (FE toast preko GlobalExceptionHandler -> 404) NE sme
+        // da vidi sirov "Negotiation 111:... not found at partner bank." — vec jasnu
+        // partner-atribuiranu poruku.
         assertThatThrownBy(() -> client.putCounterOffer(negId, buildOffer()))
-                .isInstanceOf(InterbankExceptions.InterbankNegotiationNotFoundException.class);
+                .isInstanceOf(InterbankExceptions.InterbankNegotiationNotFoundException.class)
+                .hasMessageContaining("Banka 1")
+                .hasMessageContaining("ne prepoznaje ovaj pregovor")
+                .hasMessageNotContaining("not found at partner bank");
         mockServer.verify();
     }
 

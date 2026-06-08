@@ -202,7 +202,7 @@ public class InterbankClient {
                                 if (sc == 401) throw new InterbankExceptions.InterbankAuthException(
                                         "Invalid API key for routing " + negotiationId.routingNumber() + ".");
                                 if (sc == 404) throw new InterbankExceptions.InterbankNegotiationNotFoundException(
-                                        "Negotiation " + negotiationId + " not found at partner bank.");
+                                        partnerMissingNegotiation(partnerBank));
                                 if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
                                         "Negotiation " + negotiationId + " conflict: not your turn or already closed.");
                                 if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
@@ -238,7 +238,7 @@ public class InterbankClient {
                                 if (sc == 401) throw new InterbankExceptions.InterbankAuthException(
                                         "Invalid API key for routing " + negotiationId.routingNumber() + ".");
                                 if (sc == 404) throw new InterbankExceptions.InterbankNegotiationNotFoundException(
-                                        "Negotiation " + negotiationId + " not found at partner bank.");
+                                        partnerMissingNegotiation(partnerBank));
                                 if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
                                         "Negotiation " + negotiationId + " conflict on GET.");
                                 if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
@@ -284,7 +284,7 @@ public class InterbankClient {
                                 if (sc == 401) throw new InterbankExceptions.InterbankAuthException(
                                         "Invalid API key for routing " + negotiationId.routingNumber() + ".");
                                 if (sc == 404) throw new InterbankExceptions.InterbankNegotiationNotFoundException(
-                                        "Negotiation " + negotiationId + " not found at partner bank.");
+                                        partnerMissingNegotiation(partnerBank));
                                 if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
                                         "Negotiation " + negotiationId + " conflict on DELETE.");
                                 if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
@@ -321,7 +321,7 @@ public class InterbankClient {
                                 if (sc == 401) throw new InterbankExceptions.InterbankAuthException(
                                         "Invalid API key for routing " + negotiationId.routingNumber() + ".");
                                 if (sc == 404) throw new InterbankExceptions.InterbankNegotiationNotFoundException(
-                                        "Negotiation " + negotiationId + " not found at partner bank.");
+                                        partnerMissingNegotiation(partnerBank));
                                 if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
                                         "Negotiation " + negotiationId + " conflict on accept.");
                                 if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
@@ -403,5 +403,22 @@ public class InterbankClient {
                 ? partnerBank.getDisplayName() : "Partnerska banka";
         return subjekt + " je odbila " + akcija
                 + " (greska na njihovoj strani). Pregovor je mozda istekao ili je vec zatvoren.";
+    }
+
+    /**
+     * bagovi-fix-2 follow-up: partner vrati HTTP 404 na nas outbound negotiation
+     * zahtev (PUT/GET/DELETE/accept) jer NEMA mirror tog pregovora kod sebe
+     * (istekao / nikad kreiran / zatvoren, ili ne prepoznaje nas autoritativni
+     * mirror kljuc). Ovu poruku korisnik vidi u FE toast-u (GlobalExceptionHandler
+     * mapira {@code InterbankNegotiationNotFoundException} -> 404 + propagira poruku),
+     * pa je user-friendly i partner-atribuirana umesto sirovog
+     * "Negotiation 222:... not found at partner bank.".
+     */
+    private static String partnerMissingNegotiation(InterbankProperties.PartnerBank partnerBank) {
+        String subjekt = (partnerBank != null && partnerBank.getDisplayName() != null
+                && !partnerBank.getDisplayName().isBlank())
+                ? partnerBank.getDisplayName() : "Partnerska banka";
+        return subjekt + " ne prepoznaje ovaj pregovor (nema ga na njihovoj strani). "
+                + "Verovatno je istekao ili je vec zatvoren — pokrenite nov.";
     }
 }
