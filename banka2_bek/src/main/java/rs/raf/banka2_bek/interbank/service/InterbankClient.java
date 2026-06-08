@@ -206,7 +206,7 @@ public class InterbankClient {
                                 if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
                                         "Negotiation " + negotiationId + " conflict: not your turn or already closed.");
                                 if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
-                                        "Bad request on PUT negotiation " + negotiationId + ".");
+                                        partnerRejected(partnerBank, "kontraponudu"));
                                 throw new InterbankExceptions.InterbankCommunicationException(
                                         "HTTP " + sc + " from negotiation " + negotiationId + " on PUT");
                             })
@@ -242,7 +242,7 @@ public class InterbankClient {
                                 if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
                                         "Negotiation " + negotiationId + " conflict on GET.");
                                 if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
-                                        "Bad request on GET negotiation " + negotiationId + ".");
+                                        partnerRejected(partnerBank, "citanje pregovora"));
                                 throw new InterbankExceptions.InterbankCommunicationException(
                                         "HTTP " + sc + " from negotiation " + negotiationId + " on GET");
                             })
@@ -288,7 +288,7 @@ public class InterbankClient {
                                 if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
                                         "Negotiation " + negotiationId + " conflict on DELETE.");
                                 if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
-                                        "Bad request on DELETE negotiation " + negotiationId + ".");
+                                        partnerRejected(partnerBank, "zatvaranje pregovora"));
                                 throw new InterbankExceptions.InterbankCommunicationException(
                                         "HTTP " + sc + " from negotiation " + negotiationId + " on DELETE");
                             })
@@ -325,7 +325,7 @@ public class InterbankClient {
                                 if (sc == 409) throw new InterbankExceptions.InterbankNegotiationConflictException(
                                         "Negotiation " + negotiationId + " conflict on accept.");
                                 if (sc == 400) throw new InterbankExceptions.InterbankProtocolException(
-                                        "Bad request on accept negotiation " + negotiationId + ".");
+                                        partnerRejected(partnerBank, "prihvatanje ponude"));
                                 throw new InterbankExceptions.InterbankCommunicationException(
                                         "HTTP " + sc + " from negotiation " + negotiationId + " on accept");
                             })
@@ -385,5 +385,23 @@ public class InterbankClient {
                 .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
                         "Target routing number " + routingNumber + " could not be resolved."
                 ));
+    }
+
+    /**
+     * bagovi-fix-2 follow-up: kad partnerska banka odbije nas (protokol-korektan)
+     * outbound zahtev svojim HTTP 400, OVU poruku krajnji korisnik vidi u toast-u
+     * (FE {@code getErrorMessage} -> {@code response.data.message}, a wrapper handler
+     * mapira {@code InterbankProtocolException} -> 400). Zato je user-friendly i jasno
+     * atribuira gresku PARTNERU (ne nasoj validaciji), uz partnerovo display ime.
+     * Ranije je poruka bila sirov tehnicki string ("Bad request on accept negotiation
+     * 265:...") koji izgleda kao NAS bug.
+     */
+    private static String partnerRejected(
+            InterbankProperties.PartnerBank partnerBank, String akcija) {
+        String subjekt = (partnerBank != null && partnerBank.getDisplayName() != null
+                && !partnerBank.getDisplayName().isBlank())
+                ? partnerBank.getDisplayName() : "Partnerska banka";
+        return subjekt + " je odbila " + akcija
+                + " (greska na njihovoj strani). Pregovor je mozda istekao ili je vec zatvoren.";
     }
 }

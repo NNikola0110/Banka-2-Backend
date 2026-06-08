@@ -68,6 +68,7 @@ class InterbankClientTest {
         partner.setBaseUrl(BASE_URL);
         partner.setOutboundToken(OUT_TOKEN);
         partner.setInboundToken("inToken1");
+        partner.setDisplayName("Banka 1");
 
         lenient().when(bankRoutingService.resolvePartnerByRouting(REMOTE_RN)).thenReturn(Optional.of(partner));
     }
@@ -426,6 +427,27 @@ class InterbankClientTest {
 
         assertThatThrownBy(() -> client.acceptNegotiation(negId))
                 .isInstanceOf(InterbankExceptions.InterbankCommunicationException.class);
+        mockServer.verify();
+    }
+
+    @Test
+    @DisplayName("acceptNegotiation 400 (partner odbio) -> ProtocolException sa user-friendly partner-atribuiranom porukom")
+    void acceptNegotiation_400_throwsProtocolException_withPartnerAttributedMessage() {
+        // bagovi-fix-2 follow-up: EXBanka 2 (live) vraca 400 na nas protokol-korektan
+        // accept. Korisnik (FE toast) NE sme da vidi sirov "Bad request on accept
+        // negotiation 265:..." (izgleda kao nas bug) — vec jasnu poruku da je PARTNER odbio.
+        ForeignBankId negId = new ForeignBankId(REMOTE_RN, "neg-uuid-9");
+
+        mockServer.expect(requestTo(BASE_URL + "/negotiations/" + REMOTE_RN + "/neg-uuid-9/accept"))
+                .andExpect(method(HttpMethod.GET))
+                .andRespond(withBadRequest());
+
+        assertThatThrownBy(() -> client.acceptNegotiation(negId))
+                .isInstanceOf(InterbankExceptions.InterbankProtocolException.class)
+                .hasMessageContaining("Banka 1")
+                .hasMessageContaining("odbila")
+                .hasMessageContaining("prihvatanje ponude")
+                .hasMessageNotContaining("Bad request");
         mockServer.verify();
     }
 
