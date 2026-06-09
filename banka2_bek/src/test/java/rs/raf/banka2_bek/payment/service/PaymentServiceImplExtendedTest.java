@@ -485,6 +485,9 @@ class PaymentServiceImplExtendedTest {
             // 1374 — pre fix-a interbank flow je proveravao samo limite, ne i stanje.
             // Klijent bez sredstava bi dobio PREPARING pa tek async 2PC REJECTED.
             // Sad se odbija sinhrono (mirror same-bank/validatePayment).
+            // FIX 1: cross-bank je sada SAMO RSD — racun mora biti RSD da bi se uopste
+            // doslo do balance check-a (inace RSD-guard odbija pre toga).
+            fromAccount.setCurrency(rsdCurrency());
             fromAccount.setAvailableBalance(new BigDecimal("50.00"));
             fromAccount.setBalance(new BigDecimal("50.00"));
 
@@ -505,6 +508,8 @@ class PaymentServiceImplExtendedTest {
         @Test
         @DisplayName("1374: interbank payment with sufficient balance → PROCESSING saved + PREPARING returned")
         void interbankSufficientBalance_savesProcessing() {
+            // FIX 1: cross-bank je sada SAMO RSD.
+            fromAccount.setCurrency(rsdCurrency());
             fromAccount.setAvailableBalance(new BigDecimal("5000.00"));
             fromAccount.setBalance(new BigDecimal("5000.00"));
 
@@ -537,6 +542,29 @@ class PaymentServiceImplExtendedTest {
             } finally {
                 org.springframework.transaction.support.TransactionSynchronizationManager.clearSynchronization();
             }
+        }
+
+        @Test
+        @DisplayName("FIX 1: cross-bank placanje sa NE-RSD racuna → IllegalArgumentException (samo RSD), "
+                + "bez 2PC i bez perzistencije")
+        void interbankNonRsd_blockedBeforeTwoPc() {
+            // Strane valute za obicna medjubankarska placanja se cisto ODBIJAJU (ne FX),
+            // pre balance-check-a i pre 2PC-a. fromAccount je EUR (default iz setUp-a).
+            fromAccount.setAvailableBalance(new BigDecimal("5000.00"));
+            fromAccount.setBalance(new BigDecimal("5000.00"));
+
+            CreatePaymentRequestDto request = buildRequest("100.00");
+            when(bankRoutingService.isLocalAccount(request.getToAccount())).thenReturn(false);
+            when(paymentAccountRepository.findForUpdateByAccountNumber(request.getFromAccount()))
+                    .thenReturn(Optional.of(fromAccount));
+
+            assertThatThrownBy(() -> paymentService.createPayment(request))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("samo u RSD");
+
+            // Nista nije perzistovano niti je 2PC pokrenut.
+            verify(paymentRepository, never()).saveAndFlush(any(Payment.class));
+            verifyNoInteractions(interbankPaymentAsyncService);
         }
     }
 
@@ -671,6 +699,12 @@ class PaymentServiceImplExtendedTest {
         SecurityContextHolder.getContext().setAuthentication(
                 new UsernamePasswordAuthenticationToken(principal, null, principal.getAuthorities())
         );
+    }
+
+    /** FIX 1 helper — RSD valuta za cross-bank placanja (jedina podrzana). */
+    private Currency rsdCurrency() {
+        return Currency.builder().id(100L).code("RSD").name("Serbian Dinar")
+                .symbol("din").country("RS").active(true).build();
     }
 
     private Account baseAccount(Long id, String accountNumber, Client owner, Currency currency, BigDecimal balance) {

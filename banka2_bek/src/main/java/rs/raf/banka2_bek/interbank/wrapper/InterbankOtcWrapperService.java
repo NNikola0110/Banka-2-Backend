@@ -411,29 +411,42 @@ public class InterbankOtcWrapperService {
         // inbound (OtcNegotiationService) RADE ovaj guard.
         ensureNegotiationActive(entity);
 
-        // Local close + (uslovni) DELETE outbound.
-        entity.setOngoing(false);
-        entity.setStatus(InterbankOtcNegotiationStatus.DECLINED);
-        negotiationRepository.save(entity);
-
         // T2-J mirror (zamena za T2-H skip): outbound DELETE UVEK ide ka partneru —
         // izbor target routing-a:
         //   1) Mi NE-autoritativni: partner = foreignId.rn (autoritativni vlasnik).
         //   2) Mi autoritativni: partner = foreignParty (kontra strana); URL path
         //      i dalje /negotiations/{myRouting}/{id} (partner mirror kljuc).
         // Bez T2-J, partner nikad ne sazna za nas decline na nase-autoritativni
-        // pregovor (T2-H je SKIPOVAO outbound). Close je i dalje idempotentan:
-        // RuntimeException se logguje WARN-om i ne ruzimo lokalno azuriranje.
+        // pregovor (T2-H je SKIPOVAO outbound).
         int myRouting = requireMyRoutingNumber();
         int targetPartnerRouting = (foreignId.routingNumber() == myRouting)
                 ? entity.getForeignPartyRoutingNumber()
                 : foreignId.routingNumber();
+
+        // FIX (reject-propagacija): outbound DELETE failure NE sme tiho da prodje.
+        // Ranije smo lokalno postavljali DECLINED+save PRE outbound-a i gutali svaku
+        // RuntimeException WARN-om — pa B1 nikad ne sazna za reject, a FE prikaze lazan
+        // uspeh. Sad:
+        //   - cist partner 404 (InterbankNegotiationNotFoundException) = benigno: pregovor
+        //     vec ne postoji kod partnera (idempotentno zatvaranje) → log.info, nastavi i
+        //     lokalno markiraj DECLINED.
+        //   - bilo koja DRUGA greska (auth/network/5xx → InterbankCommunicationException ili
+        //     ostalo) → PROPAGIRAJ: lokalni status OSTAJE ACTIVE (NE markiramo DECLINED), pa
+        //     korisnik vidi da reject NIJE propagiran (handler mapira Communication→502)
+        //     umesto laznog uspeha. setStatus(DECLINED)+save je premesten POSLE outbound-a.
+        // Idempotentno: ensureNegotiationActive iznad vec sprecava ponovni decline.
         try {
             negotiationService.closeNegotiation(foreignId, targetPartnerRouting);
-        } catch (RuntimeException e) {
-            log.warn("Outbound DELETE pregovora {} (target partner {}) nije uspelo: {}",
-                    foreignId, targetPartnerRouting, e.getMessage());
+        } catch (InterbankExceptions.InterbankNegotiationNotFoundException notFound) {
+            log.info("Outbound DELETE pregovora {} (target partner {}): partner vec nema pregovor "
+                            + "(404) — tretiramo kao benigno zatvaranje: {}",
+                    foreignId, targetPartnerRouting, notFound.getMessage());
         }
+
+        // Lokalno zatvaranje TEK posle uspesnog (ili benigno-404) outbound DELETE-a.
+        entity.setOngoing(false);
+        entity.setStatus(InterbankOtcNegotiationStatus.DECLINED);
+        negotiationRepository.save(entity);
         return mapNegotiationToDto(entity);
     }
 
@@ -785,8 +798,11 @@ public class InterbankOtcWrapperService {
             throw new IllegalArgumentException("contractId mora biti broj");
         }
 
+        // FIX (error-semantika): nepostojeci ugovor je NOT FOUND, ne malformed input.
+        // Ranije InterbankProtocolException → wrapper handler 400; sad
+        // InterbankNegotiationNotFoundException → 404 (resurs ne postoji).
         InterbankOtcContract contract = contractRepository.findById(contractId)
-                .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
+                .orElseThrow(() -> new InterbankExceptions.InterbankNegotiationNotFoundException(
                         "Ugovor " + contractId + " ne postoji"));
 
         // C-2 — sve preconditije -> 409 Conflict (ne 400). Payload je validan,
@@ -827,7 +843,7 @@ public class InterbankOtcWrapperService {
                 throw new IllegalArgumentException("buyerAccountId je obavezan za exercise");
             }
             buyerAccount = accountRepository.findById(buyerAccountId)
-                    .orElseThrow(() -> new InterbankExceptions.InterbankProtocolException(
+                    .orElseThrow(() -> new InterbankExceptions.InterbankNegotiationNotFoundException(
                             "Racun " + buyerAccountId + " ne postoji"));
             if (buyerAccount.getStatus() != AccountStatus.ACTIVE) {
                 throw new InterbankExceptions.InterbankExerciseConflictException(

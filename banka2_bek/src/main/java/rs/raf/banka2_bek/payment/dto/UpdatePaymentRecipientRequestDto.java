@@ -10,7 +10,9 @@ public class UpdatePaymentRecipientRequestDto {
     @Size(max = 100)
     private String name;
 
-    @Size(min = 18, max = 18, message = "Account number must be exactly 18 digits")
-    @Pattern(regexp = "\\d{18}", message = "Account number must contain only digits")
+    // Cross-bank: dozvoli 18-34 cifre (B2=18, Banka 1=19, IBAN max=34). Vidi
+    // CreatePaymentRecipientRequestDto.
+    @Size(min = 18, max = 34, message = "Account number must be 18-34 digits")
+    @Pattern(regexp = "\\d{18,34}", message = "Account number must contain only digits")
     private String accountNumber;
 }

@@ -495,9 +495,12 @@ class PaymentServiceImplTest {
         when(transactionService.getReceiptTransaction(55L, client.getId()))
                 .thenThrow(new IllegalArgumentException("Transaction with ID 55 not found for authenticated client."));
 
+        // Bug-3 fix: kad transaction ledger nema zapis (inter-bank placanja), getPaymentReceipt
+        // fallback-uje na sam Payment. Posto Payment 55 ne postoji (paymentRepository.findById
+        // vraca empty), rezultujuci izuzetak je PaymentNotFoundException — vise NE originalni
+        // IllegalArgumentException iz getReceiptTransaction.
         assertThatThrownBy(() -> paymentService.getPaymentReceipt(55L))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Transaction with ID 55 not found");
+                .isInstanceOf(rs.raf.banka2_bek.payment.exception.PaymentNotFoundException.class);
     }
 
     // ========== getPaymentById — P2-1 IDOR ownership guard ==========

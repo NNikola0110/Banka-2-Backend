@@ -27,9 +27,16 @@ public class Payment {
     @Column(nullable = false, unique = true, length = 30)
     private String orderNumber;         // Automatski generisan broj naloga
 
-    @ManyToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "from_account_id", nullable = false)
-    private Account fromAccount;        // Račun platioca
+    // INBOUND inter-bank uplata: posiljaocev racun je u DRUGOJ banci, pa lokalno
+    // ne postoji Account za njega → fromAccount je NULLABLE. Za sva ostala placanja
+    // (lokalna + outbound inter-bank) fromAccount je i dalje obavezan (validira se u
+    // servisu). resolveDirection/isPartyToPayment vec tretiraju null fromAccount kao
+    // INCOMING uplatu cija se vidljivost vodi preko toAccountNumber vlasnistva.
+    // NAPOMENA: ddl-auto=update NE skida postojeci NOT NULL na vec-deployovanoj bazi —
+    // na zivoj bazi treba rucni `ALTER TABLE payments ALTER COLUMN from_account_id DROP NOT NULL`.
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "from_account_id")
+    private Account fromAccount;        // Račun platioca (null za inbound inter-bank uplatu)
 
     // Interbank: partnerske banke mogu imati racune razlicite duzine (Banka 1 koristi
     // 19 cifara, ne 18). Cap podignut na 34 (IBAN max) da inter-bank placanje ka

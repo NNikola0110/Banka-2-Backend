@@ -13,7 +13,11 @@ public class CreatePaymentRecipientRequestDto {
     private String name;
 
     @NotBlank(message = "Account number is required")
-    @Size(min = 18, max = 18, message = "Account number must be exactly 18 digits")
-    @Pattern(regexp = "\\d{18}", message = "Account number must contain only digits")
+    // Cross-bank: B2 racuni su 18 cifara, ali partner-banke (npr. Banka 1) imaju
+    // 19-cifrene racune. Sablon primaoca mora da prihvati i strane racune, pa
+    // dozvoljavamo 18-34 cifre (IBAN max je 34). Provera valute/postojanja racuna
+    // se radi na placanju, ne ovde.
+    @Size(min = 18, max = 34, message = "Account number must be 18-34 digits")
+    @Pattern(regexp = "\\d{18,34}", message = "Account number must contain only digits")
     private String accountNumber;
 }

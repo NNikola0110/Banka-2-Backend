@@ -52,6 +52,15 @@ public class PaymentController {
     @org.springframework.beans.factory.annotation.Value("${payments.expose-active-otp:false}")
     private boolean exposeActiveOtp;
 
+    /**
+     * LOKAL TEST ONLY — kad je {@code true}, {@link #createPayment} preskace OTP gate
+     * u potpunosti (placanje se kreira bez otpCode-a). Default {@code false} → produkcija
+     * i CI su NEPROMENJENI; ukljucuje se iskljucivo env-om {@code PAYMENTS_SKIP_OTP=true}
+     * u lokalnom docker stack-u za rucno testiranje bez mobilnog OTP-a. NIKAD u produkciji.
+     */
+    @org.springframework.beans.factory.annotation.Value("${payments.skip-otp:false}")
+    private boolean skipOtp;
+
     @Operation(summary = "Create payment", description = "Creates a new payment for the authenticated client.")
     @ApiResponses({
             @ApiResponse(responseCode = "201", description = "Payment created", content = @Content(schema = @Schema(implementation = PaymentResponseDto.class))),
@@ -69,28 +78,32 @@ public class PaymentController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
         }
 
-        // OTP verifikacija: verify atomicno proverava kod, inkrementuje attempts i
-        // SINGLE-USE potrosi kod (N2) — isti OTP ne moze da se replay-uje na drugo
-        // placanje. Replay vraca verified=false + replayed=true.
-        String otpCode = request.getOtpCode();
-        if (otpCode == null || otpCode.isBlank()) {
-            return ResponseEntity.badRequest().build();
-        }
-
-        java.util.Map<String, Object> verifyResult = otpService.verify(email, otpCode);
-        if (!Boolean.TRUE.equals(verifyResult.get("verified"))) {
-            // T2-012: ako je verifikacija otkazana zbog 3 neuspela pokusaja ili isteka,
-            // perzistuj ABORTED placanje radi audit trail-a (spec §C2 Sc 14).
-            if (Boolean.TRUE.equals(verifyResult.get("blocked"))) {
-                String reason = String.valueOf(verifyResult.getOrDefault("message", "OTP otkazano"));
-                Long abortedId = paymentService.recordAbortedPayment(request, reason);
-                if (abortedId != null) {
-                    java.util.Map<String, Object> withAudit = new java.util.LinkedHashMap<>(verifyResult);
-                    withAudit.put("abortedPaymentId", abortedId);
-                    return ResponseEntity.status(HttpStatus.FORBIDDEN).body(withAudit);
-                }
+        // LOKAL TEST: payments.skip-otp=true preskace ceo OTP gate (vidi polje skipOtp).
+        // Default false → ova grana se izvrsava normalno u prod/CI.
+        if (!skipOtp) {
+            // OTP verifikacija: verify atomicno proverava kod, inkrementuje attempts i
+            // SINGLE-USE potrosi kod (N2) — isti OTP ne moze da se replay-uje na drugo
+            // placanje. Replay vraca verified=false + replayed=true.
+            String otpCode = request.getOtpCode();
+            if (otpCode == null || otpCode.isBlank()) {
+                return ResponseEntity.badRequest().build();
             }
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(verifyResult);
+
+            java.util.Map<String, Object> verifyResult = otpService.verify(email, otpCode);
+            if (!Boolean.TRUE.equals(verifyResult.get("verified"))) {
+                // T2-012: ako je verifikacija otkazana zbog 3 neuspela pokusaja ili isteka,
+                // perzistuj ABORTED placanje radi audit trail-a (spec §C2 Sc 14).
+                if (Boolean.TRUE.equals(verifyResult.get("blocked"))) {
+                    String reason = String.valueOf(verifyResult.getOrDefault("message", "OTP otkazano"));
+                    Long abortedId = paymentService.recordAbortedPayment(request, reason);
+                    if (abortedId != null) {
+                        java.util.Map<String, Object> withAudit = new java.util.LinkedHashMap<>(verifyResult);
+                        withAudit.put("abortedPaymentId", abortedId);
+                        return ResponseEntity.status(HttpStatus.FORBIDDEN).body(withAudit);
+                    }
+                }
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(verifyResult);
+            }
         }
 
         return ResponseEntity.status(HttpStatus.CREATED).body(paymentService.createPayment(request));

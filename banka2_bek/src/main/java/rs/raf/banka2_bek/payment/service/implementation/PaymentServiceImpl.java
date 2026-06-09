@@ -415,6 +415,17 @@ public class PaymentServiceImpl implements PaymentService {
                                                        Account fromAccount) {
         BigDecimal amount = request.getAmount();
 
+        // ===== RSD-ONLY GUARD (korisnikova odluka) =====
+        // Obicna medjubankarska placanja su trenutno podrzana SAMO u RSD. Strane valute
+        // se cisto ODBIJAJU pre 2PC-a (ne radimo cross-bank FX). Ovo NE vazi za OTC
+        // settlement (InterbankOtcWrapperService), koji ima svoju valutnu logiku
+        // (premija/strike u valuti pregovora) i ne prolazi kroz ovu metodu.
+        // IllegalArgumentException -> globalni handler mapira na HTTP 400 + poruku.
+        String fromCcy = fromAccount.getCurrency() != null ? fromAccount.getCurrency().getCode() : null;
+        if (!"RSD".equalsIgnoreCase(fromCcy)) {
+            throw new IllegalArgumentException("Medjubankarska placanja su trenutno podrzana samo u RSD.");
+        }
+
         // ===== 1374: SINHRONA PROVERA SREDSTAVA (posiljalac) =====
         // Pre fix-a interbank flow je proveravao SAMO limite, ne i raspolozivo stanje.
         // Klijent bez sredstava bi dobio HTTP 200 + status PREPARING, a tek async 2PC
@@ -635,8 +646,50 @@ public class PaymentServiceImpl implements PaymentService {
     @Override
     public byte[] getPaymentReceipt(Long paymentId) {
         Long clientId = getAuthenticatedClient().getId();
-        TransactionResponseDto transaction = transactionService.getReceiptTransaction(paymentId, clientId);
+        TransactionResponseDto transaction;
+        try {
+            transaction = transactionService.getReceiptTransaction(paymentId, clientId);
+        } catch (IllegalArgumentException notInLedger) {
+            // Inter-bank placanja se knjize kroz 2PC postings i NEMAJU lokalni Transaction
+            // ledger zapis (transactions tabela je prazna za njih), pa getReceiptTransaction
+            // baca "not found". Fallback: generisi PDF potvrdu direktno iz Payment-a, uz isti
+            // IDOR ownership guard kao getPaymentById.
+            Payment payment = paymentRepository.findById(paymentId)
+                    .orElseThrow(() -> new rs.raf.banka2_bek.payment.exception.PaymentNotFoundException(
+                            "Placanje nije pronadjeno."));
+            if (!isPartyToPayment(payment, clientId)) {
+                throw new PaymentNotOwnedException("Placanje ne pripada korisniku.");
+            }
+            transaction = toReceiptDto(payment, clientId);
+        }
         return paymentReceiptPdfGenerator.generate(transaction);
+    }
+
+    /**
+     * Gradi {@link TransactionResponseDto} za PDF potvrdu direktno iz {@link Payment}-a —
+     * koristi se za inter-bank placanja koja nemaju lokalni Transaction ledger zapis.
+     * OUTGOING (klijent je platilac) → {@code debit}=iznos; INCOMING (primalac) → {@code credit}=iznos.
+     */
+    private TransactionResponseDto toReceiptDto(Payment p, Long clientId) {
+        boolean outgoing = p.getFromAccount() != null
+                && p.getFromAccount().getClient() != null
+                && p.getFromAccount().getClient().getId().equals(clientId);
+        String fromAcc = p.getFromAccount() != null ? p.getFromAccount().getAccountNumber() : null;
+        return TransactionResponseDto.builder()
+                .id(p.getId())
+                .type(rs.raf.banka2_bek.transaction.dto.TransactionType.PAYMENT)
+                .accountNumber(outgoing ? fromAcc : p.getToAccountNumber())
+                .toAccountNumber(outgoing ? p.getToAccountNumber() : fromAcc)
+                .currencyCode(p.getCurrency() != null ? p.getCurrency().getCode() : null)
+                .description(p.getPurpose())
+                .debit(outgoing ? p.getAmount() : null)
+                .credit(outgoing ? null : p.getAmount())
+                .reserved(java.math.BigDecimal.ZERO)
+                .reservedUsed(java.math.BigDecimal.ZERO)
+                .balanceAfter(p.getFromAccount() != null ? p.getFromAccount().getBalance() : null)
+                .availableAfter(p.getFromAccount() != null ? p.getFromAccount().getAvailableBalance() : null)
+                .createdAt(p.getCreatedAt())
+                .build();
     }
 
     @Override

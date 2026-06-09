@@ -28,7 +28,9 @@ public class PaymentRecipient {
     @Column(nullable = false, length = 100)
     private String name;            // Recipient name or full name
 
-    @Column(nullable = false, length = 18)
+    // Cross-bank: 18 (B2) do 34 cifre (IBAN max) — partner-banke kao Banka 1 imaju
+    // 19-cifrene racune koji moraju moci da se sacuvaju kao sablon primaoca.
+    @Column(nullable = false, length = 34)
     private String accountNumber;   // Recipient account number
 
     @Column(nullable = false, updatable = false)

@@ -33,7 +33,9 @@ import java.util.Set;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -329,9 +331,46 @@ class InterbankOtcWrapperServiceStateGuardTest {
 
         service.declineOffer(OFFER_ID, 7L, "CLIENT");
 
+        // FIX 2: lokalni DECLINED+save se izvrsava TEK POSLE uspesnog outbound DELETE-a.
+        assertThat(neg.getStatus()).isEqualTo(InterbankOtcNegotiationStatus.DECLINED);
         verify(negotiationRepository).save(any());
-        // outbound DELETE pokusan (best-effort).
-        verify(negotiationService).closeNegotiation(any(), org.mockito.ArgumentMatchers.anyInt());
+        verify(negotiationService).closeNegotiation(any(), anyInt());
+    }
+
+    @Test
+    @DisplayName("FIX 2: outbound DELETE 404 (partner vec nema pregovor) → benigno, lokalno DECLINED")
+    void declineOffer_outboundNotFound_treatedBenign() {
+        InterbankOtcNegotiation neg = buildBuyerSideNegotiation(InterbankOtcNegotiationStatus.ACTIVE);
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(SELLER_RN), eq("neg-1"))).thenReturn(Optional.of(neg));
+        when(negotiationRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        doThrow(new InterbankExceptions.InterbankNegotiationNotFoundException("nema pregovora"))
+                .when(negotiationService).closeNegotiation(any(), anyInt());
+
+        service.declineOffer(OFFER_ID, 7L, "CLIENT");
+
+        // 404 je benigno (idempotentno zatvaranje) → lokalno svejedno DECLINED.
+        assertThat(neg.getStatus()).isEqualTo(InterbankOtcNegotiationStatus.DECLINED);
+        verify(negotiationRepository).save(any());
+    }
+
+    @Test
+    @DisplayName("FIX 2: outbound DELETE komunikaciona greska → propagira se, lokalno OSTAJE ACTIVE "
+            + "(bez laznog uspeha, bez save)")
+    void declineOffer_outboundCommunicationError_propagatesAndKeepsActive() {
+        InterbankOtcNegotiation neg = buildBuyerSideNegotiation(InterbankOtcNegotiationStatus.ACTIVE);
+        when(negotiationRepository.findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                eq(SELLER_RN), eq("neg-1"))).thenReturn(Optional.of(neg));
+        doThrow(new InterbankExceptions.InterbankCommunicationException("partner nedostupan"))
+                .when(negotiationService).closeNegotiation(any(), anyInt());
+
+        assertThatThrownBy(() -> service.declineOffer(OFFER_ID, 7L, "CLIENT"))
+                .isInstanceOf(InterbankExceptions.InterbankCommunicationException.class);
+
+        // Reject NIJE propagiran ka partneru → lokalni status NE sme da bude DECLINED
+        // (nema laznog uspeha), i nista se ne perzistuje kao zatvoreno.
+        assertThat(neg.getStatus()).isEqualTo(InterbankOtcNegotiationStatus.ACTIVE);
+        verify(negotiationRepository, never()).save(any());
     }
 
     // ── 209 access gate ──

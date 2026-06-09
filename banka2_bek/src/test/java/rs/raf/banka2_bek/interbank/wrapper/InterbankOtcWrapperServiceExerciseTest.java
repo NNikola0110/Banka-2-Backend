@@ -322,12 +322,13 @@ class InterbankOtcWrapperServiceExerciseTest {
     }
 
     @Test
-    @DisplayName("§2.7.2: contract ne postoji: ProtocolException (400)")
+    @DisplayName("§2.7.2: contract ne postoji: NegotiationNotFound (404)")
     void exerciseContract_notFound_throws() {
+        // FIX 3: nepostojeci ugovor je NOT FOUND (404), ne malformed input (400).
         when(contractRepository.findById(99L)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.exerciseContract("99", 101L, 7L, "CLIENT"))
-                .isInstanceOf(InterbankExceptions.InterbankProtocolException.class)
+                .isInstanceOf(InterbankExceptions.InterbankNegotiationNotFoundException.class)
                 .hasMessageContaining("ne postoji");
     }
 
@@ -684,11 +685,11 @@ class InterbankOtcWrapperServiceExerciseTest {
         supervisor.setPermissions(new java.util.HashSet<>(java.util.Set.of("SUPERVISOR")));
         when(employeeRepository.findById(60L)).thenReturn(Optional.of(supervisor));
         // contract ne postoji → prolazak gate-a se dokazuje time sto pukne KASNIJE
-        // (na contract lookup-u), a ne sa AccessDenied.
+        // (na contract lookup-u sa NegotiationNotFound/404 — FIX 3), a ne sa AccessDenied.
         when(contractRepository.findById(99L)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> service.exerciseContract("99", 101L, 60L, "EMPLOYEE"))
-                .isInstanceOf(InterbankExceptions.InterbankProtocolException.class)
+                .isInstanceOf(InterbankExceptions.InterbankNegotiationNotFoundException.class)
                 .hasMessageContaining("ne postoji");
     }
 

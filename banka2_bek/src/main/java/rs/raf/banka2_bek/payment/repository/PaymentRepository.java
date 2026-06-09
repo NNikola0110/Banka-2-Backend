@@ -43,17 +43,34 @@ public interface PaymentRepository extends JpaRepository<Payment, Long> {
     Optional<Payment> findByInterbankTxRoutingNumberAndInterbankTxIdString(
             Integer interbankTxRoutingNumber, String interbankTxIdString);
 
+    /**
+     * Inbound inter-bank uplata — idempotency guard. Isti COMMIT_TX moze biti
+     * retransmitovan (§2.9 duplikat dostava), pa pre upisa INCOMING Payment reda za
+     * primljenu uplatu proveravamo da li vec postoji red sa istim 2PC tx parom
+     * (routing+id) i istim primaocevim racunom. Tako se ne kreira duplikat istorijskog
+     * zapisa pri retry-u COMMIT_TX-a.
+     */
+    boolean existsByInterbankTxRoutingNumberAndInterbankTxIdStringAndToAccountNumber(
+            Integer interbankTxRoutingNumber, String interbankTxIdString, String toAccountNumber);
+
     // NAPOMENA (PostgreSQL): cast(:param as tip) je neophodan jer PG JDBC
     // ne moze da zakljuci tip NULL parametra — na JPQL ":p is null" izraz
     // genrise "ERROR: could not determine data type of parameter". H2/MySQL
     // ne zahtevaju cast.
+    // VAZNO: LEFT JOIN na fromAccount. Inter-bank DOLAZNA placanja imaju
+    // fromAccount = NULL (posiljalac je u drugoj banci). Path-navigacija
+    // "p.fromAccount.client.id" bi napravila IMPLICITNI INNER JOIN koji bi
+    // izbacio te redove PRE OR-grane sa toAccountNumber — pa primalac nikad
+    // ne bi video dolazno placanje. Eksplicitni left join cuva NULL-fromAccount redove.
     @Query("""
            select p from Payment p
-           where (p.fromAccount.client.id = :clientId
+           left join p.fromAccount fa
+           left join fa.client fc
+           where (fc.id = :clientId
                   or p.toAccountNumber in (select a.accountNumber from Account a where a.client.id = :clientId))
              and (cast(:fromDate as timestamp) is null or p.createdAt >= :fromDate)
              and (cast(:toDate as timestamp) is null or p.createdAt <= :toDate)
-             and (cast(:accountNumber as string) is null or p.fromAccount.accountNumber = :accountNumber or p.toAccountNumber = :accountNumber)
+             and (cast(:accountNumber as string) is null or fa.accountNumber = :accountNumber or p.toAccountNumber = :accountNumber)
              and (cast(:minAmount as big_decimal) is null or p.amount >= :minAmount)
              and (cast(:maxAmount as big_decimal) is null or p.amount <= :maxAmount)
              and (cast(:status as string) is null or p.status = :status)

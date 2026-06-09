@@ -8,6 +8,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import rs.raf.banka2.contracts.internal.InternalListingDto;
 import rs.raf.banka2.contracts.internal.InternalPortfolioHoldingDto;
 import rs.raf.banka2_bek.account.model.Account;
@@ -48,6 +50,7 @@ public class TransactionExecutorService {
     private final InterbankOtcNegotiationRepository otcNegotiationRepository;
     private final InterbankOtcContractRepository otcContractRepository;
     private final InterbankFxService interbankFxService;
+    private final InterbankInboundPaymentRecorder inboundPaymentRecorder;
 
     /**
      * §Celina 5 §40-66: registarski broj nase banke — koristi se za pronalazenje
@@ -140,7 +143,18 @@ public class TransactionExecutorService {
             // phase-2 send error never propagates here. THEN signal the caller by throwing.
             Map<Integer, IdempotenceKey> rollbackKeys = self.rollbackTxPhase(tx.transactionId(), remoteRns);
             sendPhase2Network(rollbackKeys, MessageType.ROLLBACK_TX, new RollbackTransaction(tx.transactionId()));
-            throw abort(tx, "partner vote=NO (or network/auth failure treated as NO)", null);
+            // exercise-400 fix: prosledi PRVU partner NO vote (sa reasons) umesto null. Bez
+            // ovoga konkretan protokol-razlog (npr. OPTION_USED_OR_EXPIRED) se gubi i poruka
+            // ostaje obmanjujuca "(or network/auth failure treated as NO)" iako je partner dao
+            // eksplicitan, dobro-formiran protokol NO (http 200). Kad je vote prisutan, abort()
+            // dodaje " reasons=[...]" pa razlog stigne do korisnika kroz wrapper handler (409).
+            // Ako je NO bio treated-as-NO (network/auth → prazna reasons lista), vote ostaje
+            // null i poruka pada nazad na goli "partner vote=NO".
+            TransactionVote firstNo = votes.values().stream()
+                    .filter(v -> v.vote() == TransactionVote.Vote.NO)
+                    .filter(v -> v.reasons() != null && !v.reasons().isEmpty())
+                    .findFirst().orElse(null);
+            throw abort(tx, "partner vote=NO", firstNo);
         }
     }
 
@@ -322,6 +336,28 @@ public class TransactionExecutorService {
         // Monas commits se ne kompenzuju ovde — oni rade unutar nase @Transactional pa ce
         // Spring rollback-ovati DB state ako exception bubbles up iz ove metode. Track-uju
         // se samo Stock commits jer su out-of-process.
+        // INCOMING payment-history zapis (best-effort, vidi recordInboundReceipts ispod).
+        // Belezimo SAMO kad smo RECIPIENT (druga banka je inicirala NEW_TX, mi primamo
+        // novac) — NE za nase OUTBOUND placanje (gde smo INITIATOR i Payment red vec
+        // postoji iz createInterbankPayment). Sakupljamo ovde, upisujemo POSLE COMMITTED
+        // flip-a (van money-leg petlje), u zasebnoj REQUIRES_NEW tx.
+        boolean weAreRecipient =
+                ibTx.getRole() == InterbankTransaction.InterbankTransactionRole.RECIPIENT;
+        List<InboundReceipt> inboundReceipts = new ArrayList<>();
+
+        // FINDING 2 (FIX B — buyer-credit simetrija): per-CONTRACT gate za exercise-shape tx.
+        // Seller-settle grana (ispod petlje) je vec per-contract gated (lock + ACTIVE/EXERCISING
+        // + atomican flip). ALI buyer-credit leg (Stock+Person, kad smo MI BUYER) se primenjuje
+        // UNUTAR petlje i bio je gated SAMO per-txId (stockIdempotencyKey) — retry/restart sa
+        // NOVIM txId za vec-EXERCISED ugovor bi dvostruko kreditirao kupcu hartije (asset
+        // kreiran). Ovde, pod ISTIM per-contract PESSIMISTIC_WRITE lock-om kao seller-settle,
+        // proveravamo da li je exercise jos settle-abilan; ako je ugovor vec EXERCISED,
+        // exerciseSettlementGateOpen=false → buyer Stock commit se preskace (no-op). Kad nema
+        // lokalnog ugovora za negId (npr. seller-host gde je ugovor nadjen u seller bloku, ili
+        // strana hartija), gate ostaje OTVOREN (true) — postojece ponasanje netaknuto.
+        boolean exerciseSettlementGateOpen = isExercise
+                && isExerciseSettlementClaimable(postings);
+
         List<StockCommitRecord> stockCommits = new ArrayList<>();
         try {
             for (int i = 0; i < postings.size(); i++) {
@@ -340,6 +376,13 @@ public class TransactionExecutorService {
                         // da commit ne re-racuna po live rate-u (FX drift eliminisan).
                         reservationApplier.commitRecipientCredit(
                                 a.num(), abs, m.asset().currency().name(), ibTx.getPinnedFxRate());
+                        // Plain inter-bank uplata na nas racun (pozitivan MONAS kredit na
+                        // lokalnom Account-u) → kandidat za INCOMING istorijski zapis.
+                        if (weAreRecipient) {
+                            inboundReceipts.add(new InboundReceipt(
+                                    a.num(), abs, m.asset().currency().name(),
+                                    inboundSenderLabel(tx)));
+                        }
                     } else {
                         // Sender (Banka A) debit — troši rezervaciju u izvornoj valuti,
                         // bez konverzije (R1-681: commitMonas radi samo sender-debit).
@@ -347,6 +390,17 @@ public class TransactionExecutorService {
                     }
 
                 } else if (p.asset() instanceof Asset.Stock s && p.account() instanceof TxAccount.Person pe) {
+                    // FIX B (buyer-credit simetrija): kad je ovo buyer-stock leg exercise-shape
+                    // tx-a a ugovor je VEC EXERCISED (gate zatvoren), preskoci — inace bi retry
+                    // sa novim txId dvostruko kreditirao kupcu hartije (asset kreiran). Za
+                    // ne-exercise tx-ove (plain stock transfer) gate je uvek otvoren (isExercise
+                    // je false → exerciseSettlementGateOpen=false samo kad je ugovor EXERCISED;
+                    // za ne-exercise je i isExercise=false pa gate ostaje "true" preko ranog
+                    // izlaza ispod). NB: čuvamo ne-exercise tokove netaknutim.
+                    if (isExercise && !exerciseSettlementGateOpen) {
+                        // Vec settle-ovan po ovom ugovoru — buyer stock kredit je no-op.
+                        continue;
+                    }
                     String ticker = s.asset().ticker();
                     // commitStock razresava listing po ticker-u u trading-service-u i
                     // mapira odsustvo u "Listing not found: <ticker>" (→ InterbankProtocolException),
@@ -500,9 +554,20 @@ public class TransactionExecutorService {
                     .findFirst()
                     .ifPresent(pp -> {
                         ForeignBankId negId = ((Asset.OptionAsset) pp.asset()).asset().negotiationId();
-                        otcNegotiationRepository
+                        Optional<InterbankOtcNegotiation> negOpt = otcNegotiationRepository
                                 .findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
-                                        negId.routingNumber(), negId.id())
+                                        negId.routingNumber(), negId.id());
+                        // DIJAGNOSTIKA (FIX 3): kad nemamo lokalnu BUYER kopiju pregovora za ovaj
+                        // negId, buyer-side InterbankOtcContract se NE kreira → kasniji exercise
+                        // 404-uje. Najcesci uzrok je ID-namespace mismatch izmedju routing/id koji
+                        // partner salje u OptionAsset.negotiationId i onoga sto smo persistovali pri
+                        // createOffer-u. Samo LOG (bez menjanja money/contract logike); success put
+                        // (.ifPresent ispod) ostaje netaknut.
+                        if (negOpt.isEmpty()) {
+                            log.warn("Buyer-side OTC contract NIJE kreiran: nema lokalne kopije pregovora "
+                                    + "za negId={} (COMMIT_TX OptionAsset legovi). ID-namespace mismatch?", negId);
+                        }
+                        negOpt
                                 .filter(neg -> neg.getLocalPartyType() == InterbankPartyType.BUYER)
                                 .filter(neg -> otcContractRepository
                                         .findBySourceNegotiationId(neg.getId()).isEmpty())
@@ -532,7 +597,71 @@ public class TransactionExecutorService {
         ibTx.setCommittedAt(LocalDateTime.now());
         ibTx.setLastActivityAt(LocalDateTime.now());
         txRepo.save(ibTx);
+
+        // POSLE money-leg-a: zabelezi INCOMING Payment(s) za primljene uplate (samo kad
+        // smo RECIPIENT). Best-effort i AFTER-COMMIT: upis ide TEK kad se commitLocal
+        // transakcija (kredit primaocu) durabilno commit-uje, pa nema orphan Payment reda
+        // ako se outer tx rollback-uje. Sam upis je REQUIRES_NEW + idempotentan
+        // (InterbankInboundPaymentRecorder); greska istorijskog upisa nikad ne dira novac.
+        scheduleInboundReceiptRecording(transactionId, inboundReceipts);
     }
+
+    /**
+     * Best-effort upis INCOMING {@link rs.raf.banka2_bek.payment.model.Payment} redova za
+     * uplate koje je nasa banka PRIMILA preko inter-bank-a (inbound COMMIT_TX koji je
+     * kreditirao lokalni racun). Zakazuje se kroz {@link TransactionSynchronization#afterCommit()}
+     * (mirror {@code PaymentServiceImpl.createInterbankPayment}) tako da Payment red nastaje
+     * TEK po durabilnom commit-u kredita; ako nema aktivne tx sinhronizacije (npr. test bez
+     * tx-a), upisuje odmah. Svaki red ide kroz {@link InterbankInboundPaymentRecorder} u
+     * zasebnoj REQUIRES_NEW tx i idempotentan je po (tx-par, racun). Izuzeci se gutaju.
+     */
+    private void scheduleInboundReceiptRecording(ForeignBankId transactionId, List<InboundReceipt> receipts) {
+        if (receipts.isEmpty()) return;
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    recordInboundReceipts(transactionId, receipts);
+                }
+            });
+        } else {
+            recordInboundReceipts(transactionId, receipts);
+        }
+    }
+
+    private void recordInboundReceipts(ForeignBankId transactionId, List<InboundReceipt> receipts) {
+        for (InboundReceipt r : receipts) {
+            try {
+                inboundPaymentRecorder.recordIncoming(
+                        transactionId.routingNumber(), transactionId.id(),
+                        r.accountNumber(), r.amount(), r.currencyCode(), r.senderLabel());
+            } catch (RuntimeException e) {
+                log.warn("Best-effort INCOMING payment record nije uspeo za tx {} -> {} ({}): {}",
+                        transactionId, r.accountNumber(), r.amount(), e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Best-effort, display-only naziv posiljaoca za INCOMING inter-bank uplatu: prvi
+     * REMOTE (druga banka) MONAS sender-debit leg (negativan iznos na Account/Person u
+     * drugoj banci). Vraca konkretan broj racuna / foreign-id ako je dostupan, inace
+     * genericku oznaku. Nikad ne baca — koristi se samo kao {@code recipientName} labela.
+     */
+    private String inboundSenderLabel(Transaction tx) {
+        for (Posting p : tx.postings()) {
+            if (!(p.asset() instanceof Asset.Monas)) continue;
+            if (p.amount().compareTo(BigDecimal.ZERO) >= 0) continue; // sender debit = negativan
+            if (!isPostingRemote(p)) continue;
+            if (p.account() instanceof TxAccount.Account a) return a.num();
+            if (p.account() instanceof TxAccount.Person pe) return pe.id().id();
+        }
+        return "Inter-bank uplata";
+    }
+
+    /** Zabelezeni inbound kredit (primljena uplata) — kandidat za INCOMING Payment zapis. */
+    private record InboundReceipt(String accountNumber, BigDecimal amount,
+                                  String currencyCode, String senderLabel) {}
 
     @Transactional
     public void rollbackLocal(ForeignBankId transactionId) {
@@ -1100,6 +1229,40 @@ public class TransactionExecutorService {
      * <p>Strike racun prodavca se rezolvise deterministicki po (localPartyId, strikeCcy);
      * commitStock idempotency kljuc je vezan za inter-bank transakciju (retransmit-safe).
      */
+    /**
+     * FIX B (buyer-credit simetrija) — per-CONTRACT gate odluka za exercise-shape tx.
+     * Razresava (Stock, Option) leg → negotiationId → lokalni ugovor pod ISTIM
+     * {@code findBySourceNegotiationIdForUpdate} PESSIMISTIC_WRITE lock-om koji koristi
+     * seller-settle grana, pa je gate-odluka serijalizovana sa razlicitim-txId exercise-ima
+     * istog ugovora (lock se drzi do kraja {@code @Transactional}).
+     *
+     * @return {@code true} kad settlement TREBA da se izvrsi: ugovor je jos ACTIVE ili
+     *         EXERCISING (claimed), ILI ne postoji lokalni ugovor za ovaj negId (ungated —
+     *         postojece ponasanje za strane/seller-host slucajeve). {@code false} kad je
+     *         ugovor vec EXERCISED (ili terminal) → buyer stock kredit se preskace
+     *         (exactly-once po ugovoru; sprecava double-delivery na retry sa novim txId).
+     */
+    private boolean isExerciseSettlementClaimable(List<Posting> postings) {
+        return postings.stream()
+                .filter(pp -> pp.account() instanceof TxAccount.Option)
+                .filter(pp -> pp.asset() instanceof Asset.Stock)
+                .findFirst()
+                .map(pp -> {
+                    ForeignBankId negId = ((TxAccount.Option) pp.account()).id();
+                    return otcNegotiationRepository
+                            .findByForeignNegotiationRoutingNumberAndForeignNegotiationIdString(
+                                    negId.routingNumber(), negId.id())
+                            .flatMap(neg -> otcContractRepository.findBySourceNegotiationIdForUpdate(neg.getId()))
+                            .map(contract ->
+                                    contract.getStatus() == InterbankOtcContractStatus.ACTIVE
+                                            || contract.getStatus() == InterbankOtcContractStatus.EXERCISING)
+                            // Nema lokalnog ugovora za ovaj negId → gate OTVOREN (ungated).
+                            .orElse(true);
+                })
+                // Nema (Stock, Option) leg-a (nije exercise) → gate OTVOREN.
+                .orElse(true);
+    }
+
     private void settleSellerOnInboundExercise(ForeignBankId transactionId, InterbankOtcContract contract) {
         Long sellerUserId = contract.getLocalPartyId();
         String sellerRole = contract.getLocalPartyRole();
