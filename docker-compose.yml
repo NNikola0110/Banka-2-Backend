@@ -176,9 +176,6 @@ services:
       # dev/docker ga moze ukljuciti za mobilni mock OTP flow; u produkciji NIKAD
       # ne smije biti true (rate-limit + dev-mock surface).
       PAYMENTS_EXPOSE_ACTIVE_OTP: ${PAYMENTS_EXPOSE_ACTIVE_OTP:-true}
-      # LOKAL TEST ONLY: kad je true, POST /payments preskace OTP gate (rucno
-      # testiranje bez mobilnog OTP-a). Default false → prod/CI nepromenjeni.
-      PAYMENTS_SKIP_OTP: ${PAYMENTS_SKIP_OTP:-false}
       # P1-auth-2 (R2 1367): rate-limit bucket veruje X-Forwarded-For SAMO ako je
       # BE iza poznatog reverse proxy-ja (api-gateway nginx). Direktan port (8081)
       # je izlozen bez proxy-ja, pa default je false -> XFF se ignorise (remoteAddr).

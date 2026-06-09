@@ -577,7 +577,11 @@ class PaymentControllerIntegrationTest {
                 String.class
         );
 
-        assertThat(deniedResponse.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        // Receipt fallback (interbank placanja bez ledger Transaction reda) razresava
+        // vlasnistvo nad Payment-om: tudji klijent -> PaymentNotOwnedException -> 403 FORBIDDEN
+        // (autorizaciona greska, semanticki ispravnije od ranijeg 400; usaglaseno sa
+        // GlobalExceptionHandler.handlePaymentNotOwned konvencijom).
+        assertThat(deniedResponse.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     private ResponseEntity<String> postPayment(String fromAccount,
