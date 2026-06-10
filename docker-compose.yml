@@ -194,6 +194,17 @@ services:
       PARTNER1_INBOUND_TOKEN: ${PARTNER1_INBOUND_TOKEN:-dev-outbound-banka1-to-banka2}
       # Outbound token: X-Api-Key koji mi saljemo Tim 1 — dodeljuje ga Tim 1.
       PARTNER1_OUTBOUND_TOKEN: ${PARTNER1_OUTBOUND_TOKEN:-dev-inbound-banka2-to-banka1}
+      # Inter-bank protokol — Banka 3 base URL (routing 333). Prave token vrednosti
+      # idu kroz .env override (gitignored); dev default samo za lokalni stack.
+      PARTNER3_BASE_URL: ${PARTNER3_BASE_URL:-https://banka.raf-project.com}
+      PARTNER3_USER_PATH: ${PARTNER3_USER_PATH:-/user/{rn}/{id}}
+      PARTNER3_ROUTING: ${PARTNER3_ROUTING:-333}
+      PARTNER3_NAME: ${PARTNER3_NAME:-Banka 3}
+      # Inbound token: X-Api-Key koji Banka 3 salje nama (MI ga izdajemo, mora biti
+      # jedinstven — NE deliti sa PARTNER2_INBOUND_TOKEN).
+      PARTNER3_INBOUND_TOKEN: ${PARTNER3_INBOUND_TOKEN:-dev-banka3-to-banka2}
+      # Outbound token: X-Api-Key koji mi saljemo Banci 3 — dodeljuje ga Banka 3.
+      PARTNER3_OUTBOUND_TOKEN: ${PARTNER3_OUTBOUND_TOKEN:-dev-banka2-to-banka3}
       # Arbitro Phase 6 — Whisper STT sidecar (faster-whisper tiny, port 8094 na hostu).
       # Pokrece se kroz Banka-2-Tools/docker-compose.yml. Iz BE container-a
       # se pristupa preko host.docker.internal (isti pattern kao Ollama+TTS).
