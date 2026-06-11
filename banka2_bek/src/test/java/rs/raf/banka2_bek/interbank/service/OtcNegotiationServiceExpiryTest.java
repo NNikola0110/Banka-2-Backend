@@ -8,6 +8,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
+import rs.raf.banka2_bek.account.repository.AccountRepository;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.interbank.config.InterbankProperties;
@@ -58,6 +59,7 @@ class OtcNegotiationServiceExpiryTest {
     @Mock private TradingServiceInternalClient tradingServiceClient;
     @Mock private ClientRepository clientRepository;
     @Mock private EmployeeRepository employeeRepository;
+    @Mock private AccountRepository accountRepository;
     @Mock private TransactionExecutorService transactionExecutor;
     @Mock private InterbankReservationApplier reservationApplier;
 
@@ -71,7 +73,7 @@ class OtcNegotiationServiceExpiryTest {
         properties.setMyBankDisplayName("Banka 2");
         service = new OtcNegotiationService(client, properties,
                 negotiationRepository, contractRepository, tradingServiceClient,
-                clientRepository, employeeRepository, transactionExecutor, reservationApplier);
+                clientRepository, employeeRepository, accountRepository, transactionExecutor, reservationApplier);
         // Realan self za testove koji prolaze kroz self.expireOneContract(...).
         ReflectionTestUtils.setField(service, "self", service);
     }

@@ -8,6 +8,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 import rs.raf.banka2.contracts.internal.InternalPublicStockSellerDto;
+import rs.raf.banka2_bek.account.repository.AccountRepository;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.interbank.client.TradingServiceInternalClient;
@@ -59,6 +60,7 @@ class OtcNegotiationServiceQuotaTest {
     @Mock private TradingServiceInternalClient tradingServiceClient;
     @Mock private ClientRepository clientRepository;
     @Mock private EmployeeRepository employeeRepository;
+    @Mock private AccountRepository accountRepository;
     @Mock private TransactionExecutorService transactionExecutor;
     @Mock private InterbankReservationApplier reservationApplier;
 
@@ -73,7 +75,7 @@ class OtcNegotiationServiceQuotaTest {
         service = new OtcNegotiationService(client, properties,
                 negotiationRepository, contractRepository,
                 tradingServiceClient, clientRepository, employeeRepository,
-                transactionExecutor, reservationApplier);
+                accountRepository, transactionExecutor, reservationApplier);
         // acceptCreatedNegotiation deleguje na self.acceptCreatedNegotiationLocked.
         ReflectionTestUtils.setField(service, "self", service);
     }

@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import rs.raf.banka2_bek.account.repository.AccountRepository;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.interbank.config.InterbankProperties;
@@ -47,6 +48,8 @@ class OtcNegotiationServiceIntegrationTest {
     @Mock
     private EmployeeRepository employeeRepository;
     @Mock
+    private AccountRepository accountRepository;
+    @Mock
     private TransactionExecutorService transactionExecutor;
     @Mock
     private InterbankReservationApplier reservationApplier;
@@ -59,7 +62,7 @@ class OtcNegotiationServiceIntegrationTest {
         properties.setMyBankDisplayName("Banka 2");
         OtcNegotiationService service = new OtcNegotiationService(client, properties,
                 negotiationRepository, contractRepository, tradingServiceClient,
-                clientRepository, employeeRepository, transactionExecutor, reservationApplier);
+                clientRepository, employeeRepository, accountRepository, transactionExecutor, reservationApplier);
 
         ForeignBankId buyer = new ForeignBankId(OUR_RN, "buyer-1");
         ForeignBankId seller = new ForeignBankId(SELLER_RN, "seller-1");
@@ -128,7 +131,7 @@ class OtcNegotiationServiceIntegrationTest {
         properties.setMyRoutingNumber(OUR_RN);
         OtcNegotiationService service = new OtcNegotiationService(client, properties,
                 negotiationRepository, contractRepository, tradingServiceClient,
-                clientRepository, employeeRepository, transactionExecutor, reservationApplier);
+                clientRepository, employeeRepository, accountRepository, transactionExecutor, reservationApplier);
 
         ForeignBankId negotiationId = new ForeignBankId(SELLER_RN, "neg-77");
         when(client.postNegotiation(eq(SELLER_RN), any()))

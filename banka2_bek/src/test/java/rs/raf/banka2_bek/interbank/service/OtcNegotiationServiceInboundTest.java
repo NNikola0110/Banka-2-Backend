@@ -10,6 +10,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 import rs.raf.banka2_bek.account.model.Account;
 import rs.raf.banka2_bek.client.model.Client;
+import rs.raf.banka2_bek.account.repository.AccountRepository;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.currency.model.Currency;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
@@ -75,6 +76,7 @@ class OtcNegotiationServiceInboundTest {
     @Mock private TradingServiceInternalClient tradingServiceClient;
     @Mock private ClientRepository clientRepository;
     @Mock private EmployeeRepository employeeRepository;
+    @Mock private AccountRepository accountRepository;
     @Mock private TransactionExecutorService transactionExecutor;
     @Mock private InterbankReservationApplier reservationApplier;
 
@@ -92,7 +94,7 @@ class OtcNegotiationServiceInboundTest {
         properties.setMyBankDisplayName("Banka 2");
         service = new OtcNegotiationService(client, properties,
                 negotiationRepository, contractRepository, tradingServiceClient,
-                clientRepository, employeeRepository, transactionExecutor, reservationApplier);
+                clientRepository, employeeRepository, accountRepository, transactionExecutor, reservationApplier);
         ReflectionTestUtils.setField(service, "self", selfMock);
     }
 

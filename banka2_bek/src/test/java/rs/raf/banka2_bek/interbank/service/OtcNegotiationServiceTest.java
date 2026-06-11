@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import rs.raf.banka2_bek.account.repository.AccountRepository;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.employee.repository.EmployeeRepository;
 import rs.raf.banka2_bek.interbank.config.InterbankProperties;
@@ -55,6 +56,8 @@ class OtcNegotiationServiceTest {
     @Mock
     private EmployeeRepository employeeRepository;
     @Mock
+    private AccountRepository accountRepository;
+    @Mock
     private TransactionExecutorService transactionExecutor;
     @Mock
     private InterbankReservationApplier reservationApplier;
@@ -70,7 +73,7 @@ class OtcNegotiationServiceTest {
         service = new OtcNegotiationService(client, properties,
                 negotiationRepository, contractRepository,
                 tradingServiceClient, clientRepository, employeeRepository,
-                transactionExecutor, reservationApplier);
+                accountRepository, transactionExecutor, reservationApplier);
     }
 
     // ───────────────────── §3.1 fetchRemotePublicStocks ─────────────────────
