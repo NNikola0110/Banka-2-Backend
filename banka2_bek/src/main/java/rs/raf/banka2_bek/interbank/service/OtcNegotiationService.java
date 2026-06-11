@@ -3,9 +3,11 @@ package rs.raf.banka2_bek.interbank.service;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import rs.raf.banka2_bek.account.repository.AccountRepository;
 import rs.raf.banka2_bek.client.model.Client;
 import rs.raf.banka2_bek.client.repository.ClientRepository;
 import rs.raf.banka2_bek.employee.model.Employee;
@@ -89,8 +91,12 @@ public class OtcNegotiationService {
     private final TradingServiceInternalClient tradingServiceClient;
     private final ClientRepository clientRepository;
     private final EmployeeRepository employeeRepository;
+    private final AccountRepository accountRepository;
     private final TransactionExecutorService transactionExecutor;
     private final InterbankReservationApplier reservationApplier;
+
+    @Value("${bank.registration-number}")
+    private String bankRegistrationNumber;
 
     /**
      * Self-proxy: I-3 fix po Celini 5 audit-u — {@code acceptReceivedNegotiation}
@@ -1035,12 +1041,12 @@ public class OtcNegotiationService {
      * vlasniku/roli i valuti.
      */
     private Optional<String> resolveLocalAccount(Long userId, String role, String currencyCode) {
-        if (!"CLIENT".equalsIgnoreCase(role)) {
-            // Zaposleni nemaju klijentske racune — zauzimamo bankin trading
-            // racun (kao kod intra-bank exec) ali za pojednostavljen P1
-            // demo prijavljujemo da ne podrzavamo employee-as-seller na
-            // inter-bank OTC-u sve dok se T11 fund-flow ne prosiri.
-            return Optional.empty();
+        if ("EMPLOYEE".equalsIgnoreCase(role)) {
+            // Zaposleni/supervizori nemaju licne settlement racune — koristimo
+            // bankin trading racun u toj valuti (isti fallback kao intra-bank exec).
+            return accountRepository
+                    .findBankAccountByCurrency(bankRegistrationNumber, currencyCode.toUpperCase())
+                    .map(a -> a.getAccountNumber());
         }
         Optional<Client> cOpt = clientRepository.findById(userId);
         if (cOpt.isEmpty()) return Optional.empty();
